@@ -1,0 +1,79 @@
+backend: pusht
+embodiment: pusht_sim
+cameras: [top]
+state_dim: 2
+action_dim: 2
+state_names: [x, y]
+action_names: [x, y]
+fps: 10
+data_root: data/demos
+# ACT v1: LeRobot Aloha 默认 chunk_size=100（PushT 更推荐 configs/pusht_act_v2.yaml）
+# 数据: pusht_merged_quanfu_my_demo_teleop10fps, 50k
+output_dir: outputs/act_pusht_quanfu
+
+env:
+  render_size: 96
+  max_episode_steps: 1000
+  render_mode: human
+
+dataset:
+  # ACT 仅支持单帧观测
+  n_obs_steps: 1
+  # chunk_size = horizon（对齐 LeRobot ACTConfig.chunk_size=100）
+  horizon: 100
+  run_name: pusht_merged_quanfu_my_demo_teleop10fps
+  crop_size: 84
+  eval_fixed_crop: true
+  # 与原版 ACT / LeRobot 一致：MEAN_STD
+  norm_mode: gaussian
+
+policy:
+  type: act
+  vision_backbone: resnet18
+  pretrained_encoder: true
+  # LeRobot ACTConfig 默认结构
+  dim_model: 512
+  dim_feedforward: 3200
+  n_heads: 8
+  n_encoder_layers: 4
+  n_decoder_layers: 1
+  n_vae_encoder_layers: 4
+  latent_dim: 32
+  kl_weight: 10.0
+  dropout: 0.1
+  use_vae: true
+  pre_norm: false
+  feedforward_activation: relu
+  replace_final_stride_with_dilation: false
+  # 执行整个 chunk 后再 replan（经典 ACT）
+  n_action_steps: 100
+  temporal_ensemble_coeff: null
+  rtc:
+    enabled: false
+
+train:
+  # ACT 常用较小 batch + 1e-5 lr（LeRobot 预设）
+  batch_size: 8
+  steps: 50000
+  lr: 0.00001
+  weight_decay: 0.0001
+  log_freq: 100
+  save_freq: 5000
+  device: cuda
+  num_workers: 4
+  cosine_lr: true
+  warmup_steps: 500
+  # backbone lr = lr * scale；LeRobot 中 backbone 与其余同为 1e-5
+  encoder_lr_scale: 1.0
+  max_grad_norm: 1.0
+
+eval:
+  num_episodes: 50
+  save_video: false
+  video_dir: outputs/eval_videos_act_quanfu
+  success_coverage: 0.92
+
+collect:
+  target_episodes: 30
+  save_all: false
+  task: push the T block to the target

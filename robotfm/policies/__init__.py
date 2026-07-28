@@ -1,0 +1,37 @@
+"""策略模块总入口。
+
+当前包含：
+- `encoders.py`: 多相机图像（预训练 ResNet18）与状态编码
+- `video_encoders.py`: SlowFast-R50 视频编码（与 ResNet 分文件）
+- `unet1d.py`: ConditionalUnet1D + FiLM 动作骨干
+- `dit.py`: 旧版 DiT（保留作消融对照）
+- `flow_matching.py`: OT-CFM 训练损失与 Euler 采样（可选 RTC）
+- `a2a/`: Action-to-Action / N-A2A（torchcfm；obs_state history → future actions）
+- `act/`: Action Chunking Transformer（对齐 LeRobot / 原版 ACT）
+- `rtc/`: Real-Time Chunking 推理引导
+- `multitask_dit.py`: 第二阶段语言条件预留
+
+建议阅读顺序：
+1. `ARCHITECTURE.md`
+2. `flow_matching.py` / `a2a/` / `act/`
+3. `rtc/`
+4. `encoders.py` / `video_encoders.py`
+5. `unet1d.py`
+"""
+
+from robotfm.policies.a2a import A2AConfig, A2APolicy
+from robotfm.policies.act import ACTConfig, ACTPolicy
+from robotfm.policies.flow_matching import FlowMatchingConfig, FlowMatchingPolicy
+from robotfm.policies.rtc import ActionQueue, RTCConfig, RTCProcessor
+
+__all__ = [
+    "A2AConfig",
+    "A2APolicy",
+    "ACTConfig",
+    "ACTPolicy",
+    "ActionQueue",
+    "FlowMatchingConfig",
+    "FlowMatchingPolicy",
+    "RTCConfig",
+    "RTCProcessor",
+]

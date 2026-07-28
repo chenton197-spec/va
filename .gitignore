@@ -1,0 +1,23 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+dist/
+build/
+.pytest_cache/
+.venv/
+venv/
+.env
+
+# Large non-core artifacts (repo root only)
+/data/
+/data_*/
+/outputs/
+*.pt
+*.pth
+*.ckpt
+*.safetensors
+*.zarr/
+wandb/
+checkpoints/
+*.log

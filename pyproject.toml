@@ -1,0 +1,32 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "robotfm"
+version = "0.1.0"
+description = "Extensible robot learning framework with flow matching"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "gym-pusht>=0.1.5",
+    "gymnasium>=0.29",
+    "numpy>=1.24",
+    "opencv-python>=4.8",
+    "pygame>=2.5",
+    "pymunk<7",
+    "pyyaml>=6.0",
+    "torch>=2.1",
+    "torchvision>=0.16",
+    "tqdm>=4.66",
+    "matplotlib>=3.7",
+    "pytorchvideo>=0.1.5",
+    "torchcfm>=1.0.0",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=7.0"]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["robotfm*"]

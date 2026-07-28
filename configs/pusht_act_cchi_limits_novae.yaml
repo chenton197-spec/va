@@ -1,0 +1,75 @@
+backend: pusht
+embodiment: pusht_sim
+cameras: [top]
+state_dim: 2
+action_dim: 2
+state_names: [x, y]
+action_names: [x, y]
+fps: 10
+data_root: data/demos
+# ACT recipe v3 on cchi: limits (FM-aligned) + no VAE + dataset image MEAN_STD + constant LR
+output_dir: outputs/act_pusht_cchi_limits_novae
+
+env:
+  render_size: 96
+  max_episode_steps: 1000
+  render_mode: human
+
+dataset:
+  n_obs_steps: 1
+  horizon: 8
+  run_name: pusht_merged_cchi_teleop10fps
+  crop_size: 84
+  eval_fixed_crop: true
+  # Align successful FM PushT recipe
+  norm_mode: limits
+  image_norm_mode: dataset
+
+policy:
+  type: act
+  vision_backbone: resnet18
+  pretrained_encoder: true
+  dim_model: 512
+  dim_feedforward: 3200
+  n_heads: 8
+  n_encoder_layers: 4
+  n_decoder_layers: 1
+  n_vae_encoder_layers: 4
+  latent_dim: 32
+  kl_weight: 10.0
+  dropout: 0.1
+  # Deterministic ACT (no CVAE) — reduce posterior collapse risk on PushT
+  use_vae: false
+  pre_norm: false
+  feedforward_activation: relu
+  replace_final_stride_with_dilation: false
+  # Match FM closed-loop replan frequency
+  n_action_steps: 6
+  temporal_ensemble_coeff: null
+  rtc:
+    enabled: false
+
+train:
+  batch_size: 8
+  steps: 50000
+  lr: 0.00001
+  weight_decay: 0.0001
+  log_freq: 100
+  save_freq: 5000
+  device: cuda
+  num_workers: 4
+  cosine_lr: false
+  warmup_steps: 500
+  encoder_lr_scale: 1.0
+  max_grad_norm: 1.0
+
+eval:
+  num_episodes: 50
+  save_video: false
+  video_dir: outputs/eval_videos_act_cchi_limits_novae
+  success_coverage: 0.92
+
+collect:
+  target_episodes: 30
+  save_all: false
+  task: push the T block to the target

@@ -1,0 +1,77 @@
+backend: pusht
+embodiment: pusht_sim
+cameras: [top]
+state_dim: 2
+action_dim: 2
+state_names: [x, y]
+action_names: [x, y]
+fps: 30
+data_root: data/demos
+# N-A2A 无 OT = a2a + history_noise；limits_01 → [0,1]；30k
+output_dir: outputs/a2a_noise_limits01_pusht
+
+env:
+  render_size: 96
+  max_episode_steps: 1000
+  render_mode: human
+
+dataset:
+  n_obs_steps: 8
+  horizon: 8
+  run_name: pusht_merged_cchi_teleop10fps
+  crop_size: 84
+  eval_fixed_crop: true
+  # gaussian | limits([-1,1]) | limits_01([0,1])
+  norm_mode: limits_01
+
+policy:
+  # a2a + history_noise → 只有 noise、无 OT（OT 仅 n_a2a 开启）
+  type: a2a
+  hidden_dim: 256
+  num_inference_steps: 6
+  n_action_steps: 8
+  pretrained_encoder: true
+  use_frame_diff: true
+  latent_dim: 512
+  consistency_weight: 1.0
+  enc_recon_weight: 0.5
+  flow_recon_weight: 0.5
+  enc_contrastive_weight: 0.0
+  flow_contrastive_weight: 0.0
+  history_noise_std: 0.1
+  flow_hidden_dim: 512
+  flow_num_layers: 4
+  flow_mlp_ratio: 4.0
+  flow_dropout: 0.0
+  ae_enc_hidden_dim: 512
+  ae_dec_hidden_dim: 512
+  ae_num_layers: 4
+  ae_dropout: 0.0
+  decode_flow_latents: true
+  rtc:
+    enabled: false
+
+train:
+  batch_size: 64
+  steps: 30000
+  lr: 0.0003
+  weight_decay: 0.000001
+  log_freq: 100
+  save_freq: 5000
+  device: cuda
+  num_workers: 2
+  cosine_lr: true
+  warmup_steps: 500
+  encoder_lr_scale: 0.1
+  max_grad_norm: 1.0
+
+eval:
+  num_episodes: 50
+  save_video: false
+  video_dir: outputs/eval_videos_a2a_noise_limits01
+  success_coverage: 0.92
+
+collect:
+  target_episodes: 30
+  save_all: false
+  task: push the T block to the target
