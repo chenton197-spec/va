@@ -28,13 +28,13 @@ from robotfm.config import (
     resolve_path,
 )
 from robotfm.collect.loop import get_run_dir
-from robotfm.data.dataset import EpisodeDataset
+from robotfm.data.dataset import build_episode_dataset
 from robotfm.data.stats import ensure_stats, resolve_image_stats
-from robotfm.policies.a2a import A2AConfig, A2APolicy
 from robotfm.policies.act import ACTConfig, ACTPolicy
 from robotfm.policies.flow_matching import FlowMatchingConfig, FlowMatchingPolicy
 
-PolicyModule = FlowMatchingPolicy | A2APolicy | ACTPolicy
+# A2A is optional (torchcfm); import lazily in _build_a2a_policy.
+PolicyModule = FlowMatchingPolicy | ACTPolicy | torch.nn.Module
 
 
 class _TrainLogger:
@@ -115,7 +115,14 @@ def _load_resume_checkpoint(
     return start_step, stats if stats is not None else None
 
 
-def _build_a2a_policy(cfg: RobotFMConfig) -> A2APolicy:
+def _build_a2a_policy(cfg: RobotFMConfig) -> torch.nn.Module:
+    try:
+        from robotfm.policies.a2a import A2AConfig, A2APolicy
+    except ImportError as exc:
+        raise ImportError(
+            "policy.type a2a/n_a2a requires torchcfm; pip install torchcfm"
+        ) from exc
+
     ptype = cfg.policy.type.lower()
     history_noise_std = cfg.policy.history_noise_std
     use_ot = ptype == "n_a2a"
@@ -359,7 +366,7 @@ def train_flow_matching(
             )
             logger.log("stats: recomputed with image_mean/image_std for ACT dataset norm")
 
-        dataset = EpisodeDataset(
+        dataset = build_episode_dataset(
             run_dir=run_dir,
             n_obs_steps=cfg.dataset.n_obs_steps,
             horizon=cfg.dataset.horizon,

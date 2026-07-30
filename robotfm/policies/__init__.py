@@ -19,7 +19,10 @@
 5. `unet1d.py`
 """
 
-from robotfm.policies.a2a import A2AConfig, A2APolicy
+from __future__ import annotations
+
+from typing import Any
+
 from robotfm.policies.act import ACTConfig, ACTPolicy
 from robotfm.policies.flow_matching import FlowMatchingConfig, FlowMatchingPolicy
 from robotfm.policies.rtc import ActionQueue, RTCConfig, RTCProcessor
@@ -35,3 +38,12 @@ __all__ = [
     "RTCConfig",
     "RTCProcessor",
 ]
+
+
+def __getattr__(name: str) -> Any:
+    """Lazy-import A2A so FM / ACT / dataset paths work without torchcfm."""
+    if name in {"A2AConfig", "A2APolicy"}:
+        from robotfm.policies.a2a import A2AConfig, A2APolicy
+
+        return A2AConfig if name == "A2AConfig" else A2APolicy
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

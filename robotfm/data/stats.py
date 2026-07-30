@@ -43,6 +43,148 @@ def validate_image_norm_mode(mode: str) -> ImageNormMode:
     return mode  # type: ignore[return-value]
 
 
+def _stats_from_state_action(
+    states: list[np.ndarray],
+    actions: list[np.ndarray],
+    *,
+    image_mean: np.ndarray | None = None,
+    image_std: np.ndarray | None = None,
+) -> dict[str, np.ndarray]:
+    if not states or not actions:
+        raise ValueError("No state/action arrays to aggregate")
+    state_all = np.concatenate(states, axis=0)
+    action_all = np.concatenate(actions, axis=0)
+    if image_mean is None or image_std is None:
+        ref = imagenet_image_stats()
+        image_mean = ref["image_mean"]
+        image_std = ref["image_std"]
+    return {
+        "state_mean": state_all.mean(axis=0).astype(np.float32),
+        "state_std": (state_all.std(axis=0) + 1e-6).astype(np.float32),
+        "state_min": state_all.min(axis=0).astype(np.float32),
+        "state_max": state_all.max(axis=0).astype(np.float32),
+        "action_mean": action_all.mean(axis=0).astype(np.float32),
+        "action_std": (action_all.std(axis=0) + 1e-6).astype(np.float32),
+        "action_min": action_all.min(axis=0).astype(np.float32),
+        "action_max": action_all.max(axis=0).astype(np.float32),
+        "image_mean": np.asarray(image_mean, dtype=np.float32),
+        "image_std": np.asarray(image_std, dtype=np.float32),
+    }
+
+
+def _merge_episode_stats_jsonl(run_dir: Path) -> dict[str, np.ndarray] | None:
+    """Weighted merge of ``meta/episodes_stats.jsonl`` into robotfm stats (7-D).
+
+    Returns None if the file is missing or incomplete.
+    """
+    path = Path(run_dir) / "meta" / "episodes_stats.jsonl"
+    if not path.is_file():
+        return None
+
+    # Accumulators for mean / min / max / second moment via count-weighted merge
+    keys = (
+        ("observation.state", "observation.gripper", "state"),
+        ("action", "action.gripper", "action"),
+    )
+    acc: dict[str, dict[str, np.ndarray | float]] = {}
+    for arm_key, grip_key, prefix in keys:
+        acc[prefix] = {
+            "count": 0.0,
+            "sum": None,
+            "sq_sum": None,
+            "min": None,
+            "max": None,
+        }
+
+    def _as_vec(
+        arm: dict, grip: dict | None
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, float]:
+        arm_mean = np.asarray(arm["mean"], dtype=np.float64)
+        arm_std = np.asarray(arm["std"], dtype=np.float64)
+        arm_min = np.asarray(arm["min"], dtype=np.float64)
+        arm_max = np.asarray(arm["max"], dtype=np.float64)
+        count = float(arm["count"])
+        if isinstance(grip, dict):
+            mean = np.concatenate([arm_mean, np.asarray([grip["mean"]], dtype=np.float64)])
+            std = np.concatenate([arm_std, np.asarray([grip["std"]], dtype=np.float64)])
+            vmin = np.concatenate([arm_min, np.asarray([grip["min"]], dtype=np.float64)])
+            vmax = np.concatenate([arm_max, np.asarray([grip["max"]], dtype=np.float64)])
+        else:
+            mean, std, vmin, vmax = arm_mean, arm_std, arm_min, arm_max
+        return mean, std, vmin, vmax, count
+
+    n_lines = 0
+    with path.open() as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            raw = json.loads(line)
+            ep_stats = raw["stats"]
+            n_lines += 1
+            for arm_key, grip_key, prefix in keys:
+                if arm_key not in ep_stats:
+                    return None
+                grip = ep_stats.get(grip_key)
+                if grip is not None and not isinstance(grip, dict):
+                    return None
+                mean, std, vmin, vmax, count = _as_vec(ep_stats[arm_key], grip)
+                bucket = acc[prefix]
+                sq = np.square(std) + np.square(mean)  # E[x^2] = var + mean^2
+                if bucket["sum"] is None:
+                    bucket["sum"] = mean * count
+                    bucket["sq_sum"] = sq * count
+                    bucket["min"] = vmin.copy()
+                    bucket["max"] = vmax.copy()
+                    bucket["count"] = count
+                else:
+                    bucket["sum"] = bucket["sum"] + mean * count
+                    bucket["sq_sum"] = bucket["sq_sum"] + sq * count
+                    bucket["min"] = np.minimum(bucket["min"], vmin)
+                    bucket["max"] = np.maximum(bucket["max"], vmax)
+                    bucket["count"] = float(bucket["count"]) + count
+
+    if n_lines == 0:
+        return None
+
+    out: dict[str, np.ndarray] = {}
+    for prefix in ("state", "action"):
+        bucket = acc[prefix]
+        count = float(bucket["count"])
+        if count <= 0 or bucket["sum"] is None:
+            return None
+        mean = np.asarray(bucket["sum"], dtype=np.float64) / count
+        ex2 = np.asarray(bucket["sq_sum"], dtype=np.float64) / count
+        var = np.maximum(ex2 - np.square(mean), 0.0)
+        std = np.sqrt(var) + 1e-6
+        out[f"{prefix}_mean"] = mean.astype(np.float32)
+        out[f"{prefix}_std"] = std.astype(np.float32)
+        out[f"{prefix}_min"] = np.asarray(bucket["min"], dtype=np.float32)
+        out[f"{prefix}_max"] = np.asarray(bucket["max"], dtype=np.float32)
+
+    ref = imagenet_image_stats()
+    out["image_mean"] = ref["image_mean"]
+    out["image_std"] = ref["image_std"]
+    return out
+
+
+def compute_lerobot_stats(run_dir: Path) -> dict[str, np.ndarray]:
+    """Compute stats for a leobot image-sequence dataset root.
+
+    Prefers weighted merge of ``meta/episodes_stats.jsonl``; falls back to
+    scanning parquet state/action. Image mean/std default to ImageNet (FM
+    does not require a full pixel scan).
+    """
+    merged = _merge_episode_stats_jsonl(run_dir)
+    if merged is not None:
+        return merged
+
+    from robotfm.data.lerobot_dataset import iter_lerobot_state_action
+
+    _meta, states, actions = iter_lerobot_state_action(run_dir)
+    return _stats_from_state_action(states, actions)
+
+
 def compute_stats(run_dir: Path) -> dict[str, np.ndarray]:
     """遍历 run 下所有 episode，计算 state/action/image 的全局统计量。
 
@@ -51,7 +193,16 @@ def compute_stats(run_dir: Path) -> dict[str, np.ndarray]:
         action_mean, action_std, action_min, action_max,
         image_mean, image_std  （RGB，形状 (3,)，像素已 /255 → [0,1]）
     std 上加 1e-6 防止除零。min/max 供 ``limits`` / ``limits_01`` 模式使用。
+
+    LeRobot image-sequence roots (``meta/info.json``) use parquet / episodes_stats
+    and skip a full image pixel scan (ImageNet image stats by default).
     """
+    run_dir = Path(run_dir)
+    from robotfm.data.lerobot_dataset import is_lerobot_image_sequence_root
+
+    if is_lerobot_image_sequence_root(run_dir):
+        return compute_lerobot_stats(run_dir)
+
     meta = load_meta(run_dir)
     episode_files = sorted((run_dir / "episodes").glob("ep_*.npz"))
     if not episode_files:
@@ -79,25 +230,15 @@ def compute_stats(run_dir: Path) -> dict[str, np.ndarray]:
     if pixel_count <= 0:
         raise ValueError(f"No image pixels found in {run_dir}")
 
-    state_all = np.concatenate(states, axis=0)
-    action_all = np.concatenate(actions, axis=0)
     image_mean = pixel_sum / pixel_count
     image_var = pixel_sq_sum / pixel_count - np.square(image_mean)
     image_std = np.sqrt(np.maximum(image_var, 0.0)) + 1e-6
-
-    stats = {
-        "state_mean": state_all.mean(axis=0),
-        "state_std": state_all.std(axis=0) + 1e-6,
-        "state_min": state_all.min(axis=0),
-        "state_max": state_all.max(axis=0),
-        "action_mean": action_all.mean(axis=0),
-        "action_std": action_all.std(axis=0) + 1e-6,
-        "action_min": action_all.min(axis=0),
-        "action_max": action_all.max(axis=0),
-        "image_mean": image_mean.astype(np.float32),
-        "image_std": image_std.astype(np.float32),
-    }
-    return stats
+    return _stats_from_state_action(
+        states,
+        actions,
+        image_mean=image_mean.astype(np.float32),
+        image_std=image_std.astype(np.float32),
+    )
 
 
 def save_stats(run_dir: Path, stats: dict[str, np.ndarray]) -> None:

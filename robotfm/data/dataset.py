@@ -22,6 +22,22 @@ from robotfm.data.schema import image_key, load_episode, load_meta
 from robotfm.data.stats import is_limits_mode, normalize, validate_norm_mode
 
 
+def build_episode_dataset(run_dir: Path, **kwargs):
+    """Build NPZ ``EpisodeDataset`` or LeRobot image-sequence dataset.
+
+    Auto-detects ``run_dir/meta/info.json`` with ``image_storage=image_sequence``.
+    """
+    from robotfm.data.lerobot_dataset import (
+        LeRobotImageSequenceDataset,
+        is_lerobot_image_sequence_root,
+    )
+
+    run_dir = Path(run_dir)
+    if is_lerobot_image_sequence_root(run_dir):
+        return LeRobotImageSequenceDataset(run_dir=run_dir, **kwargs)
+    return EpisodeDataset(run_dir=run_dir, **kwargs)
+
+
 def resize_images(images: torch.Tensor, size: int | None) -> torch.Tensor:
     """双线性缩放到 ``size×size``。
 

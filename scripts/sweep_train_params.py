@@ -26,7 +26,7 @@ from tqdm import tqdm
 
 from robotfm.config import RobotFMConfig, load_config, resolve_path
 from robotfm.collect.loop import get_run_dir
-from robotfm.data.dataset import EpisodeDataset
+from robotfm.data.dataset import build_episode_dataset
 from robotfm.data.stats import ensure_stats
 from robotfm.train import build_policy
 
@@ -51,7 +51,7 @@ def run_one(
     run_dir = get_run_dir(cfg, base_dir)
     stats = ensure_stats(run_dir, cfg.dataset.norm_mode)
 
-    dataset = EpisodeDataset(
+    dataset = build_episode_dataset(
         run_dir=run_dir,
         n_obs_steps=cfg.dataset.n_obs_steps,
         horizon=cfg.dataset.horizon,

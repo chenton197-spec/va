@@ -13,6 +13,8 @@ dependencies = [
     "gymnasium>=0.29",
     "numpy>=1.24",
     "opencv-python>=4.8",
+    "pillow>=10.0",
+    "pyarrow>=14.0",
     "pygame>=2.5",
     "pymunk<7",
     "pyyaml>=6.0",
