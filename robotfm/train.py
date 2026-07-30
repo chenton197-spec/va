@@ -3,7 +3,7 @@
 流程:
 1. 加载/计算 stats.json
 2. 构建 EpisodeDataset + DataLoader
-3. 按 policy.type 实例化 FlowMatchingPolicy / A2APolicy / ACTPolicy
+3. 按 policy.type 实例化 FlowMatchingPolicy / A2APolicy / VITAPolicy / ACTPolicy
 4. AdamW（encoder 小 lr）+ grad clip，定期保存 checkpoint
 5. 将训练日志写入 ``output_dir/train.log``
 
@@ -32,9 +32,10 @@ from robotfm.data.dataset import build_episode_dataset
 from robotfm.data.stats import ensure_stats, resolve_image_stats
 from robotfm.policies.act import ACTConfig, ACTPolicy
 from robotfm.policies.flow_matching import FlowMatchingConfig, FlowMatchingPolicy
+from robotfm.policies.vita import VITAConfig, VITAPolicy
 
 # A2A is optional (torchcfm); import lazily in _build_a2a_policy.
-PolicyModule = FlowMatchingPolicy | ACTPolicy | torch.nn.Module
+PolicyModule = FlowMatchingPolicy | VITAPolicy | ACTPolicy | torch.nn.Module
 
 
 class _TrainLogger:
@@ -144,7 +145,7 @@ def _build_a2a_policy(cfg: RobotFMConfig) -> torch.nn.Module:
         enc_contrastive_weight=cfg.policy.enc_contrastive_weight,
         flow_contrastive_weight=cfg.policy.flow_contrastive_weight,
         history_noise_std=history_noise_std,
-        use_ot_matcher=use_ot,
+        use_ot_matcher=use_ot or cfg.policy.use_ot_matcher,
         decode_flow_latents=cfg.policy.decode_flow_latents,
         flow_hidden_dim=cfg.policy.flow_hidden_dim,
         flow_num_layers=cfg.policy.flow_num_layers,
@@ -158,6 +159,39 @@ def _build_a2a_policy(cfg: RobotFMConfig) -> torch.nn.Module:
         use_frame_diff=cfg.policy.use_frame_diff,
     )
     return A2APolicy(a2a_cfg)
+
+
+def _build_vita_policy(cfg: RobotFMConfig) -> VITAPolicy:
+    """构造 VITA（视觉潜变量 → 动作潜变量）。"""
+    vita_cfg = VITAConfig(
+        num_cameras=len(cfg.cameras),
+        state_dim=cfg.state_dim,
+        action_dim=cfg.action_dim,
+        horizon=cfg.dataset.horizon,
+        n_obs_steps=cfg.dataset.n_obs_steps,
+        n_action_steps=cfg.policy.n_action_steps,
+        latent_dim=cfg.policy.latent_dim,
+        hidden_dim=cfg.policy.hidden_dim,
+        num_inference_steps=cfg.policy.num_inference_steps,
+        consistency_weight=cfg.policy.consistency_weight,
+        enc_recon_weight=cfg.policy.enc_recon_weight,
+        flow_recon_weight=cfg.policy.flow_recon_weight,
+        enc_contrastive_weight=cfg.policy.enc_contrastive_weight,
+        flow_contrastive_weight=cfg.policy.flow_contrastive_weight,
+        use_ot_matcher=cfg.policy.use_ot_matcher,
+        decode_flow_latents=cfg.policy.decode_flow_latents,
+        flow_hidden_dim=cfg.policy.flow_hidden_dim,
+        flow_num_layers=cfg.policy.flow_num_layers,
+        flow_mlp_ratio=cfg.policy.flow_mlp_ratio,
+        flow_dropout=cfg.policy.flow_dropout,
+        ae_enc_hidden_dim=cfg.policy.ae_enc_hidden_dim,
+        ae_dec_hidden_dim=cfg.policy.ae_dec_hidden_dim,
+        ae_num_layers=cfg.policy.ae_num_layers,
+        ae_dropout=cfg.policy.ae_dropout,
+        pretrained_encoder=cfg.policy.pretrained_encoder,
+        use_frame_diff=cfg.policy.use_frame_diff,
+    )
+    return VITAPolicy(vita_cfg)
 
 
 def _build_act_policy(
@@ -205,6 +239,8 @@ def build_policy(cfg: RobotFMConfig, stats: dict | None = None) -> PolicyModule:
     ptype = cfg.policy.type.lower()
     if ptype in {"a2a", "n_a2a"}:
         return _build_a2a_policy(cfg)
+    if ptype == "vita":
+        return _build_vita_policy(cfg)
     if ptype == "act":
         return _build_act_policy(cfg, stats)
     if ptype != "flow_matching":

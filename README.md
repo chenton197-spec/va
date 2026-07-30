@@ -44,12 +44,18 @@ SlowFast-R50 video backbone (Kinetics pretrained; `n_obs_steps=8`, resize 256 �
 python scripts/train_flow_matching.py --config configs/pusht_slowfast_fm.yaml
 ```
 
-A2A / N-A2A（Action-to-Action flow matching，依赖 `torchcfm`；历史动作为 flow 起点）：
+A2A / N-A2A（Action-to-Action flow matching，依赖 `torchcfm`；历史状态为 flow 起点）：
 
 ```bash
 pip install torchcfm
 python scripts/train_flow_matching.py --config configs/pusht_a2a.yaml
 python scripts/train_flow_matching.py --config configs/pusht_n_a2a.yaml
+```
+
+VITA（Vision-to-Action flow matching；视觉潜变量为起点，默认 OT-CFM）：
+
+```bash
+python scripts/train_flow_matching.py --config configs/pusht_vita.yaml
 ```
 
 Checkpoints go to `outputs/fm_pusht_pretrained/` (see `output_dir` in the yaml).

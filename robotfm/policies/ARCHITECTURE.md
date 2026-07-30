@@ -10,6 +10,7 @@
 - `dit.py`：旧版 DiT（消融对照）
 - `flow_matching.py`：OT-CFM 训练与 Euler 采样（可选 RTC 钩子）
 - `a2a/`：A2A / N-A2A（torchcfm；obs_state / agent_pos → future actions）
+- `vita/`：VITA（torchcfm；视觉潜变量 → 动作潜变量，无 global_cond）
 - `rtc/`：Real-Time Chunking（`RTCConfig` / `RTCProcessor` / `ActionQueue`）
 - `multitask_dit.py`：语言条件预留
 

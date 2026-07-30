@@ -50,9 +50,9 @@ class DatasetConfig:
 
 @dataclass
 class PolicyConfig:
-    """策略结构与采样超参数（flow_matching / a2a / n_a2a / act）。"""
+    """策略结构与采样超参数（flow_matching / a2a / n_a2a / vita / act）。"""
 
-    type: str = "flow_matching"  # flow_matching | a2a | n_a2a | act
+    type: str = "flow_matching"  # flow_matching | a2a | n_a2a | vita | act
     vision_backbone: str = "resnet18"  # resnet18 | slowfast_r50
     hidden_dim: int = 256           # 条件向量 / 全局 cond 维度
     num_layers: int = 4               # 旧 DiT 字段，保留兼容
@@ -68,7 +68,7 @@ class PolicyConfig:
     n_groups: int = 8
     pretrained_encoder: bool = True  # ImageNet / Kinetics 预训练（微调）
     use_frame_diff: bool = True  # ResNet 路径：[I0, I1-I0, ...] 通道堆叠
-    # A2A / N-A2A（flow_matching 忽略）
+    # A2A / N-A2A / VITA（flow_matching 忽略）
     latent_dim: int = 512
     consistency_weight: float = 1.0
     enc_recon_weight: float = 0.5
@@ -76,6 +76,7 @@ class PolicyConfig:
     enc_contrastive_weight: float = 0.0
     flow_contrastive_weight: float = 0.0
     history_noise_std: float = 0.0  # >0 启用 N-A2A 历史加噪
+    use_ot_matcher: bool = False  # True: OT-CFM；VITA 默认在 builder 中开
     flow_hidden_dim: int = 512
     flow_num_layers: int = 4
     flow_mlp_ratio: float = 4.0

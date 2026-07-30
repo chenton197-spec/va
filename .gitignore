@@ -21,3 +21,7 @@ venv/
 wandb/
 checkpoints/
 *.log
+
+# External / unrelated project trees
+/shine_shoes_fr3/
+/shine_shoes_fr3_roi_masked/
