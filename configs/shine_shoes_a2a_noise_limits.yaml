@@ -1,0 +1,54 @@
+# 离线 BC：A2A+noise + limits([-1,1])，无 OT
+# 硬件：RTX 5060 Ti 16GB + i5-12400F 6C/12T + 16GB RAM
+# 瓶颈在双相机 JPEG decode（n_obs=8），不是显存（bs=48 仅~3.3GB）
+# N=63270 → floor(N/16)=3954 steps/epoch → 100 epoch = 395400
+cameras: [hand, head]
+state_dim: 7
+action_dim: 7
+data_root: .
+output_dir: outputs/a2a_noise_shine_shoes_limits
+
+dataset:
+  n_obs_steps: 8
+  horizon: 8
+  run_name: shine_shoes_fr3
+  resize_size: 256
+  crop_size: 224
+  color_jitter_brightness: 0.2
+  color_jitter_contrast: 0.2
+  color_jitter_saturation: 0.1
+  color_jitter_hue: 0.02
+  norm_mode: limits
+
+policy:
+  type: a2a
+  hidden_dim: 256
+  num_inference_steps: 6
+  n_action_steps: 8
+  pretrained_encoder: true
+  use_frame_diff: true
+  latent_dim: 512
+  consistency_weight: 1.0
+  enc_recon_weight: 0.5
+  flow_recon_weight: 0.5
+  history_noise_std: 0.1
+  flow_hidden_dim: 512
+  flow_num_layers: 4
+  flow_mlp_ratio: 4.0
+  ae_enc_hidden_dim: 512
+  ae_dec_hidden_dim: 512
+  ae_num_layers: 4
+
+train:
+  batch_size: 16
+  steps: 395400
+  lr: 0.0003
+  weight_decay: 0.000001
+  log_freq: 20
+  save_freq: 10000
+  device: cuda
+  num_workers: 4
+  cosine_lr: true
+  warmup_steps: 2000
+  encoder_lr_scale: 0.1
+  max_grad_norm: 1.0

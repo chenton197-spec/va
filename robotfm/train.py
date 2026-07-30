@@ -468,17 +468,36 @@ def train_flow_matching(
                 loss = policy.compute_loss(batch)
                 optim.zero_grad(set_to_none=True)
                 loss.backward()
+                # clip_grad_norm_ 返回值为 clip 前的总梯度范数
+                grad_norm_v = float("nan")
                 if cfg.train.max_grad_norm > 0:
-                    torch.nn.utils.clip_grad_norm_(policy.parameters(), cfg.train.max_grad_norm)
+                    grad_norm_v = float(
+                        torch.nn.utils.clip_grad_norm_(
+                            policy.parameters(), cfg.train.max_grad_norm
+                        )
+                    )
                 optim.step()
 
                 lr = float(optim.param_groups[-1]["lr"])
                 loss_v = float(loss.item())
                 if step % cfg.train.log_freq == 0:
-                    pbar.set_postfix(loss=loss_v, lr=lr)
+                    clipped = (
+                        cfg.train.max_grad_norm > 0
+                        and grad_norm_v == grad_norm_v  # not NaN
+                        and grad_norm_v > cfg.train.max_grad_norm
+                    )
+                    pbar.set_postfix(
+                        loss=loss_v,
+                        lr=lr,
+                        gnorm=grad_norm_v,
+                        clip=int(clipped),
+                    )
                     # 只写文件，避免打断 tqdm 进度条
                     logger.log(
-                        f"step={step}/{cfg.train.steps} loss={loss_v:.6f} lr={lr:.8g}",
+                        f"step={step}/{cfg.train.steps} loss={loss_v:.6f} "
+                        f"lr={lr:.8g} grad_norm={grad_norm_v:.6f} "
+                        f"max_grad_norm={cfg.train.max_grad_norm:g} "
+                        f"clipped={int(clipped)}",
                         also_print=False,
                     )
                 if step > 0 and step % cfg.train.save_freq == 0:
