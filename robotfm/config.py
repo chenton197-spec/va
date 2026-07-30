@@ -36,6 +36,11 @@ class DatasetConfig:
     resize_size: int | None = None  # 裁剪前先双线性缩放到该边长；None 表示不缩放
     crop_size: int | None = 84  # 图像裁剪边长；None 表示不裁剪
     eval_fixed_crop: bool = True  # 评估时用中心裁剪（训练用 random crop）
+    # 训练光度增强（评估不加）。0 表示关闭该项。同一条样本对所有相机/历史帧共用一组随机因子。
+    color_jitter_brightness: float = 0.0
+    color_jitter_contrast: float = 0.0
+    color_jitter_saturation: float = 0.0
+    color_jitter_hue: float = 0.0
     # state/action 归一化: gaussian=(x-mean)/std；limits→[-1,1]；limits_01→[0,1]
     norm_mode: str = "gaussian"
     # ACT 图像归一化: imagenet=旧硬编码；dataset=LeRobot VISUAL MEAN_STD（stats.json）

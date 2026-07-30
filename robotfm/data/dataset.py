@@ -86,6 +86,47 @@ def crop_images(images: torch.Tensor, crop_size: int | None, random: bool) -> to
     return images[..., top : top + crop_size, left : left + crop_size]
 
 
+def color_jitter_images(
+    images: torch.Tensor,
+    brightness: float = 0.0,
+    contrast: float = 0.0,
+    saturation: float = 0.0,
+    hue: float = 0.0,
+) -> torch.Tensor:
+    """对 [0,1] CHW 图像做光度增强；同一条样本共用一组随机因子。
+
+    支持形状:
+      - (T, 3, H, W)
+      - (Cams, T, 3, H, W)
+
+    强度为相对幅度（如 brightness=0.2 → 因子均匀采样自 [0.8, 1.2]）。
+    全部为 0 时原样返回。评估路径不应调用本函数。
+    """
+    if brightness <= 0 and contrast <= 0 and saturation <= 0 and hue <= 0:
+        return images
+
+    from torchvision.transforms import functional as TF
+
+    *lead, c, h, w = images.shape
+    flat = images.reshape(-1, c, h, w)
+
+    if brightness > 0:
+        factor = float(torch.empty(1).uniform_(max(0.0, 1.0 - brightness), 1.0 + brightness))
+        flat = TF.adjust_brightness(flat, factor)
+    if contrast > 0:
+        factor = float(torch.empty(1).uniform_(max(0.0, 1.0 - contrast), 1.0 + contrast))
+        flat = TF.adjust_contrast(flat, factor)
+    if saturation > 0:
+        factor = float(torch.empty(1).uniform_(max(0.0, 1.0 - saturation), 1.0 + saturation))
+        flat = TF.adjust_saturation(flat, factor)
+    if hue > 0:
+        # torchvision hue 因子范围 (-0.5, 0.5)
+        factor = float(torch.empty(1).uniform_(-hue, hue))
+        flat = TF.adjust_hue(flat, max(-0.5, min(0.5, factor)))
+
+    return flat.clamp(0.0, 1.0).reshape(*lead, c, h, w)
+
+
 class EpisodeDataset(Dataset):
     """帧级索引的数据集，支持多相机与 action chunking。
 
@@ -108,6 +149,10 @@ class EpisodeDataset(Dataset):
         resize_size: int | None = None,
         crop_size: int | None = 84,
         random_crop: bool = True,
+        color_jitter_brightness: float = 0.0,
+        color_jitter_contrast: float = 0.0,
+        color_jitter_saturation: float = 0.0,
+        color_jitter_hue: float = 0.0,
     ) -> None:
         self.run_dir = Path(run_dir)
         self.meta = load_meta(self.run_dir)
@@ -131,6 +176,10 @@ class EpisodeDataset(Dataset):
         self.resize_size = resize_size
         self.crop_size = crop_size
         self.random_crop = random_crop
+        self.color_jitter_brightness = color_jitter_brightness
+        self.color_jitter_contrast = color_jitter_contrast
+        self.color_jitter_saturation = color_jitter_saturation
+        self.color_jitter_hue = color_jitter_hue
 
         if drop_n_last_frames is None:
             drop_n_last_frames = 0
@@ -214,6 +263,14 @@ class EpisodeDataset(Dataset):
         obs_images = resize_images(obs_images, self.resize_size)
         # 训练时 random_crop=True：随机裁到 crop_size×crop_size
         obs_images = crop_images(obs_images, self.crop_size, random=self.random_crop)
+        if self.random_crop:
+            obs_images = color_jitter_images(
+                obs_images,
+                brightness=self.color_jitter_brightness,
+                contrast=self.color_jitter_contrast,
+                saturation=self.color_jitter_saturation,
+                hue=self.color_jitter_hue,
+            )
 
         # ---- 4) 状态取 obs_indices，并用 stats 归一化 ----
         state = self._normalize_state(arrays["state"][obs_indices].astype(np.float32))

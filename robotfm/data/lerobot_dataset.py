@@ -20,7 +20,7 @@ import torch
 from PIL import Image
 from torch.utils.data import Dataset
 
-from robotfm.data.dataset import crop_images, resize_images
+from robotfm.data.dataset import color_jitter_images, crop_images, resize_images
 from robotfm.data.stats import is_limits_mode, normalize, validate_norm_mode
 from robotfm.types import EpisodeMeta
 
@@ -203,6 +203,10 @@ class LeRobotImageSequenceDataset(Dataset):
         resize_size: int | None = None,
         crop_size: int | None = 84,
         random_crop: bool = True,
+        color_jitter_brightness: float = 0.0,
+        color_jitter_contrast: float = 0.0,
+        color_jitter_saturation: float = 0.0,
+        color_jitter_hue: float = 0.0,
     ) -> None:
         self.run_dir = Path(run_dir)
         self.info = load_lerobot_info(self.run_dir)
@@ -232,6 +236,10 @@ class LeRobotImageSequenceDataset(Dataset):
         self.resize_size = resize_size
         self.crop_size = crop_size
         self.random_crop = random_crop
+        self.color_jitter_brightness = color_jitter_brightness
+        self.color_jitter_contrast = color_jitter_contrast
+        self.color_jitter_saturation = color_jitter_saturation
+        self.color_jitter_hue = color_jitter_hue
 
         if drop_n_last_frames is None:
             drop_n_last_frames = 0
@@ -336,6 +344,14 @@ class LeRobotImageSequenceDataset(Dataset):
         obs_images = torch.stack(images, dim=0)
         obs_images = resize_images(obs_images, self.resize_size)
         obs_images = crop_images(obs_images, self.crop_size, random=self.random_crop)
+        if self.random_crop:
+            obs_images = color_jitter_images(
+                obs_images,
+                brightness=self.color_jitter_brightness,
+                contrast=self.color_jitter_contrast,
+                saturation=self.color_jitter_saturation,
+                hue=self.color_jitter_hue,
+            )
 
         state = self._normalize_state(state_all[obs_indices].astype(np.float32))
 

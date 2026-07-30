@@ -378,6 +378,10 @@ def train_flow_matching(
             resize_size=cfg.dataset.resize_size,
             crop_size=cfg.dataset.crop_size,
             random_crop=True,
+            color_jitter_brightness=cfg.dataset.color_jitter_brightness,
+            color_jitter_contrast=cfg.dataset.color_jitter_contrast,
+            color_jitter_saturation=cfg.dataset.color_jitter_saturation,
+            color_jitter_hue=cfg.dataset.color_jitter_hue,
         )
         logger.log(f"dataset: run_dir={run_dir} num_samples={len(dataset)}")
         loader = DataLoader(

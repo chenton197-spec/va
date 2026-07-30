@@ -3,7 +3,7 @@
 
 Usage (from va/ with conda env lerobot)::
 
-    PYTHONPATH=. python scripts/test_shine_shoes_dataset.py --config configs/shine_shoes_fm.yaml
+    PYTHONPATH=. python scripts/test_shine_shoes_dataset.py --config configs/shine_shoes_fm_limits.yaml
 """
 
 from __future__ import annotations
@@ -56,7 +56,7 @@ def main() -> int:
     parser.add_argument(
         "--config",
         type=str,
-        default="configs/shine_shoes_fm.yaml",
+        default="configs/shine_shoes_fm_limits.yaml",
         help="Path to RobotFM yaml (relative to va/ or absolute)",
     )
     parser.add_argument("--batch-size", type=int, default=2)
