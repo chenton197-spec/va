@@ -14,13 +14,13 @@ import json
 from pathlib import Path
 from typing import Any
 
+import cv2
 import numpy as np
 import pyarrow.parquet as pq
 import torch
-from PIL import Image
 from torch.utils.data import Dataset
 
-from robotfm.data.dataset import color_jitter_images, crop_images, resize_images
+from robotfm.data.dataset import color_jitter_images, crop_images
 from robotfm.data.stats import is_limits_mode, normalize, validate_norm_mode
 from robotfm.types import EpisodeMeta
 
@@ -115,9 +115,30 @@ def build_episode_meta_from_info(
     )
 
 
-def _load_image_rgb(path: Path) -> np.ndarray:
-    with Image.open(path) as img:
-        return np.asarray(img.convert("RGB"), dtype=np.uint8)
+def _load_image_rgb(path: Path, resize_size: int | None = None) -> np.ndarray:
+    """Decode JPEG via OpenCV (faster than PIL); optionally resize in uint8.
+
+    When ``resize_size`` is set, try half-resolution JPEG decode first
+    (``IMREAD_REDUCED_COLOR_2``), then ``cv2.resize`` to target. This avoids
+    bilinear interpolate on full 1280x720 float tensors (dual-cam n_obs hot path).
+    """
+    path_str = str(path)
+    bgr = None
+    if resize_size is not None:
+        half = cv2.imread(path_str, cv2.IMREAD_REDUCED_COLOR_2)
+        if half is not None and min(half.shape[:2]) >= resize_size:
+            bgr = half
+    if bgr is None:
+        bgr = cv2.imread(path_str, cv2.IMREAD_COLOR)
+    if bgr is None:
+        raise FileNotFoundError(f"Failed to read image: {path}")
+    if resize_size is not None:
+        h, w = bgr.shape[:2]
+        if h != resize_size or w != resize_size:
+            bgr = cv2.resize(
+                bgr, (resize_size, resize_size), interpolation=cv2.INTER_AREA
+            )
+    return cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
 
 
 def _vector_column_to_array(values: list) -> np.ndarray:
@@ -321,7 +342,7 @@ class LeRobotImageSequenceDataset(Dataset):
         frames = []
         for fi in frame_indices:
             img_path = self.run_dir / paths[fi]
-            frames.append(_load_image_rgb(img_path))
+            frames.append(_load_image_rgb(img_path, resize_size=self.resize_size))
         return np.stack(frames, axis=0)
 
     def __getitem__(self, idx: int) -> dict[str, torch.Tensor]:
@@ -342,7 +363,7 @@ class LeRobotImageSequenceDataset(Dataset):
             images.append(torch.from_numpy(cam_frames))
 
         obs_images = torch.stack(images, dim=0)
-        obs_images = resize_images(obs_images, self.resize_size)
+        # resize already done in uint8 via OpenCV when resize_size is set
         obs_images = crop_images(obs_images, self.crop_size, random=self.random_crop)
         if self.random_crop:
             obs_images = color_jitter_images(

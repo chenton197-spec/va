@@ -40,6 +40,7 @@ policy:
   ae_num_layers: 4
 
 train:
+  # 瓶颈在双相机 JPEG decode，不是显存。bs=16；workers=4（6 会打满 16GB+swap）。
   batch_size: 16
   steps: 395400
   lr: 0.0003

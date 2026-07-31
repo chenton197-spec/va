@@ -420,14 +420,18 @@ def train_flow_matching(
             color_jitter_hue=cfg.dataset.color_jitter_hue,
         )
         logger.log(f"dataset: run_dir={run_dir} num_samples={len(dataset)}")
-        loader = DataLoader(
-            dataset,
-            batch_size=cfg.train.batch_size,
-            shuffle=True,
-            num_workers=cfg.train.num_workers,
-            pin_memory=True,
-            drop_last=True,
-        )
+        loader_kwargs: dict = {
+            "batch_size": cfg.train.batch_size,
+            "shuffle": True,
+            "num_workers": cfg.train.num_workers,
+            "pin_memory": True,
+            "drop_last": True,
+        }
+        if cfg.train.num_workers > 0:
+            # Avoid worker respawn cost; keep prefetch small for 16GB RAM.
+            loader_kwargs["persistent_workers"] = True
+            loader_kwargs["prefetch_factor"] = 2
+        loader = DataLoader(dataset, **loader_kwargs)
 
         device = torch.device(cfg.train.device if torch.cuda.is_available() else "cpu")
         logger.log(f"device: {device}")
