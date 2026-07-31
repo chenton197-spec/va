@@ -1,0 +1,113 @@
+backend: pusht
+embodiment: pusht_sim
+cameras:
+- hand
+- head
+state_dim: 7
+action_dim: 7
+state_names:
+- x
+- y
+action_names:
+- x
+- y
+fps: 10
+data_root: .
+output_dir: outputs/a2a_noise_shine_shoes_limits_260730175409
+env:
+  render_size: 96
+  max_episode_steps: 300
+  render_mode: human
+dataset:
+  n_obs_steps: 8
+  horizon: 8
+  run_name: shine_shoes_fr3
+  resize_size: 256
+  crop_size: 224
+  eval_fixed_crop: true
+  color_jitter_brightness: 0.2
+  color_jitter_contrast: 0.2
+  color_jitter_saturation: 0.1
+  color_jitter_hue: 0.02
+  norm_mode: limits
+  image_norm_mode: imagenet
+policy:
+  type: a2a
+  vision_backbone: resnet18
+  hidden_dim: 256
+  num_layers: 4
+  num_heads: 4
+  num_inference_steps: 6
+  n_action_steps: 8
+  beta_alpha: 1.5
+  beta_beta: 1.0
+  noise_s: 0.999
+  down_dims:
+  - 256
+  - 512
+  - 1024
+  diffusion_step_embed_dim: 256
+  kernel_size: 5
+  n_groups: 8
+  pretrained_encoder: true
+  use_frame_diff: true
+  latent_dim: 512
+  consistency_weight: 1.0
+  enc_recon_weight: 0.5
+  flow_recon_weight: 0.5
+  enc_contrastive_weight: 0.0
+  flow_contrastive_weight: 0.0
+  history_noise_std: 0.1
+  use_ot_matcher: false
+  flow_hidden_dim: 512
+  flow_num_layers: 4
+  flow_mlp_ratio: 4.0
+  flow_dropout: 0.0
+  ae_enc_hidden_dim: 512
+  ae_dec_hidden_dim: 512
+  ae_num_layers: 4
+  ae_dropout: 0.0
+  decode_flow_latents: true
+  dim_model: 512
+  dim_feedforward: 3200
+  n_heads: 8
+  n_encoder_layers: 4
+  n_decoder_layers: 1
+  n_vae_encoder_layers: 4
+  kl_weight: 10.0
+  dropout: 0.1
+  use_vae: true
+  pre_norm: false
+  feedforward_activation: relu
+  replace_final_stride_with_dilation: false
+  temporal_ensemble_coeff: null
+  rtc:
+    enabled: false
+    prefix_attention_schedule: LINEAR
+    max_guidance_weight: 10.0
+    execution_horizon: 10
+    inference_delay: 0
+    debug: false
+    debug_maxlen: 100
+train:
+  batch_size: 16
+  steps: 395400
+  lr: 0.0003
+  weight_decay: 1.0e-06
+  log_freq: 20
+  save_freq: 10000
+  device: cuda
+  num_workers: 4
+  cosine_lr: true
+  warmup_steps: 2000
+  encoder_lr_scale: 0.1
+  max_grad_norm: 1.0
+eval:
+  num_episodes: 50
+  save_video: false
+  video_dir: outputs/eval_videos
+  success_coverage: 0.85
+collect:
+  target_episodes: 30
+  save_all: false
+  task: push the T block to the target
