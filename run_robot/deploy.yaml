@@ -1,0 +1,39 @@
+# run_policy.py 部署配置（与脚本同目录）
+
+# 策略 checkpoint；相对路径相对于 ct/va/
+checkpoint: outputs/fm_shine_shoes_limits_260730163921/checkpoint_030000.pt
+
+# teleop 部署 YAML：FR3 IP、Orbbec、Gloria-M
+teleop_yaml: /home/casbot/teleop_project/teleop.yaml
+
+# 覆盖 teleop.yaml 中的 fr3.robot_ip；null 表示不覆盖
+robot_ip: null
+
+# MoveJ 回起点速度百分比 [0~100]
+vel: 20.0
+
+# 工具号 / 工件号；null 表示使用机器人当前值
+tool: null
+user: null
+
+# 闭环最大步数
+max_steps: 300
+
+# 启动时 MoveJ 目标（关节角单位：度）
+start_pose:
+  joints_deg:
+    - -47.7424
+    - -91.6757
+    - -91.555
+    - -88.2289
+    - 88.7578
+    - 42.1355
+  tcp_pose:
+    - 528.8538
+    - -449.481
+    - 300.7279
+    - 2.2341
+    - -0.6568
+    - 151.0478
+
+z_limit: -69.5

@@ -44,11 +44,11 @@ train:
   # 瓶颈在双相机 JPEG decode，不是显存。bs=16 + workers=6 是速度/样本量折中。
   # 显存上限约 bs=112；更大 batch 每 step 更慢，200k 墙钟更长。
   batch_size: 16
-  steps: 200000
+  steps: 300000
   lr: 0.0003
   weight_decay: 0.000001
   log_freq: 100
-  save_freq: 10000
+  save_freq: 30000
   device: cuda
   num_workers: 6
   cosine_lr: true
