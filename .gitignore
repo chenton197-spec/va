@@ -21,6 +21,7 @@ venv/
 wandb/
 checkpoints/
 *.log
+/Log/
 
 # External / unrelated project trees
 /shine_shoes_fr3/

@@ -1,17 +1,17 @@
 # 离线 BC：A2A+noise + limits([-1,1])，无 OT
-# 硬件：RTX 5060 Ti 16GB + i5-12400F 6C/12T + 16GB RAM
-# 瓶颈在双相机 JPEG decode（n_obs=8），不是显存（bs=48 仅~3.3GB）
-# N=63270 → floor(N/16)=3954 steps/epoch → 100 epoch = 395400
+# 硬件：RTX 5060 8GB + i5-13500 (14C/20T) + 31GB RAM
+# 数据：shine_shoes_fr3_s256（JPEG 已预缩到 256×256，训练时再 crop 到 224）
+# N=132645 → floor(N/16)=8290 steps/epoch → 50 epoch = 414500
 cameras: [hand, head]
 state_dim: 7
 action_dim: 7
-data_root: .
-output_dir: outputs/a2a_noise_shine_shoes_limits
+data_root: /home/casbot/ct/data
+output_dir: outputs/a2a_noise_shine_shoes_limits_s256
 
 dataset:
   n_obs_steps: 8
   horizon: 8
-  run_name: shine_shoes_fr3
+  run_name: shine_shoes_fr3_s256
   resize_size: 256
   crop_size: 224
   color_jitter_brightness: 0.2
@@ -40,15 +40,15 @@ policy:
   ae_num_layers: 4
 
 train:
-  # 瓶颈在双相机 JPEG decode，不是显存。bs=16；workers=4（6 会打满 16GB+swap）。
+  # 8GB 显存保持 bs=16；s256 预缩放后 decode 更轻，workers=6 通常够用
   batch_size: 16
-  steps: 395400
+  steps: 414500
   lr: 0.0003
   weight_decay: 0.000001
-  log_freq: 20
-  save_freq: 10000
+  log_freq: 50
+  save_freq: 20000
   device: cuda
-  num_workers: 4
+  num_workers: 6
   cosine_lr: true
   warmup_steps: 2000
   encoder_lr_scale: 0.1

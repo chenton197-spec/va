@@ -1,26 +1,36 @@
 #!/usr/bin/env python3
-"""FR3 + Gloria-M + Orbbec 上的 Flow Matching 闭环部署。
+"""FR3 + Gloria-M + Orbbec 上的策略闭环部署。
 
-训练相关配置全部从 checkpoint 读取（相机、维度、norm_mode、
-resize/crop、n_obs_steps、n_action_steps、fps 等）。机械臂走与
+训练相关配置优先来自训练 YAML（``deploy.yaml`` 的 ``config`` 或
+``--config``），否则回退到 checkpoint 内嵌 config（相机、维度、
+norm_mode、resize/crop、n_obs_steps、n_action_steps、fps 等）。
+权重与 stats 仍从 checkpoint 加载。机械臂走与
 ``ct/scripts/move_to_start_pose.py`` 相同的 FAIRINO SDK：
 
   /home/casbot/teleop_project/fairino390/linux/fairino/Robot.py
 
   - 启动时 MoveJ 到 deploy.yaml 中的 start_pose
   - 闭环用 MoveJ 下发关节角（度，速度默认 20）
-  - 夹爪用 Gloria-M ``send_normalized``，开合 ∈ [0, 1]
+  - 夹爪目标写入后台循环，按 ``gripper_rate_hz``（默认 125）连续
+    ``send_normalized``（MIT 不能只偶发一帧）
 
 用法（在 ``ct/va`` 下，conda 环境 ``lerobot``）::
 
-    # 部署参数见同目录 deploy.yaml
+    # 部署 + 训练配置见同目录 deploy.yaml
     PYTHONPATH=. python run_robot/run_policy.py
+
+    # CLI 覆盖训练配置 / checkpoint
+    PYTHONPATH=. python run_robot/run_policy.py \\
+        --config configs/shine_shoes_a2a_noise_limits.yaml \\
+        --checkpoint model/a2a_noise_shine_shoes_limits_260730175409/checkpoint_090000.pt
 """
 
 from __future__ import annotations
 
+import argparse
 import importlib.util
 import sys
+import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -34,7 +44,6 @@ VA_ROOT = Path(__file__).resolve().parents[1]
 TELEOP_ROOT = Path("/home/casbot/teleop_project")
 SDK_ROBOT_PY = TELEOP_ROOT / "fairino390" / "linux" / "fairino" / "Robot.py"
 SCRIPT_DIR = Path(__file__).resolve().parent
-# 与本脚本同目录的部署参数（含 start_pose），不再通过 CLI 覆盖
 DEPLOY_YAML = SCRIPT_DIR / "deploy.yaml"
 DEFAULT_ROBOT_IP = "192.168.57.3"
 
@@ -44,6 +53,7 @@ if str(TELEOP_ROOT) not in sys.path:
 if str(VA_ROOT) not in sys.path:
     sys.path.insert(0, str(VA_ROOT))
 
+from robotfm.config import load_config  # noqa: E402
 from robotfm.data.dataset import crop_images, resize_images  # noqa: E402
 from robotfm.data.stats import denormalize, normalize  # noqa: E402
 from robotfm.train import build_policy  # noqa: E402
@@ -90,7 +100,7 @@ def _resolve_path(value: str | Path, *, base: Path) -> Path:
 
 
 def _load_deploy_config(path: Path) -> dict[str, Any]:
-    """读取 deploy.yaml：checkpoint / teleop / MoveJ / max_steps / start_pose。"""
+    """读取 deploy.yaml：checkpoint / config / teleop / MoveJ / max_steps / start_pose。"""
     if not path.is_file():
         raise FileNotFoundError(f"找不到部署配置: {path}")
     with path.open("r", encoding="utf-8") as f:
@@ -107,14 +117,23 @@ def _load_deploy_config(path: Path) -> dict[str, Any]:
 
     ckpt = _resolve_path(data["checkpoint"], base=VA_ROOT)
     teleop_yaml = _resolve_path(data["teleop_yaml"], base=SCRIPT_DIR)
+    train_cfg = data.get("config")
+    train_cfg_path = (
+        _resolve_path(train_cfg, base=VA_ROOT) if train_cfg else None
+    )
     robot_ip = data.get("robot_ip")
     if robot_ip is not None:
         robot_ip = str(robot_ip)
 
     tool = data.get("tool")
     user = data.get("user")
+    gripper_rate_hz = float(data.get("gripper_rate_hz", 125.0))
+    if gripper_rate_hz <= 0.0:
+        raise ValueError("deploy.yaml 的 gripper_rate_hz 必须 > 0")
+
     return {
         "checkpoint": ckpt,
+        "config": train_cfg_path,
         "teleop_yaml": teleop_yaml,
         "robot_ip": robot_ip,
         "vel": float(data["vel"]),
@@ -124,7 +143,33 @@ def _load_deploy_config(path: Path) -> dict[str, Any]:
         "joints_deg": joints_deg,
         "tcp_pose": tcp_pose,
         "z_limit": float(data["z_limit"]),
+        "gripper_rate_hz": gripper_rate_hz,
     }
+
+
+def _parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="FR3 + Gloria-M + Orbbec 策略闭环部署"
+    )
+    parser.add_argument(
+        "--deploy",
+        type=str,
+        default=str(DEPLOY_YAML),
+        help="部署 YAML（默认 run_robot/deploy.yaml）",
+    )
+    parser.add_argument(
+        "--config",
+        type=str,
+        default=None,
+        help="训练配置 YAML（覆盖 deploy.yaml 的 config；相对路径相对于 ct/va）",
+    )
+    parser.add_argument(
+        "--checkpoint",
+        type=str,
+        default=None,
+        help="checkpoint 路径（覆盖 deploy.yaml；相对路径相对于 ct/va）",
+    )
+    return parser.parse_args()
 
 
 def _parse_start_pose(
@@ -258,11 +303,95 @@ class HardwareBundle:
 
     robot: Any | None = None
     gripper: Any | None = None
+    gripper_loop: "BackgroundGripperLoop | None" = None
     camera_manager: Any | None = None
     camera_names: tuple[str, ...] = ()
     tool: int = 0
     user: int = 0
     start_joints_deg: list[float] | None = None
+
+
+class BackgroundGripperLoop:
+    """后台按固定频率刷 Gloria-M ``send_normalized``，策略只更新目标开合。"""
+
+    def __init__(self, gripper: Any, *, rate_hz: float = 125.0):
+        if rate_hz <= 0.0:
+            raise ValueError("gripper rate_hz 必须 > 0")
+        self._gripper = gripper
+        self._period_s = 1.0 / float(rate_hz)
+        self._rate_hz = float(rate_hz)
+        self._lock = threading.Lock()
+        self._target = 1.0
+        self._stop = threading.Event()
+        self._thread: threading.Thread | None = None
+        self._warn_every = max(1, int(self._rate_hz))
+        self._fail_streak = 0
+
+    @property
+    def rate_hz(self) -> float:
+        return self._rate_hz
+
+    def set_opening(self, opening: float) -> None:
+        value = float(np.clip(opening, 0.0, 1.0))
+        with self._lock:
+            self._target = value
+
+    def get_opening(self) -> float:
+        with self._lock:
+            return float(self._target)
+
+    def start(self, initial_opening: float | None = None) -> None:
+        if self._thread is not None:
+            raise RuntimeError("夹爪后台循环已在运行")
+        if initial_opening is not None:
+            self.set_opening(initial_opening)
+        self._stop.clear()
+        self._thread = threading.Thread(
+            target=self._run,
+            name="gloria-m-gripper-loop",
+            daemon=True,
+        )
+        self._thread.start()
+        print(
+            f"[INFO] Gloria-M 后台循环已启动: {self._rate_hz:g} Hz，"
+            f"初始目标={self.get_opening():.4f}"
+        )
+
+    def stop(self, *, join_timeout_s: float = 2.0) -> None:
+        self._stop.set()
+        thread = self._thread
+        if thread is not None and thread.is_alive():
+            thread.join(timeout=join_timeout_s)
+        self._thread = None
+
+    def _run(self) -> None:
+        next_t = time.perf_counter()
+        while not self._stop.is_set():
+            with self._lock:
+                target = self._target
+            try:
+                ok = bool(self._gripper.send_normalized(target))
+            except Exception as exc:
+                ok = False
+                self._fail_streak += 1
+                if self._fail_streak == 1 or self._fail_streak % self._warn_every == 0:
+                    print(f"[WARN] Gloria-M 后台 send 异常: {exc}")
+            else:
+                if ok:
+                    self._fail_streak = 0
+                else:
+                    self._fail_streak += 1
+                    if self._fail_streak == 1 or self._fail_streak % self._warn_every == 0:
+                        print("[WARN] Gloria-M 后台 send_normalized 失败")
+
+            next_t += self._period_s
+            sleep_s = next_t - time.perf_counter()
+            if sleep_s > 0.0:
+                if self._stop.wait(timeout=sleep_s):
+                    break
+            else:
+                # 过载时丢掉落后节拍，避免追赶打爆串口。
+                next_t = time.perf_counter()
 
 
 def _connect_cameras(teleop_yaml: Path, required: list[str]) -> Any:
@@ -446,8 +575,9 @@ def _send_action(
     vel: float = 20.0,
     z_limit: float,
 ) -> None:
-    """打印并下发一步动作：MoveJ 关节角（度）+ Gloria-M 归一化夹爪。
+    """打印并下发一步动作：先更新夹爪目标，再阻塞 MoveJ。
 
+    夹爪由后台高频循环持续 ``send_normalized``；本函数只改目标开合。
     正运动学得到的笛卡尔 Z 若小于 ``z_limit``（mm），则跳过 MoveJ。
     """
     joints = action[:6].astype(float).tolist()
@@ -458,6 +588,14 @@ def _send_action(
     )
     if hw.robot is None:
         raise RuntimeError("未连接机器人，无法下发 MoveJ")
+
+    # 先写目标，MoveJ 阻塞期间后台仍持续刷 MIT 帧。
+    if hw.gripper_loop is not None:
+        hw.gripper_loop.set_opening(gripper)
+    elif hw.gripper is not None:
+        ok = hw.gripper.send_normalized(gripper)
+        if not ok:
+            print("[WARN] Gloria-M send_normalized 失败")
 
     desc_pos = _forward_kin_desc_pos(hw.robot, joints)
     if desc_pos is not None:
@@ -485,20 +623,22 @@ def _send_action(
     else:
         print("[WARN] GetForwardKin 失败，跳过 MoveJ（无法校验 Z）", flush=True)
 
-    if hw.gripper is not None:
-        ok = hw.gripper.send_normalized(gripper)
-        if not ok:
-            print("[WARN] Gloria-M send_normalized 失败")
-
 
 def _shutdown(hw: HardwareBundle) -> None:
-    """安全退出：停运动、失能夹爪、停相机。"""
+    """安全退出：停运动、停夹爪后台、失能夹爪、停相机。"""
     if hw.robot is not None:
         try:
             hw.robot.StopMotion()
             print("[INFO] FR3 StopMotion")
         except Exception as exc:
             print(f"[WARN] 停止 FR3 时出错: {exc}")
+    if hw.gripper_loop is not None:
+        try:
+            hw.gripper_loop.stop()
+            print("[INFO] Gloria-M 后台循环已停止")
+        except Exception as exc:
+            print(f"[WARN] 停止夹爪后台时出错: {exc}")
+        hw.gripper_loop = None
     if hw.gripper is not None:
         try:
             hw.gripper.disable()
@@ -522,18 +662,39 @@ def _shutdown(hw: HardwareBundle) -> None:
 
 
 def main() -> None:
-    deploy = _load_deploy_config(DEPLOY_YAML)
-    ckpt_path = deploy["checkpoint"]
+    args = _parse_args()
+    deploy_path = Path(args.deploy)
+    if not deploy_path.is_absolute():
+        deploy_path = _resolve_path(deploy_path, base=VA_ROOT)
+    deploy = _load_deploy_config(deploy_path)
+
+    ckpt_path = (
+        _resolve_path(args.checkpoint, base=VA_ROOT)
+        if args.checkpoint
+        else deploy["checkpoint"]
+    )
+    train_cfg_path = (
+        _resolve_path(args.config, base=VA_ROOT)
+        if args.config
+        else deploy["config"]
+    )
     teleop_yaml = deploy["teleop_yaml"]
     if not ckpt_path.is_file():
         raise FileNotFoundError(f"找不到 checkpoint: {ckpt_path}")
     if not teleop_yaml.is_file():
         raise FileNotFoundError(f"找不到 teleop.yaml: {teleop_yaml}")
+    if train_cfg_path is not None and not train_cfg_path.is_file():
+        raise FileNotFoundError(f"找不到训练配置: {train_cfg_path}")
 
-    print(f"[INFO] 部署配置: {DEPLOY_YAML}")
+    print(f"[INFO] 部署配置: {deploy_path}")
     print(f"[INFO] 加载 checkpoint: {ckpt_path}")
     ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
-    cfg = ckpt["config"]
+    if train_cfg_path is not None:
+        cfg = load_config(train_cfg_path)
+        print(f"[INFO] 训练配置: {train_cfg_path}")
+    else:
+        cfg = ckpt["config"]
+        print("[INFO] 训练配置: checkpoint 内嵌 config")
     stats = ckpt["stats"]
     cameras = list(cfg.cameras)
     norm_mode = cfg.dataset.norm_mode
@@ -543,7 +704,8 @@ def main() -> None:
     max_steps = deploy["max_steps"]
 
     print(
-        f"[INFO] cameras={cameras} state_dim={cfg.state_dim} action_dim={cfg.action_dim}"
+        f"[INFO] cameras={cameras} state_dim={cfg.state_dim} action_dim={cfg.action_dim} "
+        f"policy.type={cfg.policy.type}"
     )
     print(
         f"[INFO] norm_mode={norm_mode} n_obs={n_obs} horizon={cfg.dataset.horizon} "
@@ -569,6 +731,12 @@ def main() -> None:
         ip = _resolve_robot_ip(deploy["robot_ip"], teleop_yaml)
         hw.robot = _connect_robot(ip)
         hw.gripper = _connect_gripper(teleop_yaml)
+        # 先以当前反馈为持有目标，避免连接后到首帧动作之间 MIT 断流。
+        hold_opening = _read_gripper(hw.gripper, fallback=1.0)
+        hw.gripper_loop = BackgroundGripperLoop(
+            hw.gripper, rate_hz=deploy["gripper_rate_hz"]
+        )
+        hw.gripper_loop.start(initial_opening=hold_opening)
         hw.camera_manager = _connect_cameras(teleop_yaml, cameras)
         hw.camera_names = tuple(cameras)
 

@@ -1,16 +1,20 @@
 #!/usr/bin/env python3
 """Open-loop offline eval: predicted vs GT actions on one dataset episode.
 
-Matches training/eval conditions from the checkpoint config:
-- stats + norm_mode from checkpoint
-- resize → fixed center crop (no random crop / no color jitter)
-- action chunking with policy.n_action_steps / horizon / num_inference_steps
+训练相关配置优先来自训练 YAML（``--config``，或 checkpoint 同目录的
+``config_source.yaml`` / ``config.yaml``），否则回退到 checkpoint 内嵌
+config。权重与 stats 仍从 checkpoint 加载。
+
+评估预处理与部署一致：
+- resize → fixed center crop（无 random crop / 无 color jitter）
+- action chunking 用 policy.n_action_steps / horizon / num_inference_steps
 
 Usage (from va/ with conda env lerobot)::
 
     PYTHONPATH=. python scripts/eval_episode_openloop.py \\
-      --checkpoint outputs/fm_shine_shoes_limits_260730163921/checkpoint_030000.pt \\
-      --episode 10
+      --checkpoint outputs/a2a_noise_shine_shoes_limits_s256_xxx/checkpoint_320000.pt \\
+      --config configs/shine_shoes_a2a_noise_limits.yaml \\
+      --episode 120 --device cpu
 """
 
 from __future__ import annotations
@@ -24,7 +28,7 @@ import numpy as np
 import torch
 
 from robotfm.collect.loop import get_run_dir
-from robotfm.config import resolve_path
+from robotfm.config import load_config, resolve_path
 from robotfm.data.dataset import crop_images, resize_images
 from robotfm.data.lerobot_dataset import (
     _load_image_rgb,
@@ -34,6 +38,28 @@ from robotfm.data.lerobot_dataset import (
 )
 from robotfm.data.stats import denormalize, normalize
 from robotfm.train import build_policy
+
+
+def _resolve_train_config(ckpt_path: Path, config_arg: str | None, base_dir: Path) -> Path | None:
+    """Resolve training YAML: CLI > config_source.yaml > config.yaml beside ckpt."""
+    if config_arg:
+        p = Path(config_arg)
+        if not p.is_absolute():
+            p = base_dir / p
+        return p.resolve()
+    for name in ("config_source.yaml", "config.yaml"):
+        cand = ckpt_path.parent / name
+        if cand.is_file():
+            return cand
+    return None
+
+
+def _action_names_from_cfg(cfg) -> list[str]:
+    names = list(cfg.action_names)
+    if len(names) == int(cfg.action_dim):
+        return names
+    # YAML often omits names; defaults stay PushT ["x","y"] while action_dim=7.
+    return [f"j{i + 1}" for i in range(int(cfg.action_dim) - 1)] + ["gripper"]
 
 
 def _build_obs_batch(
@@ -79,8 +105,20 @@ def _build_obs_batch(
 def main() -> None:
     parser = argparse.ArgumentParser(description="Open-loop episode action comparison")
     parser.add_argument("--checkpoint", type=str, required=True)
+    parser.add_argument(
+        "--config",
+        type=str,
+        default=None,
+        help="训练配置 YAML（与训练一致）。默认用 checkpoint 同目录 config_source.yaml/config.yaml，再回退 checkpoint 内嵌 config",
+    )
     parser.add_argument("--episode", type=int, default=10)
     parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument(
+        "--device",
+        type=str,
+        default=None,
+        help="Override device (e.g. cpu / cuda). Default: config train.device if CUDA available else cpu",
+    )
     parser.add_argument(
         "--out-dir",
         type=str,
@@ -98,13 +136,21 @@ def main() -> None:
     np.random.seed(args.seed)
 
     ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
-    cfg = ckpt["config"]
+    train_cfg_path = _resolve_train_config(ckpt_path, args.config, base_dir)
+    if train_cfg_path is not None:
+        if not train_cfg_path.is_file():
+            raise FileNotFoundError(f"找不到训练配置: {train_cfg_path}")
+        cfg = load_config(train_cfg_path)
+        print(f"train_config: {train_cfg_path}")
+    else:
+        cfg = ckpt["config"]
+        print("train_config: checkpoint embedded config")
     stats = ckpt["stats"]
     norm_mode = cfg.dataset.norm_mode
     n_obs = cfg.dataset.n_obs_steps
     horizon = cfg.dataset.horizon
     n_action_steps = int(cfg.policy.n_action_steps)
-    action_names = list(cfg.action_names)
+    action_names = _action_names_from_cfg(cfg)
     cameras = list(cfg.cameras)
 
     run_dir = get_run_dir(cfg, base_dir)
@@ -128,7 +174,10 @@ def main() -> None:
     )
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    device = torch.device(cfg.train.device if torch.cuda.is_available() else "cpu")
+    if args.device is not None:
+        device = torch.device(args.device)
+    else:
+        device = torch.device(cfg.train.device if torch.cuda.is_available() else "cpu")
     policy = build_policy(cfg, stats)
     policy.load_state_dict(ckpt["policy_state_dict"])
     policy.to(device)
@@ -182,10 +231,12 @@ def main() -> None:
 
     metrics = {
         "checkpoint": str(ckpt_path),
+        "train_config": str(train_cfg_path) if train_cfg_path is not None else None,
         "episode": args.episode,
         "length": length,
         "n_valid_steps": int(valid.sum()),
         "n_replans": len(replan_ts),
+        "policy_type": cfg.policy.type,
         "norm_mode": norm_mode,
         "n_obs_steps": n_obs,
         "horizon": horizon,
@@ -193,6 +244,7 @@ def main() -> None:
         "num_inference_steps": int(cfg.policy.num_inference_steps),
         "resize_size": cfg.dataset.resize_size,
         "crop_size": cfg.dataset.crop_size,
+        "run_name": cfg.dataset.run_name,
         "seed": args.seed,
         "mae_per_dim": {n: float(v) for n, v in zip(action_names, mae)},
         "rmse_per_dim": {n: float(v) for n, v in zip(action_names, rmse)},

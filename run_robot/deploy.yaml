@@ -1,7 +1,11 @@
 # run_policy.py 部署配置（与脚本同目录）
 
 # 策略 checkpoint；相对路径相对于 ct/va/
-checkpoint: outputs/fm_shine_shoes_limits_260730163921/checkpoint_030000.pt
+checkpoint: model/a2a_noise_shine_shoes_limits_260730175409/checkpoint_090000.pt
+
+# 训练配置 YAML（与训练一致）；相对路径相对于 ct/va/
+# 不设或 null 时回退到 checkpoint 内嵌 config
+config: configs/shine_shoes_a2a_noise_limits.yaml
 
 # teleop 部署 YAML：FR3 IP、Orbbec、Gloria-M
 teleop_yaml: /home/casbot/teleop_project/teleop.yaml
@@ -17,7 +21,7 @@ tool: null
 user: null
 
 # 闭环最大步数
-max_steps: 300
+max_steps: 500
 
 # 启动时 MoveJ 目标（关节角单位：度）
 start_pose:
@@ -37,3 +41,6 @@ start_pose:
     - 151.0478
 
 z_limit: -69.5
+
+# Gloria-M MIT 后台刷帧频率（Hz）；与遥操默认 125 对齐
+gripper_rate_hz: 125
