@@ -1,0 +1,56 @@
+# run_policy.py 部署配置（与脚本同目录）
+
+# 策略 checkpoint；相对路径相对于 ct/va/
+checkpoint: model/a2a_noise_shine_shoes_limits_260730175409/checkpoint_090000.pt
+
+# 训练配置 YAML（与训练一致）；相对路径相对于 ct/va/
+# 不设或 null 时回退到 checkpoint 内嵌 config
+config: configs/shine_shoes_a2a_noise_limits.yaml
+
+# teleop 部署 YAML：FR3 IP、Orbbec、Gloria-M
+teleop_yaml: /home/casbot/teleop_project/teleop.yaml
+
+# 覆盖 teleop.yaml 中的 fr3.robot_ip；null 表示不覆盖
+robot_ip: null
+
+# MoveJ 回起点速度百分比 [0~100]
+vel: 20.0
+
+# 工具号 / 工件号；null 表示使用机器人当前值
+tool: null
+user: null
+
+# 闭环最大步数
+max_steps: 500
+
+# 启动时 MoveJ 目标（关节角单位：度）
+start_pose:
+  joints_deg:
+    - -47.7424
+    - -91.6757
+    - -91.555
+    - -88.2289
+    - 88.7578
+    - 42.1355
+  tcp_pose:
+    - 528.8538
+    - -449.481
+    - 300.7279
+    - 2.2341
+    - -0.6568
+    - 151.0478
+
+z_limit: -69.5
+
+# Gloria-M MIT 后台刷帧频率（Hz）；与遥操默认 125 对齐
+gripper_rate_hz: 125
+
+# ServoJ 后台指令周期 cmdT（秒）；闭环关节控制按此周期刷目标
+servoj_cmdt: 1.0
+
+# RTC 覆盖（可选）；字段为 null 或不写则沿用训练 YAML 的 policy.rtc
+# CLI --rtc / --inference-delay / --execution-horizon 优先级更高
+rtc:
+  enabled: null
+  inference_delay: null
+  execution_horizon: null
