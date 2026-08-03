@@ -89,6 +89,63 @@ def test_rtc_guidance_pulls_prefix_toward_previous_chunk():
     assert torch.isfinite(guided).all()
 
 
+def test_fm_closed_form_correction_matches_identity_autograd():
+    """Frozen-v path: autograd through x1=x+(1-t)*v equals correction=err."""
+    processor = RTCProcessor(
+        RTCConfig(
+            execution_horizon=4,
+            max_guidance_weight=10.0,
+            prefix_attention_schedule=RTCAttentionSchedule.LINEAR,
+            enabled=True,
+        )
+    )
+    torch.manual_seed(0)
+    x_t = torch.randn(2, 4, 2)
+    leftover = torch.randn(2, 4, 2)
+    time = 0.25
+    inference_delay, execution_horizon = 2, 4
+
+    def denoise_fn(x):
+        return -0.3 * x + 0.1
+
+    # Reference: previous identity-autograd formulation.
+    x_ref = x_t.clone().detach()
+    weights = (
+        processor.get_prefix_weights(inference_delay, execution_horizon, x_ref.shape[1])
+        .to(dtype=x_ref.dtype)
+        .unsqueeze(0)
+        .unsqueeze(-1)
+    )
+    with torch.enable_grad():
+        v_ref = denoise_fn(x_ref)
+        x_leaf = x_ref.detach().requires_grad_(True)
+        x1_ref = x_leaf + (1.0 - time) * v_ref
+        err_ref = (leftover - x1_ref) * weights
+        corr_ref = torch.autograd.grad(x1_ref, x_leaf, err_ref.clone().detach())[0]
+
+    # Current closed-form path via denoise_step.
+    v_new = processor.denoise_step(
+        x_t=x_t.clone(),
+        prev_chunk_left_over=leftover,
+        inference_delay=inference_delay,
+        time=time,
+        original_denoise_step_partial=denoise_fn,
+        execution_horizon=execution_horizon,
+    )
+    gw = processor._guidance_weight(
+        time, processor.rtc_config.max_guidance_weight, x_t.device, x_t.dtype
+    )
+    # Reconstruct closed-form result: v + gw * err with same v/x1 as frozen-v.
+    x_cf = x_t.clone().detach()
+    v_cf = denoise_fn(x_cf)
+    x1_cf = x_cf + (1.0 - time) * v_cf
+    err_cf = (leftover - x1_cf) * weights
+    expected = v_cf + gw * err_cf
+
+    assert torch.allclose(corr_ref, err_ref, atol=1e-6, rtol=1e-5)
+    assert torch.allclose(v_new, expected, atol=1e-6, rtol=1e-5)
+
+
 def test_action_queue_merge_skips_inference_delay():
     cfg = RTCConfig(enabled=True, execution_horizon=4, inference_delay=2)
     queue = ActionQueue(cfg)

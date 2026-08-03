@@ -149,11 +149,18 @@ class MultiCameraSlowFastEncoder(nn.Module):
         obs_images: (B, Cams, T, 3, H, W)
         obs_state: (B, T, state_dim)
         returns: cond (B, cond_dim)
+
+        Train: per-camera serial; eval: batch cameras (B*Cams) for one backbone pass.
         """
         b, cams, t, _, _, _ = obs_images.shape
 
-        cam_feats = [self.image_encoder(obs_images[:, c]) for c in range(cams)]
-        img_feat = torch.cat(cam_feats, dim=-1)
+        if self.training:
+            cam_feats = [self.image_encoder(obs_images[:, c]) for c in range(cams)]
+            img_feat = torch.cat(cam_feats, dim=-1)
+        else:
+            flat = obs_images.reshape(b * cams, t, *obs_images.shape[3:])
+            cam_feats = self.image_encoder(flat)
+            img_feat = cam_feats.reshape(b, cams, -1).flatten(1)
 
         state = obs_state.reshape(b * t, -1)
         state_feat = self.state_encoder(state).reshape(b, -1)

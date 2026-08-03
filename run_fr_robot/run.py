@@ -27,6 +27,9 @@ norm_mode、resize/crop、n_obs_steps、n_action_steps、fps 等）。
 
     # 启用 RTC（也可在训练 YAML policy.rtc.enabled / deploy.yaml rtc 段开启）
     PYTHONPATH=. python run_fr_robot/run.py --rtc --inference-delay 2 --execution-horizon 4
+
+    # 可选：torch.compile encoder + denoiser（也可在 deploy.yaml 设 compile: true）
+    PYTHONPATH=. python run_fr_robot/run.py --compile
 """
 
 from __future__ import annotations
@@ -140,6 +143,9 @@ def _load_deploy_config(path: Path) -> dict[str, Any]:
     if servoj_cmdt <= 0.0:
         raise ValueError("deploy.yaml 的 servoj_cmdt 必须 > 0")
 
+    # torch.compile for encoder + denoiser; default off (RTC autograd path).
+    compile_enabled = bool(data.get("compile", False))
+
     rtc_raw = data.get("rtc")
     rtc_override: dict[str, Any] = {}
     if rtc_raw is not None:
@@ -166,6 +172,7 @@ def _load_deploy_config(path: Path) -> dict[str, Any]:
         "z_limit": float(data["z_limit"]),
         "gripper_rate_hz": gripper_rate_hz,
         "servoj_cmdt": servoj_cmdt,
+        "compile": compile_enabled,
         "rtc": rtc_override,
     }
 
@@ -215,6 +222,54 @@ def _apply_rtc_overrides(cfg: Any, deploy_rtc: dict[str, Any], args: argparse.Na
     cfg.policy.rtc = _normalize_rtc_config(cfg.policy.rtc)
 
 
+def _resolve_compile_enabled(deploy: dict[str, Any], args: argparse.Namespace) -> bool:
+    """CLI --compile overrides deploy.yaml ``compile`` (default False)."""
+    if args.compile:
+        return True
+    return bool(deploy.get("compile", False))
+
+
+def _compile_policy_submodules(policy: torch.nn.Module) -> list[str]:
+    """Compile encoder + denoiser + A2A action_decoder (RTC VJP hot path).
+
+    Uses ``mode=\"default\"`` (not ``reduce-overhead``): CUDA graphs in
+    reduce-overhead conflict with SpatialSoftmax grid buffers on repeated calls.
+    """
+    compiled: list[str] = []
+    for name in ("encoder", "unet", "flow_net", "action_decoder"):
+        mod = getattr(policy, name, None)
+        if mod is None:
+            continue
+        setattr(policy, name, torch.compile(mod, mode="default"))
+        compiled.append(name)
+    return compiled
+
+
+def _warmup_compiled_policy(
+    policy: torch.nn.Module,
+    cfg: Any,
+    device: torch.device,
+    *,
+    crop_size: int | None,
+) -> None:
+    """One dummy ``sample_actions`` to finish Inductor compile + CUDA graphs."""
+    n_cams = len(cfg.cameras)
+    n_obs = int(cfg.dataset.n_obs_steps)
+    h = w = int(crop_size or cfg.dataset.resize_size or 224)
+    batch = {
+        "obs_images": torch.zeros(
+            1, n_cams, n_obs, 3, h, w, device=device, dtype=torch.float32
+        ),
+        "obs_state": torch.zeros(
+            1, n_obs, int(cfg.state_dim), device=device, dtype=torch.float32
+        ),
+    }
+    with torch.no_grad():
+        _ = policy.sample_actions(batch)
+    if device.type == "cuda":
+        torch.cuda.synchronize()
+
+
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="FR3 + Gloria-M + Orbbec 策略闭环部署"
@@ -253,6 +308,11 @@ def _parse_args() -> argparse.Namespace:
         type=int,
         default=None,
         help="RTC execution_horizon",
+    )
+    parser.add_argument(
+        "--compile",
+        action="store_true",
+        help="torch.compile encoder + unet/flow_net（覆盖 deploy.yaml compile）",
     )
     return parser.parse_args()
 
@@ -1210,11 +1270,31 @@ def main() -> None:
         print("[INFO] RTC mode: async think-while-moving (control loop not blocked)")
 
     device = torch.device(cfg.train.device if torch.cuda.is_available() else "cpu")
+    if device.type == "cuda":
+        torch.backends.cudnn.benchmark = True
     policy = build_policy(cfg, stats)
     policy.load_state_dict(ckpt["policy_state_dict"])
     policy.to(device)
     policy.eval()
-    print(f"[INFO] 策略已就绪，设备={device}")
+
+    compile_enabled = _resolve_compile_enabled(deploy, args)
+    if compile_enabled:
+        compiled = _compile_policy_submodules(policy)
+        if compiled:
+            print(f"[INFO] torch.compile({', '.join(compiled)}, mode=default)")
+            crop_for_warmup = cfg.dataset.crop_size
+            t_warm = time.perf_counter()
+            _warmup_compiled_policy(
+                policy, cfg, device, crop_size=crop_for_warmup
+            )
+            warm_ms = (time.perf_counter() - t_warm) * 1000.0
+            print(f"[INFO] compile warmup done ({warm_ms:.0f}ms)")
+        else:
+            print("[WARN] --compile set but no encoder/unet/flow_net found; skipped")
+    else:
+        print("[INFO] torch.compile disabled (deploy.compile / --compile)")
+
+    print(f"[INFO] 策略已就绪，设备={device} cudnn.benchmark={device.type == 'cuda'}")
 
     start_joints = deploy["joints_deg"]
     hw = HardwareBundle(start_joints_deg=start_joints)

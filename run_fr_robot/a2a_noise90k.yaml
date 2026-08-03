@@ -48,8 +48,7 @@ gripper_rate_hz: 125
 # ServoJ 后台指令周期 cmdT（秒）；闭环关节控制按此周期刷目标
 servoj_cmdt: 1.0
 
-# torch.compile encoder + unet/flow_net；默认关闭（RTC grad 路径需台上验证）
-# CLI --compile 可强制开启
+# torch.compile encoder + unet/flow_net；默认关闭；CLI --compile 可强制开启
 compile: false
 
 # RTC 覆盖（可选）；字段为 null 或不写则沿用训练 YAML 的 policy.rtc

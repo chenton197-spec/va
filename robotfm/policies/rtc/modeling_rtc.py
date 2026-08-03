@@ -34,6 +34,9 @@ class RTCProcessor:
                 enabled=rtc_config.debug,
                 maxlen=rtc_config.debug_maxlen,
             )
+        # Cache prefix weights / A2A decoder output shape across Euler steps.
+        self._prefix_weight_cache: dict[tuple, Tensor] = {}
+        self._latent_action_hw: tuple[int, int] | None = None
 
     def track(
         self,
@@ -148,7 +151,11 @@ class RTCProcessor:
         original_denoise_step_partial,
         execution_horizon,
     ) -> Tensor:
-        """Action-space RTC (Flow Matching): x_t and leftover are (B, H, A)."""
+        """Action-space RTC (Flow Matching): x_t and leftover are (B, H, A).
+
+        ``v_t`` is computed with ``x_t`` detached, so ``x1 = x_t + (1-t)*v_t`` has
+        ``∂x1/∂x_t = I``. Correction equals ``err`` (identity VJP); skip autograd.
+        """
         x_t = x_t.clone().detach()
 
         squeezed = False
@@ -178,22 +185,16 @@ class RTCProcessor:
             "The padded previous chunk must be the same size as the input tensor"
         )
 
-        weights = (
-            self.get_prefix_weights(inference_delay, execution_horizon, action_chunk_size)
-            .to(device=x_t.device, dtype=x_t.dtype)
-            .unsqueeze(0)
-            .unsqueeze(-1)
+        weights = self._prefix_weights_cached(
+            inference_delay, execution_horizon, action_chunk_size, x_t.device, x_t.dtype
         )
 
-        with torch.enable_grad():
-            v_t = original_denoise_step_partial(x_t)
-            x_t.requires_grad_(True)
-
-            # Clean-action estimate under OT-CFM with t: 0→1, v ≈ x1 - x0
-            x1_t = x_t + (1.0 - time) * v_t  # noqa: N806
-            err = (prev_chunk_left_over - x1_t) * weights
-            grad_outputs = err.clone().detach()
-            correction = torch.autograd.grad(x1_t, x_t, grad_outputs, retain_graph=False)[0]
+        v_t = original_denoise_step_partial(x_t)
+        # Clean-action estimate under OT-CFM with t: 0→1, v ≈ x1 - x0
+        x1_t = x_t + (1.0 - time) * v_t  # noqa: N806
+        err = (prev_chunk_left_over - x1_t) * weights
+        # Identity VJP: v_t is not connected to leaf x_t, so grad(x1, x_t, err) == err.
+        correction = err
 
         guidance_weight = self._guidance_weight(
             tau, self.rtc_config.max_guidance_weight, x_t.device, x_t.dtype
@@ -253,13 +254,7 @@ class RTCProcessor:
                 f"leftover batch {prev_chunk_left_over.shape[0]} != x_t batch {batch_size}"
             )
 
-        # Probe decoder output shape for weights / leftover padding (no grad).
-        with torch.no_grad():
-            probe = decode_x1(x_t)
-        if probe.ndim != 3:
-            raise ValueError(f"decode_x1 must return (B, H, A), got {tuple(probe.shape)}")
-        action_chunk_size = probe.shape[1]
-        action_dim = probe.shape[2]
+        action_chunk_size, action_dim = self._resolve_latent_action_shape(x_t, decode_x1)
 
         if execution_horizon is None:
             execution_horizon = self.rtc_config.execution_horizon
@@ -285,11 +280,8 @@ class RTCProcessor:
             padded[:, :h, :a] = prev_chunk_left_over[:, :h, :a]
             prev_chunk_left_over = padded
 
-        weights = (
-            self.get_prefix_weights(inference_delay, execution_horizon, action_chunk_size)
-            .to(device=x_t.device, dtype=x_t.dtype)
-            .unsqueeze(0)
-            .unsqueeze(-1)
+        weights = self._prefix_weights_cached(
+            inference_delay, execution_horizon, action_chunk_size, x_t.device, x_t.dtype
         )
 
         with torch.enable_grad():
@@ -319,6 +311,50 @@ class RTCProcessor:
         )
 
         return result
+
+    def _resolve_latent_action_shape(
+        self,
+        x_t: Tensor,
+        decode_x1: Callable[[Tensor], Tensor],
+    ) -> tuple[int, int]:
+        """Return (H, A) for A2A decoder; probe at most once per processor."""
+        if self._latent_action_hw is not None:
+            return self._latent_action_hw
+        with torch.no_grad():
+            probe = decode_x1(x_t)
+        if probe.ndim != 3:
+            raise ValueError(f"decode_x1 must return (B, H, A), got {tuple(probe.shape)}")
+        self._latent_action_hw = (int(probe.shape[1]), int(probe.shape[2]))
+        return self._latent_action_hw
+
+    def _prefix_weights_cached(
+        self,
+        start: int,
+        end: int,
+        total: int,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> Tensor:
+        """Prefix weights shaped (1, H, 1), cached across Euler steps."""
+        key = (
+            int(start),
+            int(end),
+            int(total),
+            str(self.rtc_config.prefix_attention_schedule),
+            device.type,
+            device.index,
+            str(dtype),
+        )
+        cached = self._prefix_weight_cache.get(key)
+        if cached is None:
+            cached = (
+                self.get_prefix_weights(start, end, total)
+                .to(device=device, dtype=dtype)
+                .unsqueeze(0)
+                .unsqueeze(-1)
+            )
+            self._prefix_weight_cache[key] = cached
+        return cached
 
     def get_prefix_weights(self, start, end, total):
         start = min(start, end)
