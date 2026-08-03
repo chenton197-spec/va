@@ -244,20 +244,74 @@ def _pace_step(step_start: float, fps: int) -> None:
 # ---------------------------------------------------------------------------
 
 
+def _preprocess_images(
+    images: dict[str, np.ndarray],
+    *,
+    resize_size: int | None,
+    crop_size: int | None,
+    eval_fixed_crop: bool,
+) -> dict[str, np.ndarray]:
+    """相机原图 HWC uint8 → 策略分辨率 HWC float32 [0,1]（resize + 可选中心 crop）。
+
+    入队时做一次，避免每次推理对整段历史重复预处理。
+    """
+    out: dict[str, np.ndarray] = {}
+    for name, rgb in images.items():
+        arr = np.asarray(rgb)
+        if arr.dtype != np.uint8:
+            arr = np.clip(arr, 0, 255).astype(np.uint8)
+        t = torch.from_numpy(arr.astype(np.float32) / 255.0).permute(2, 0, 1).unsqueeze(0)
+        t = resize_images(t, resize_size)
+        if crop_size is not None and eval_fixed_crop:
+            t = crop_images(t, crop_size, random=False)
+        out[name] = t.squeeze(0).permute(1, 2, 0).contiguous().numpy()
+    return out
+
+
+def _prepare_observation(
+    obs: Observation,
+    *,
+    resize_size: int | None,
+    crop_size: int | None,
+    eval_fixed_crop: bool,
+) -> Observation:
+    """替换图像为入队即用的 resize/crop 结果；state 原样保留。"""
+    return Observation(
+        images=_preprocess_images(
+            obs.images,
+            resize_size=resize_size,
+            crop_size=crop_size,
+            eval_fixed_crop=eval_fixed_crop,
+        ),
+        state=np.asarray(obs.state, dtype=np.float32),
+        timestamp=obs.timestamp,
+    )
+
+
+def _append_observation(
+    obs_history: list[Observation],
+    obs: Observation,
+    *,
+    n_obs_steps: int,
+) -> None:
+    """追加观测并只保留最近 ``n_obs_steps`` 帧。"""
+    obs_history.append(obs)
+    overflow = len(obs_history) - n_obs_steps
+    if overflow > 0:
+        del obs_history[:overflow]
+
+
 def _build_obs_batch(
     obs_history: list[Observation],
     cameras: list[str],
     n_obs_steps: int,
-    resize_size: int | None,
-    crop_size: int | None,
-    eval_fixed_crop: bool,
     stats: dict,
     norm_mode: str,
     device: torch.device,
 ) -> dict[str, torch.Tensor]:
-    """将观测历史转为策略输入 batch（batch_size=1）。
+    """将已预处理的观测历史转为策略输入 batch（batch_size=1）。
 
-    - 图像：/255 → CHW → resize → 固定中心 crop（无 color jitter）
+    - 图像：历史中已是 HWC float32 [0,1]（入队时 resize/crop），此处只转 CHW 堆叠
     - 状态：按 checkpoint 的 norm_mode 归一化
     - 历史不足时重复最早一帧（与训练 pad 一致）
     """
@@ -269,9 +323,8 @@ def _build_obs_batch(
     for cam in cameras:
         frames = []
         for obs in history:
-            img = obs.images[cam].astype(np.float32) / 255.0
-            img = np.transpose(img, (2, 0, 1))
-            frames.append(torch.from_numpy(img))
+            img = np.asarray(obs.images[cam], dtype=np.float32)
+            frames.append(torch.from_numpy(np.transpose(img, (2, 0, 1))))
         camera_histories.append(torch.stack(frames, dim=0))
 
     states = [
@@ -281,13 +334,8 @@ def _build_obs_batch(
         for obs in history
     ]
 
-    obs_images = torch.stack(camera_histories, dim=0)
-    obs_images = resize_images(obs_images, resize_size)
-    if crop_size is not None and eval_fixed_crop:
-        obs_images = crop_images(obs_images, crop_size, random=False)
-
     return {
-        "obs_images": obs_images.unsqueeze(0).to(device),
+        "obs_images": torch.stack(camera_histories, dim=0).unsqueeze(0).to(device),
         "obs_state": torch.stack(states, dim=0).unsqueeze(0).to(device),
     }
 
@@ -408,7 +456,6 @@ def _connect_cameras(teleop_yaml: Path, required: list[str]) -> Any:
     manager.start()
     print(f"[INFO] Orbbec 已启动: {[c.name for c in configs]}")
     return manager
-
 
 def _connect_gripper(teleop_yaml: Path) -> Any:
     """连接 Gloria-M 夹爪（与采集侧同一适配器）。"""
@@ -753,7 +800,20 @@ def main() -> None:
 
         obs = _read_observation(hw, cameras, last_state=None)
         obs.validate(cameras, int(cfg.state_dim))
+        resize_size = cfg.dataset.resize_size
+        crop_size = cfg.dataset.crop_size
+        eval_fixed_crop = bool(cfg.dataset.eval_fixed_crop)
+        obs = _prepare_observation(
+            obs,
+            resize_size=resize_size,
+            crop_size=crop_size,
+            eval_fixed_crop=eval_fixed_crop,
+        )
         obs_history: list[Observation] = [obs]
+        print(
+            f"[INFO] 观测入队即 resize/crop "
+            f"(resize={resize_size} crop={crop_size} fixed={eval_fixed_crop})"
+        )
 
         # action chunking：执行 n_action_steps 步后再 replan（与 eval.py 一致）
         chunk_actions: list[np.ndarray] = []
@@ -767,9 +827,6 @@ def main() -> None:
                     obs_history,
                     cameras=cameras,
                     n_obs_steps=n_obs,
-                    resize_size=cfg.dataset.resize_size,
-                    crop_size=cfg.dataset.crop_size,
-                    eval_fixed_crop=bool(cfg.dataset.eval_fixed_crop),
                     stats=stats,
                     norm_mode=norm_mode,
                     device=device,
@@ -791,8 +848,13 @@ def main() -> None:
             print(f"[INFO] step={step_i}", end="")
             _send_action(hw, action, vel=20.0, z_limit=deploy["z_limit"])
 
-            obs = _read_observation(hw, cameras, last_state=obs.state)
-            obs_history.append(obs)
+            obs = _prepare_observation(
+                _read_observation(hw, cameras, last_state=obs.state),
+                resize_size=resize_size,
+                crop_size=crop_size,
+                eval_fixed_crop=eval_fixed_crop,
+            )
+            _append_observation(obs_history, obs, n_obs_steps=n_obs)
             _pace_step(t0, fps)
 
         print("[INFO] 达到 max-steps，正常结束")

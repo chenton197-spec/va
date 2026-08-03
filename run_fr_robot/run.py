@@ -11,6 +11,7 @@ norm_mode、resize/crop、n_obs_steps、n_action_steps、fps 等）。
 
   - 启动时 MoveJ 到 deploy.yaml 中的 start_pose
   - 闭环用独立后台线程 ServoJ 下发关节角（度，``cmdT`` 默认 1.0s）
+  - GetForwardKin / Z 限位校验同在 ServoJ 线程，避免 XML-RPC 并发
   - 夹爪目标写入后台循环，按 ``gripper_rate_hz``（默认 125）连续
     ``send_normalized``（MIT 不能只偶发一帧）
 
@@ -32,10 +33,11 @@ from __future__ import annotations
 
 import argparse
 import importlib.util
+import queue
 import sys
 import threading
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -327,20 +329,74 @@ def _pace_step(step_start: float, fps: int) -> None:
 # ---------------------------------------------------------------------------
 
 
+def _preprocess_images(
+    images: dict[str, np.ndarray],
+    *,
+    resize_size: int | None,
+    crop_size: int | None,
+    eval_fixed_crop: bool,
+) -> dict[str, np.ndarray]:
+    """相机原图 HWC uint8 → 策略分辨率 HWC float32 [0,1]（resize + 可选中心 crop）。
+
+    入队时做一次，避免每次推理对整段历史重复预处理。
+    """
+    out: dict[str, np.ndarray] = {}
+    for name, rgb in images.items():
+        arr = np.asarray(rgb)
+        if arr.dtype != np.uint8:
+            arr = np.clip(arr, 0, 255).astype(np.uint8)
+        t = torch.from_numpy(arr.astype(np.float32) / 255.0).permute(2, 0, 1).unsqueeze(0)
+        t = resize_images(t, resize_size)
+        if crop_size is not None and eval_fixed_crop:
+            t = crop_images(t, crop_size, random=False)
+        out[name] = t.squeeze(0).permute(1, 2, 0).contiguous().numpy()
+    return out
+
+
+def _prepare_observation(
+    obs: Observation,
+    *,
+    resize_size: int | None,
+    crop_size: int | None,
+    eval_fixed_crop: bool,
+) -> Observation:
+    """替换图像为入队即用的 resize/crop 结果；state 原样保留。"""
+    return Observation(
+        images=_preprocess_images(
+            obs.images,
+            resize_size=resize_size,
+            crop_size=crop_size,
+            eval_fixed_crop=eval_fixed_crop,
+        ),
+        state=np.asarray(obs.state, dtype=np.float32),
+        timestamp=obs.timestamp,
+    )
+
+
+def _append_observation(
+    obs_history: list[Observation],
+    obs: Observation,
+    *,
+    n_obs_steps: int,
+) -> None:
+    """追加观测并只保留最近 ``n_obs_steps`` 帧。"""
+    obs_history.append(obs)
+    overflow = len(obs_history) - n_obs_steps
+    if overflow > 0:
+        del obs_history[:overflow]
+
+
 def _build_obs_batch(
     obs_history: list[Observation],
     cameras: list[str],
     n_obs_steps: int,
-    resize_size: int | None,
-    crop_size: int | None,
-    eval_fixed_crop: bool,
     stats: dict,
     norm_mode: str,
     device: torch.device,
 ) -> dict[str, torch.Tensor]:
-    """将观测历史转为策略输入 batch（batch_size=1）。
+    """将已预处理的观测历史转为策略输入 batch（batch_size=1）。
 
-    - 图像：/255 → CHW → resize → 固定中心 crop（无 color jitter）
+    - 图像：历史中已是 HWC float32 [0,1]（入队时 resize/crop），此处只转 CHW 堆叠
     - 状态：按 checkpoint 的 norm_mode 归一化
     - 历史不足时重复最早一帧（与训练 pad 一致）
     """
@@ -352,9 +408,8 @@ def _build_obs_batch(
     for cam in cameras:
         frames = []
         for obs in history:
-            img = obs.images[cam].astype(np.float32) / 255.0
-            img = np.transpose(img, (2, 0, 1))
-            frames.append(torch.from_numpy(img))
+            img = np.asarray(obs.images[cam], dtype=np.float32)
+            frames.append(torch.from_numpy(np.transpose(img, (2, 0, 1))))
         camera_histories.append(torch.stack(frames, dim=0))
 
     states = [
@@ -364,15 +419,190 @@ def _build_obs_batch(
         for obs in history
     ]
 
-    obs_images = torch.stack(camera_histories, dim=0)
-    obs_images = resize_images(obs_images, resize_size)
-    if crop_size is not None and eval_fixed_crop:
-        obs_images = crop_images(obs_images, crop_size, random=False)
-
     return {
-        "obs_images": obs_images.unsqueeze(0).to(device),
+        "obs_images": torch.stack(camera_histories, dim=0).unsqueeze(0).to(device),
         "obs_state": torch.stack(states, dim=0).unsqueeze(0).to(device),
     }
+
+
+def _clone_observation(obs: Observation) -> Observation:
+    """深拷贝一帧观测，供推理线程异步组 batch 时不受主循环追加影响。"""
+    return Observation(
+        images={k: np.asarray(v).copy() for k, v in obs.images.items()},
+        state=np.asarray(obs.state).copy(),
+        timestamp=obs.timestamp,
+    )
+
+
+@dataclass
+class _RtcInferJob:
+    """单次 RTC 推理结果句柄（由 ``_RtcInferWorker`` 填写）。"""
+
+    idx0: int
+    leftover_len: int
+    started_at: float
+    _lock: threading.Lock = field(default_factory=threading.Lock)
+    _pred: torch.Tensor | None = None
+    _error: BaseException | None = None
+    _infer_ms: float | None = None
+    _done: bool = False
+
+    def _set_ok(self, pred: torch.Tensor, infer_ms: float) -> None:
+        with self._lock:
+            self._pred = pred
+            self._infer_ms = infer_ms
+            self._done = True
+
+    def _set_err(self, exc: BaseException) -> None:
+        with self._lock:
+            self._error = exc
+            self._done = True
+
+    def poll(
+        self,
+    ) -> tuple[bool, torch.Tensor | None, BaseException | None, float | None]:
+        """返回 ``(done, pred, error, infer_ms)``；未完成时其余为 None。"""
+        with self._lock:
+            if not self._done:
+                return False, None, None, None
+            return True, self._pred, self._error, self._infer_ms
+
+
+class _RtcInferWorker:
+    """常驻推理线程：只建一次 CUDA/cuBLAS context，避免每次 new Thread 冷启动。
+
+    主线程不得在 busy 期间再调用 ``policy``；``batch_factory`` 在本线程执行。
+    """
+
+    def __init__(self, device: torch.device):
+        self._device = device
+        self._requests: queue.Queue[
+            tuple[
+                _RtcInferJob,
+                Any,
+                Any,
+                torch.Tensor | None,
+                int,
+                int,
+            ]
+            | None
+        ] = queue.Queue(maxsize=1)
+        self._stop = threading.Event()
+        self._ready = threading.Event()
+        self._warm_error: BaseException | None = None
+        self._thread = threading.Thread(
+            target=self._loop, name="rtc-infer", daemon=True
+        )
+
+    def start(self) -> None:
+        self._thread.start()
+        if not self._ready.wait(timeout=60.0):
+            raise RuntimeError("RTC infer worker CUDA warmup timed out")
+        if self._warm_error is not None:
+            raise RuntimeError(
+                f"RTC infer worker CUDA warmup failed: {self._warm_error}"
+            ) from self._warm_error
+
+    def shutdown(self, *, join_timeout_s: float = 2.0) -> None:
+        self._stop.set()
+        # Unblock a waiting get(); if a job is in-flight, sentinel follows it.
+        try:
+            self._requests.put_nowait(None)
+        except queue.Full:
+            try:
+                self._requests.get_nowait()
+            except queue.Empty:
+                pass
+            try:
+                self._requests.put_nowait(None)
+            except queue.Full:
+                pass
+        if self._thread.is_alive():
+            self._thread.join(timeout=join_timeout_s)
+
+    def submit(
+        self,
+        *,
+        policy: Any,
+        batch_factory: Any,
+        leftover: torch.Tensor | None,
+        inference_delay: int,
+        execution_horizon: int,
+        idx0: int,
+        leftover_len: int,
+    ) -> _RtcInferJob:
+        if self._stop.is_set():
+            raise RuntimeError("RTC infer worker already shut down")
+        job = _RtcInferJob(
+            idx0=idx0,
+            leftover_len=leftover_len,
+            started_at=time.perf_counter(),
+        )
+        self._requests.put(
+            (
+                job,
+                policy,
+                batch_factory,
+                leftover,
+                int(inference_delay),
+                int(execution_horizon),
+            )
+        )
+        return job
+
+    def _loop(self) -> None:
+        try:
+            if self._device.type == "cuda":
+                # bare "cuda" has no index; set_device needs cuda:N or int
+                cuda_idx = (
+                    self._device.index
+                    if self._device.index is not None
+                    else torch.cuda.current_device()
+                )
+                torch.cuda.set_device(cuda_idx)
+                # Warm primary context + cuBLAS path used by RTC autograd.grad.
+                x = torch.zeros(8, device=self._device, dtype=torch.float32)
+                x = x.detach().requires_grad_(True)
+                y = (x * x).sum()
+                _ = torch.autograd.grad(y, x)[0]
+                torch.cuda.synchronize()
+        except BaseException as exc:
+            self._warm_error = exc
+        finally:
+            self._ready.set()
+
+        if self._warm_error is not None:
+            return
+
+        while not self._stop.is_set():
+            req = self._requests.get()
+            if req is None:
+                break
+            (
+                job,
+                policy,
+                batch_factory,
+                leftover,
+                inference_delay,
+                execution_horizon,
+            ) = req
+            try:
+                t0 = time.perf_counter()
+                batch = batch_factory()
+                # RTC denoise uses torch.enable_grad() internally.
+                with torch.no_grad():
+                    pred = policy.sample_actions(
+                        batch,
+                        prev_chunk_left_over=leftover,
+                        inference_delay=inference_delay,
+                        execution_horizon=execution_horizon,
+                    )[0]
+                if self._device.type == "cuda":
+                    torch.cuda.synchronize()
+                infer_ms = (time.perf_counter() - t0) * 1000.0
+                job._set_ok(pred, infer_ms)
+            except BaseException as exc:
+                job._set_err(exc)
 
 
 # ---------------------------------------------------------------------------
@@ -396,18 +626,24 @@ class HardwareBundle:
 
 
 class BackgroundServoJLoop:
-    """后台按 ``cmdT`` 周期刷 FAIRINO ``ServoJ``，策略只更新目标关节角。"""
+    """后台按 ``cmdT`` 周期刷 FAIRINO ``ServoJ``，策略只更新目标关节角。
+
+    ``GetForwardKin`` / Z 限位校验也在本线程执行，避免与主线程并发打 XML-RPC。
+    """
 
     _AXIS_POS = [0.0, 0.0, 0.0, 0.0]
 
-    def __init__(self, robot: Any, *, cmdt_s: float = 1.0):
+    def __init__(self, robot: Any, *, cmdt_s: float = 1.0, z_limit: float):
         if cmdt_s <= 0.0:
             raise ValueError("servoj cmdt_s 必须 > 0")
         self._robot = robot
         self._cmdt_s = float(cmdt_s)
+        self._z_limit = float(z_limit)
         self._lock = threading.Lock()
         self._target: list[float] | None = None
+        self._pending: list[float] | None = None
         self._stop = threading.Event()
+        self._wake = threading.Event()
         self._thread: threading.Thread | None = None
         self._servo_started = False
         self._warn_every = max(1, int(round(1.0 / self._cmdt_s)))
@@ -417,12 +653,23 @@ class BackgroundServoJLoop:
     def cmdt_s(self) -> float:
         return self._cmdt_s
 
-    def set_joints_deg(self, joints_deg: list[float] | np.ndarray) -> None:
+    def set_joints_deg(
+        self,
+        joints_deg: list[float] | np.ndarray,
+        *,
+        check_z: bool = True,
+    ) -> None:
+        """提交关节目标。默认经后台 ``GetForwardKin`` 校验 Z；``check_z=False`` 直接生效。"""
         values = [float(v) for v in joints_deg]
         if len(values) != 6:
             raise ValueError(f"ServoJ 目标必须是 6 轴，得到 {len(values)}")
         with self._lock:
-            self._target = values
+            if check_z:
+                self._pending = values
+            else:
+                self._target = values
+                self._pending = None
+        self._wake.set()
 
     def get_joints_deg(self) -> list[float] | None:
         with self._lock:
@@ -432,7 +679,8 @@ class BackgroundServoJLoop:
         if self._thread is not None:
             raise RuntimeError("ServoJ 后台循环已在运行")
         if initial_joints_deg is not None:
-            self.set_joints_deg(initial_joints_deg)
+            # 已在起点，跳过 FK；启动前主线程仍可独占 RPC
+            self.set_joints_deg(initial_joints_deg, check_z=False)
         if self.get_joints_deg() is None:
             raise RuntimeError("启动 ServoJ 前必须提供初始目标关节角")
 
@@ -443,6 +691,7 @@ class BackgroundServoJLoop:
         self._servo_started = True
 
         self._stop.clear()
+        self._wake.clear()
         self._thread = threading.Thread(
             target=self._run,
             name="fairino-servoj-loop",
@@ -451,11 +700,13 @@ class BackgroundServoJLoop:
         self._thread.start()
         print(
             f"[INFO] ServoJ 后台循环已启动: cmdT={self._cmdt_s:g}s，"
+            f"z_limit={self._z_limit:g}，"
             f"初始目标={[round(v, 3) for v in self.get_joints_deg() or []]}"
         )
 
     def stop(self, *, join_timeout_s: float = 2.0) -> None:
         self._stop.set()
+        self._wake.set()
         thread = self._thread
         if thread is not None and thread.is_alive():
             thread.join(timeout=join_timeout_s)
@@ -468,37 +719,88 @@ class BackgroundServoJLoop:
                 print(f"[WARN] ServoMoveEnd 异常: {exc}")
             self._servo_started = False
 
+    def _apply_pending(self, pending: list[float]) -> None:
+        """在 ServoJ 线程内做正运动学与 Z 限位；通过才更新 ``_target``。"""
+        try:
+            desc_pos = _forward_kin_desc_pos(self._robot, pending)
+        except Exception as exc:
+            print(f"[WARN] GetForwardKin 异常，跳过 ServoJ 目标更新: {exc}", flush=True)
+            return
+        if desc_pos is not None:
+            print(
+                f"  desc_pos={[round(v, 3) for v in desc_pos]}",
+                flush=True,
+            )
+            if desc_pos[2] < self._z_limit:
+                print(
+                    f"[WARN] Z={desc_pos[2]:.3f} < z_limit={self._z_limit}，"
+                    f"跳过 ServoJ 目标更新",
+                    flush=True,
+                )
+                return
+        else:
+            print(
+                "[WARN] GetForwardKin 失败，跳过 ServoJ 目标更新（无法校验 Z）",
+                flush=True,
+            )
+            return
+        with self._lock:
+            self._target = pending
+
     def _run(self) -> None:
+        next_servoj_t = time.perf_counter()
         while not self._stop.is_set():
-            t0 = time.perf_counter()
             with self._lock:
-                target = None if self._target is None else list(self._target)
-            if target is not None:
-                try:
-                    ret = self._robot.ServoJ(
-                        joint_pos=target,
-                        axisPos=self._AXIS_POS,
-                        cmdT=self._cmdt_s,
-                    )
-                except Exception as exc:
-                    ret = -1
-                    self._fail_streak += 1
-                    if self._fail_streak == 1 or self._fail_streak % self._warn_every == 0:
-                        print(f"[WARN] ServoJ 后台异常: {exc}")
-                else:
-                    if ret == 0:
-                        self._fail_streak = 0
-                    else:
+                pending = self._pending
+                if pending is not None:
+                    self._pending = None
+            if pending is not None:
+                self._apply_pending(pending)
+
+            now = time.perf_counter()
+            if now >= next_servoj_t:
+                with self._lock:
+                    target = None if self._target is None else list(self._target)
+                if target is not None:
+                    try:
+                        ret = self._robot.ServoJ(
+                            joint_pos=target,
+                            axisPos=self._AXIS_POS,
+                            cmdT=self._cmdt_s,
+                        )
+                    except Exception as exc:
+                        ret = -1
                         self._fail_streak += 1
                         if (
                             self._fail_streak == 1
                             or self._fail_streak % self._warn_every == 0
                         ):
-                            print(f"[WARN] ServoJ 错误码: {ret}")
+                            print(f"[WARN] ServoJ 后台异常: {exc}")
+                    else:
+                        if ret == 0:
+                            self._fail_streak = 0
+                        else:
+                            self._fail_streak += 1
+                            if (
+                                self._fail_streak == 1
+                                or self._fail_streak % self._warn_every == 0
+                            ):
+                                print(f"[WARN] ServoJ 错误码: {ret}")
+                next_servoj_t = now + self._cmdt_s
 
-            sleep_s = self._cmdt_s - (time.perf_counter() - t0)
-            if sleep_s > 0.0 and self._stop.wait(timeout=sleep_s):
+            if self._stop.is_set():
                 break
+            with self._lock:
+                if self._pending is not None:
+                    continue
+            wait_s = max(0.0, next_servoj_t - time.perf_counter())
+            self._wake.clear()
+            with self._lock:
+                if self._pending is not None:
+                    continue
+            if self._stop.is_set():
+                break
+            self._wake.wait(timeout=wait_s)
 
 
 class BackgroundGripperLoop:
@@ -761,13 +1063,11 @@ def _read_observation(
 def _send_action(
     hw: HardwareBundle,
     action: np.ndarray,
-    *,
-    z_limit: float,
 ) -> None:
-    """打印并下发一步动作：先更新夹爪目标，再更新 ServoJ 目标关节角。
+    """打印并下发一步动作：先更新夹爪目标，再提交 ServoJ 目标关节角。
 
     夹爪 / ServoJ 均由后台循环持续刷帧；本函数只改目标。
-    正运动学得到的笛卡尔 Z 若小于 ``z_limit``（mm），则跳过关节目标更新。
+    Z 限位由 ServoJ 后台线程内 ``GetForwardKin`` 校验。
     """
     joints = action[:6].astype(float).tolist()
     gripper = float(np.clip(action[6], 0.0, 1.0))
@@ -786,22 +1086,6 @@ def _send_action(
         ok = hw.gripper.send_normalized(gripper)
         if not ok:
             print("[WARN] Gloria-M send_normalized 失败")
-
-    desc_pos = _forward_kin_desc_pos(hw.robot, joints)
-    if desc_pos is not None:
-        print(
-            f"  desc_pos={[round(v, 3) for v in desc_pos]}",
-            flush=True,
-        )
-        if desc_pos[2] < z_limit:
-            print(
-                f"[WARN] Z={desc_pos[2]:.3f} < z_limit={z_limit}，跳过 ServoJ 目标更新",
-                flush=True,
-            )
-            return
-    else:
-        print("[WARN] GetForwardKin 失败，跳过 ServoJ 目标更新（无法校验 Z）", flush=True)
-        return
 
     hw.servoj_loop.set_joints_deg(joints)
 
@@ -922,6 +1206,8 @@ def main() -> None:
         f"[INFO] rtc.enabled={rtc_enabled} delay={rtc_cfg.inference_delay} "
         f"exec_h={rtc_cfg.execution_horizon} schedule={rtc_cfg.prefix_attention_schedule}"
     )
+    if rtc_enabled:
+        print("[INFO] RTC mode: async think-while-moving (control loop not blocked)")
 
     device = torch.device(cfg.train.device if torch.cuda.is_available() else "cpu")
     policy = build_policy(cfg, stats)
@@ -932,6 +1218,7 @@ def main() -> None:
 
     start_joints = deploy["joints_deg"]
     hw = HardwareBundle(start_joints_deg=start_joints)
+    infer_worker: _RtcInferWorker | None = None
 
     try:
         ip = _resolve_robot_ip(deploy["robot_ip"], teleop_yaml)
@@ -958,85 +1245,222 @@ def main() -> None:
         hw.tool, hw.user = tool, user
 
         hw.servoj_loop = BackgroundServoJLoop(
-            hw.robot, cmdt_s=deploy["servoj_cmdt"]
+            hw.robot,
+            cmdt_s=deploy["servoj_cmdt"],
+            z_limit=deploy["z_limit"],
         )
         hw.servoj_loop.start(initial_joints_deg=joints)
 
         obs = _read_observation(hw, cameras, last_state=None)
         obs.validate(cameras, int(cfg.state_dim))
+        resize_size = cfg.dataset.resize_size
+        crop_size = cfg.dataset.crop_size
+        eval_fixed_crop = bool(cfg.dataset.eval_fixed_crop)
+        obs = _prepare_observation(
+            obs,
+            resize_size=resize_size,
+            crop_size=crop_size,
+            eval_fixed_crop=eval_fixed_crop,
+        )
         obs_history: list[Observation] = [obs]
+        print(
+            f"[INFO] 观测入队即 resize/crop "
+            f"(resize={resize_size} crop={crop_size} fixed={eval_fixed_crop})"
+        )
 
         print(f"[INFO] 开始闭环，最多 {max_steps} 步" + (" (RTC)" if rtc_enabled else ""))
 
         if rtc_enabled:
+            infer_worker = _RtcInferWorker(device)
+            infer_worker.start()
+            print("[INFO] RTC infer worker ready (persistent CUDA thread)")
+
             action_queue = ActionQueue(rtc_cfg)
             step_i = 0
-            while step_i < max_steps:
-                if action_queue.qsize() <= rtc_cfg.inference_delay:
-                    leftover = action_queue.get_left_over()
-                    if leftover is not None and leftover.shape[0] == 0:
-                        leftover = None
+            infer_job: _RtcInferJob | None = None
+            cold_started = False
 
-                    batch = _build_obs_batch(
-                        obs_history,
-                        cameras=cameras,
-                        n_obs_steps=n_obs,
-                        resize_size=cfg.dataset.resize_size,
-                        crop_size=cfg.dataset.crop_size,
-                        eval_fixed_crop=bool(cfg.dataset.eval_fixed_crop),
-                        stats=stats,
-                        norm_mode=norm_mode,
-                        device=device,
-                    )
+            def _make_batch() -> dict[str, torch.Tensor]:
+                return _build_obs_batch(
+                    obs_history,
+                    cameras=cameras,
+                    n_obs_steps=n_obs,
+                    stats=stats,
+                    norm_mode=norm_mode,
+                    device=device,
+                )
+
+            # Strictly inference_delay — do NOT use execution_horizon here.
+            # threshold==real_delay after merge causes immediate replan forever.
+            replan_threshold = int(rtc_cfg.inference_delay)
+            print(
+                f"[INFO] RTC replan when qsize<={replan_threshold} "
+                f"(inference_delay={rtc_cfg.inference_delay})"
+            )
+            underrun_warned = False
+
+            while step_i < max_steps:
+                merged_this_iter = False
+
+                # Merge completed async inference (use real consumed steps as delay).
+                if infer_job is not None:
+                    done, pred, err, infer_ms = infer_job.poll()
+                    if done:
+                        if err is not None:
+                            print(f"[ERROR] RTC async inference failed: {err}")
+                            infer_job = None
+                        else:
+                            assert pred is not None
+                            real_delay = max(
+                                0, action_queue.get_action_index() - infer_job.idx0
+                            )
+                            cfg_delay = int(rtc_cfg.inference_delay)
+                            infer_ms_v = (
+                                float(infer_ms)
+                                if infer_ms is not None
+                                else (time.perf_counter() - infer_job.started_at)
+                                * 1000.0
+                            )
+                            if abs(real_delay - cfg_delay) >= 1:
+                                print(
+                                    f"[WARN] step={step_i} RTC real_delay={real_delay} "
+                                    f"!= inference_delay={cfg_delay} "
+                                    f"(推理耗时={infer_ms_v:.1f}ms); "
+                                    f"prefix guidance uses cfg delay, merge uses real_delay"
+                                )
+                            print(
+                                f"[INFO] step={step_i} RTC async replan done "
+                                f"推理耗时={infer_ms_v:.1f}ms "
+                                f"real_delay={real_delay} cfg_delay={cfg_delay} "
+                                f"leftover_at_start={infer_job.leftover_len}"
+                            )
+                            processed = denormalize(
+                                pred, stats, prefix="action", mode=norm_mode
+                            )
+                            action_queue.merge(
+                                pred.cpu(),
+                                processed.cpu(),
+                                real_delay=real_delay,
+                                action_index_before_inference=infer_job.idx0,
+                            )
+                            infer_job = None
+                            underrun_warned = False
+                            merged_this_iter = True
+
+                # Cold start: one synchronous inference (no leftover to cover latency).
+                if (
+                    not cold_started
+                    and infer_job is None
+                    and action_queue.qsize() == 0
+                ):
+                    batch = _make_batch()
+                    t_infer = time.perf_counter()
                     with torch.no_grad():
                         pred = policy.sample_actions(
                             batch,
-                            prev_chunk_left_over=leftover,
+                            prev_chunk_left_over=None,
                             inference_delay=rtc_cfg.inference_delay,
                             execution_horizon=rtc_cfg.execution_horizon,
                         )[0]
-
-                    # 模拟推理延迟：merge 前先从旧队列执行 delay 步（对齐 eval.py）
-                    delay = 0 if leftover is None else rtc_cfg.inference_delay
-                    leftover_len = 0 if leftover is None else int(leftover.shape[0])
-                    print(
-                        f"[INFO] step={step_i} RTC replan leftover={leftover_len} "
-                        f"delay={delay} qsize={action_queue.qsize()}"
-                    )
-                    for _ in range(min(delay, action_queue.qsize())):
-                        if step_i >= max_steps:
-                            break
-                        t0 = time.perf_counter()
-                        action_t = action_queue.get()
-                        if action_t is None:
-                            break
-                        print(f"[INFO] step={step_i}", end="")
-                        _send_action(
-                            hw, action_t.numpy(), z_limit=deploy["z_limit"]
-                        )
-                        obs = _read_observation(hw, cameras, last_state=obs.state)
-                        obs_history.append(obs)
-                        step_i += 1
-                        _pace_step(t0, fps)
-
-                    if step_i >= max_steps:
-                        break
-
+                    if device.type == "cuda":
+                        torch.cuda.synchronize()
+                    infer_ms = (time.perf_counter() - t_infer) * 1000.0
                     processed = denormalize(
                         pred, stats, prefix="action", mode=norm_mode
                     )
                     action_queue.merge(
-                        pred.cpu(), processed.cpu(), real_delay=delay
+                        pred.cpu(), processed.cpu(), real_delay=0
+                    )
+                    cold_started = True
+                    merged_this_iter = True
+                    print(
+                        f"[INFO] step={step_i} RTC cold-start chunk merged "
+                        f"推理耗时={infer_ms:.1f}ms qsize={action_queue.qsize()}"
+                    )
+
+                # Kick async replan early enough that leftover covers wall-clock latency.
+                # Skip same iteration as merge so a late real_delay cannot immediately
+                # re-arm when post-merge qsize happens to equal the threshold.
+                if (
+                    cold_started
+                    and infer_job is None
+                    and not merged_this_iter
+                    and action_queue.qsize() <= replan_threshold
+                ):
+                    leftover = action_queue.get_left_over()
+                    if leftover is not None and leftover.shape[0] == 0:
+                        leftover = None
+                    leftover_len = 0 if leftover is None else int(leftover.shape[0])
+                    idx0 = action_queue.get_action_index()
+                    # Snapshot obs so control loop can keep appending while we prep batch.
+                    obs_snap = [
+                        _clone_observation(o) for o in obs_history[-n_obs:]
+                    ]
+                    if len(obs_snap) == 0:
+                        obs_snap = [_clone_observation(obs)]
+
+                    def _batch_factory(
+                        history: list[Observation] = obs_snap,
+                    ) -> dict[str, torch.Tensor]:
+                        return _build_obs_batch(
+                            history,
+                            cameras=cameras,
+                            n_obs_steps=n_obs,
+                            stats=stats,
+                            norm_mode=norm_mode,
+                            device=device,
+                        )
+
+                    print(
+                        f"[INFO] step={step_i} RTC async replan start "
+                        f"leftover={leftover_len} qsize={action_queue.qsize()} "
+                        f"idx0={idx0} threshold={replan_threshold}"
+                    )
+                    assert infer_worker is not None
+                    infer_job = infer_worker.submit(
+                        policy=policy,
+                        batch_factory=_batch_factory,
+                        leftover=leftover,
+                        inference_delay=int(rtc_cfg.inference_delay),
+                        execution_horizon=int(rtc_cfg.execution_horizon),
+                        idx0=idx0,
+                        leftover_len=leftover_len,
                     )
 
                 t0 = time.perf_counter()
                 action_t = action_queue.get()
                 if action_t is None:
+                    if infer_job is not None:
+                        # Leftover exhausted before inference finished → arm holds last target.
+                        if not underrun_warned:
+                            waited_ms = (
+                                time.perf_counter() - infer_job.started_at
+                            ) * 1000.0
+                            print(
+                                f"[WARN] step={step_i} action queue underrun while "
+                                f"inferring (~{waited_ms:.0f}ms so far); "
+                                f"arm holding last ServoJ target (stutter). "
+                                f"Increase rtc.execution_horizon / inference_delay "
+                                f"or lower num_inference_steps.",
+                                flush=True,
+                            )
+                            underrun_warned = True
+                        time.sleep(0.001)
+                        continue
+                    print(
+                        "[WARN] action queue empty and no inference in flight; stopping"
+                    )
                     break
+
                 print(f"[INFO] step={step_i}", end="")
-                _send_action(hw, action_t.numpy(), z_limit=deploy["z_limit"])
-                obs = _read_observation(hw, cameras, last_state=obs.state)
-                obs_history.append(obs)
+                _send_action(hw, action_t.numpy())
+                obs = _prepare_observation(
+                    _read_observation(hw, cameras, last_state=obs.state),
+                    resize_size=resize_size,
+                    crop_size=crop_size,
+                    eval_fixed_crop=eval_fixed_crop,
+                )
+                _append_observation(obs_history, obs, n_obs_steps=n_obs)
                 step_i += 1
                 _pace_step(t0, fps)
         else:
@@ -1051,15 +1475,14 @@ def main() -> None:
                         obs_history,
                         cameras=cameras,
                         n_obs_steps=n_obs,
-                        resize_size=cfg.dataset.resize_size,
-                        crop_size=cfg.dataset.crop_size,
-                        eval_fixed_crop=bool(cfg.dataset.eval_fixed_crop),
                         stats=stats,
                         norm_mode=norm_mode,
                         device=device,
                     )
+                    t_infer = time.perf_counter()
                     with torch.no_grad():
                         pred = policy.sample_actions(batch)[0].cpu()
+                    infer_ms = (time.perf_counter() - t_infer) * 1000.0
                     pred_phys = denormalize(
                         pred, stats, prefix="action", mode=norm_mode
                     ).numpy()
@@ -1069,22 +1492,31 @@ def main() -> None:
                     ]
                     chunk_idx = 0
                     print(
-                        f"[INFO] step={step_i} 重新规划 chunk={len(chunk_actions)}"
+                        f"[INFO] step={step_i} 重新规划 chunk={len(chunk_actions)} "
+                        f"推理耗时={infer_ms:.1f}ms"
                     )
 
                 action = chunk_actions[chunk_idx]
                 chunk_idx += 1
                 print(f"[INFO] step={step_i}", end="")
-                _send_action(hw, action, z_limit=deploy["z_limit"])
+                _send_action(hw, action)
 
-                obs = _read_observation(hw, cameras, last_state=obs.state)
-                obs_history.append(obs)
+                obs = _prepare_observation(
+                    _read_observation(hw, cameras, last_state=obs.state),
+                    resize_size=resize_size,
+                    crop_size=crop_size,
+                    eval_fixed_crop=eval_fixed_crop,
+                )
+                _append_observation(obs_history, obs, n_obs_steps=n_obs)
                 _pace_step(t0, fps)
 
         print("[INFO] 达到 max-steps，正常结束")
     except KeyboardInterrupt:
         print("\n[INFO] 用户中断")
     finally:
+        if infer_worker is not None:
+            infer_worker.shutdown()
+            infer_worker = None
         _shutdown(hw)
 
 

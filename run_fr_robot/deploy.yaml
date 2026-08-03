@@ -51,6 +51,6 @@ servoj_cmdt: 1.0
 # RTC 覆盖（可选）；字段为 null 或不写则沿用训练 YAML 的 policy.rtc
 # CLI --rtc / --inference-delay / --execution-horizon 优先级更高
 rtc:
-  enabled: null
-  inference_delay: null
-  execution_horizon: null
+  enabled: true
+  inference_delay: 2
+  execution_horizon: 4
