@@ -49,7 +49,13 @@ policy:
   ae_dropout: 0.0
   decode_flow_latents: true
   rtc:
+    # RTC 推理引导（训练不受影响）；A2A 要求 n_action_steps == horizon
     enabled: false
+    execution_horizon: 4
+    max_guidance_weight: 10.0
+    prefix_attention_schedule: exp
+    inference_delay: 2
+    debug: false
 
 train:
   batch_size: 64

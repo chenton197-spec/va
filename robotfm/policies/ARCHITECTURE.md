@@ -9,7 +9,7 @@
 - `unet1d.py`：ConditionalUnet1D + FiLM 动作骨干
 - `dit.py`：旧版 DiT（消融对照）
 - `flow_matching.py`：OT-CFM 训练与 Euler 采样（可选 RTC 钩子）
-- `a2a/`：A2A / N-A2A（torchcfm；obs_state / agent_pos → future actions）
+- `a2a/`：A2A / N-A2A（torchcfm；obs_state / agent_pos → future actions；可选 RTC，经 decoder 投影）
 - `vita/`：VITA（torchcfm；视觉潜变量 → 动作潜变量，无 global_cond）
 - `rtc/`：Real-Time Chunking（`RTCConfig` / `RTCProcessor` / `ActionQueue`）
 - `multitask_dit.py`：语言条件预留
@@ -51,10 +51,22 @@ for t in Euler:
   x <- x + dt * v
 ```
 
+A2A 推理（潜空间 Euler；可选 RTC）：
+
+```text
+x <- history_latents
+for t in Euler:
+  v = flow_net(x, t, cond)
+  if RTC: v = denoise_step(..., decode_x1=action_decoder)  # leftover 在动作空间
+  x <- x + dt * v
+actions <- action_decoder(x)
+```
+
 ## RTC 保真边界
 
 - 完整移植 LeRobot：`denoise_step`、prefix schedules、`ActionQueue.merge`、debug `Tracker`
 - 时间约定适配（非弱化）：robotfm / PI 原文 `t: 0→1`，`x1_hat = x_t + (1-t)*v`，`tau = t`；因 Euler `dt>0`，引导项为 `v + gw * correction`（对应 LeRobot `dt<0` 时的 `v - gw * correction`）
+- A2A：`decode_x1` 将 clean latent 投影到动作空间再与 leftover 对齐；要求 `n_action_steps == horizon`
 - 未移植：相对动作 reanchor、debug visualizer、异步 `RTCInferenceEngine`
 
 ## `encoders.py`（ResNet）

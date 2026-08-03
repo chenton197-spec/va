@@ -13,7 +13,7 @@
 | `envs/` | `base.py`, `pusht.py`, `registry.py` | 环境抽象与 PushT 适配 |
 | `data/` | `schema.py`, `writer.py`, `dataset.py`, `stats.py` | NPZ 数据协议与 Dataset |
 | `collect/` | `loop.py`, `drivers/` | 遥操作采集 |
-| `policies/` | `flow_matching.py`, `encoders.py`, `video_encoders.py`, `unet1d.py`, `rtc/` | 条件 FM（ResNet / SlowFast）+ 推理期 RTC |
+| `policies/` | `flow_matching.py`, `a2a/`, `encoders.py`, `video_encoders.py`, `unet1d.py`, `rtc/` | 条件 FM / A2A + 推理期 RTC |
 | `rl/` | `base.py` | RL 占位（Phase 3） |
 
 ## 端到端数据流
@@ -28,6 +28,8 @@
 
 - 训练目标不变；仅 `sample_actions` / `eval` 可选启用
 - 算法核：Euler 每步 `RTCProcessor.denoise_step`（标准 RTC inpainting 引导）
+  - FM：动作空间直接引导
+  - A2A：潜空间 Euler + `decode_x1` 投影到动作空间再对齐 leftover（需 `n_action_steps == horizon`）
 - 控制核：`ActionQueue` leftover + `inference_delay` merge（与 LeRobot 同构；当前为同步模拟）
 - 配置：`policy.rtc.enabled`（默认 `false`）
 

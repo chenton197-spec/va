@@ -1,20 +1,21 @@
-backend: real_robot
-embodiment: fairino_fr3
+# 离线 BC：Flow Matching + limits([-1,1])
+# 硬件：RTX 5060 Ti 16GB + i5-12400F 6C/12T + 16GB RAM
+# 瓶颈在双相机图像 decode + 系统内存，不是显存
+# 上次 bs=32/workers=4 约 step 2300 被系统杀（16GB RAM+swap 打满，且尚无 ckpt）
+# shine_shoes_fr3_s256：N=132645 → floor(N/16)=8290 steps/epoch → 120 epoch = 994800
 cameras: [hand, head]
 state_dim: 7
 action_dim: 7
 state_names: [j1, j2, j3, j4, j5, j6, gripper]
 action_names: [j1, j2, j3, j4, j5, j6, gripper]
 fps: 30
-data_root: /home/casbot/teleop_project/datasets
-# FM + limits([-1,1])，RTX 5060 8GB / dual-cam 实测推荐
-# N=132645 → floor(N/16)=8290 steps/epoch → 100 epoch = 829000
+data_root: .
 output_dir: outputs/fm_shine_shoes_limits
 
 dataset:
   n_obs_steps: 2
   horizon: 8
-  run_name: shine_shoes_fr3
+  run_name: shine_shoes_fr3_s256
   resize_size: 256
   crop_size: 224
   eval_fixed_crop: true
@@ -42,17 +43,16 @@ policy:
   n_groups: 8
 
 train:
-  # 瓶颈在双相机 JPEG decode，不是显存。bs=16 + workers=6 是速度/样本量折中。
-  # 显存上限约 bs=112；更大 batch 每 step 更慢，墙钟更长。
+  # 16GB RAM：bs=16 + workers=2，降低 DataLoader 占内存；更频存盘防中途挂掉。
   batch_size: 16
-  steps: 829000
+  steps: 994800
   lr: 0.0003
   weight_decay: 0.000001
   log_freq: 100
-  save_freq: 30000
+  save_freq: 82900
   device: cuda
-  num_workers: 6
+  num_workers: 2
   cosine_lr: true
-  warmup_steps: 1000
+  warmup_steps: 2000
   encoder_lr_scale: 0.1
   max_grad_norm: 1.0

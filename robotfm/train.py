@@ -129,6 +129,7 @@ def _build_a2a_policy(cfg: RobotFMConfig) -> torch.nn.Module:
     use_ot = ptype == "n_a2a"
     if ptype == "n_a2a" and history_noise_std <= 0:
         history_noise_std = 0.1
+    rtc = _normalize_rtc_config(cfg.policy.rtc)
     a2a_cfg = A2AConfig(
         num_cameras=len(cfg.cameras),
         state_dim=cfg.state_dim,
@@ -157,6 +158,7 @@ def _build_a2a_policy(cfg: RobotFMConfig) -> torch.nn.Module:
         ae_dropout=cfg.policy.ae_dropout,
         pretrained_encoder=cfg.policy.pretrained_encoder,
         use_frame_diff=cfg.policy.use_frame_diff,
+        rtc=rtc if rtc.enabled else None,
     )
     return A2APolicy(a2a_cfg)
 

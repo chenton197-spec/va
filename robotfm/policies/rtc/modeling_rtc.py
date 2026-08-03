@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import logging
 import math
+from collections.abc import Callable
 
 import torch
 from torch import Tensor
@@ -75,6 +76,16 @@ class RTCProcessor:
         if self.tracker is not None:
             self.tracker.reset()
 
+    @staticmethod
+    def _guidance_weight(tau: float | Tensor, max_guidance_weight: float, device, dtype) -> Tensor:
+        max_gw = torch.as_tensor(max_guidance_weight, device=device, dtype=dtype)
+        tau_tensor = torch.as_tensor(tau, device=device, dtype=dtype)
+        squared_one_minus_tau = (1 - tau_tensor) ** 2
+        inv_r2 = (squared_one_minus_tau + tau_tensor**2) / (squared_one_minus_tau)
+        c = torch.nan_to_num((1 - tau_tensor) / tau_tensor, posinf=max_gw)
+        guidance_weight = torch.nan_to_num(c * inv_r2, posinf=max_gw)
+        return torch.minimum(guidance_weight, max_gw)
+
     def denoise_step(
         self,
         x_t,
@@ -83,6 +94,7 @@ class RTCProcessor:
         time,
         original_denoise_step_partial,
         execution_horizon=None,
+        decode_x1: Callable[[Tensor], Tensor] | None = None,
     ) -> Tensor:
         """RTC guidance wrapper around an existing denoiser.
 
@@ -90,6 +102,12 @@ class RTCProcessor:
           tau = time
           x1_t = x_t + (1 - time) * v_t
         which is equivalent to LeRobot's inversion of their t: 1→0 schedule.
+
+        Args:
+            decode_x1: Optional map from clean latent estimate ``x1_latent`` to
+                action-space ``(B, H, A)``. When set, ``x_t`` is latent ``(B, D)``
+                and leftover / prefix weights live in action space (A2A path).
+                When ``None``, ``x_t`` and leftover share action-space shape (FM).
         """
         # robotfm / PI original: time goes from 0 (noise) to 1 (data)
         tau = time
@@ -98,6 +116,39 @@ class RTCProcessor:
             v_t = original_denoise_step_partial(x_t)
             return v_t
 
+        if decode_x1 is not None:
+            return self._denoise_step_latent(
+                x_t=x_t,
+                prev_chunk_left_over=prev_chunk_left_over,
+                inference_delay=inference_delay,
+                time=time,
+                tau=tau,
+                original_denoise_step_partial=original_denoise_step_partial,
+                execution_horizon=execution_horizon,
+                decode_x1=decode_x1,
+            )
+
+        return self._denoise_step_action(
+            x_t=x_t,
+            prev_chunk_left_over=prev_chunk_left_over,
+            inference_delay=inference_delay,
+            time=time,
+            tau=tau,
+            original_denoise_step_partial=original_denoise_step_partial,
+            execution_horizon=execution_horizon,
+        )
+
+    def _denoise_step_action(
+        self,
+        x_t,
+        prev_chunk_left_over,
+        inference_delay,
+        time,
+        tau,
+        original_denoise_step_partial,
+        execution_horizon,
+    ) -> Tensor:
+        """Action-space RTC (Flow Matching): x_t and leftover are (B, H, A)."""
         x_t = x_t.clone().detach()
 
         squeezed = False
@@ -144,13 +195,9 @@ class RTCProcessor:
             grad_outputs = err.clone().detach()
             correction = torch.autograd.grad(x1_t, x_t, grad_outputs, retain_graph=False)[0]
 
-        max_guidance_weight = torch.as_tensor(self.rtc_config.max_guidance_weight, device=x_t.device, dtype=x_t.dtype)
-        tau_tensor = torch.as_tensor(tau, device=x_t.device, dtype=x_t.dtype)
-        squared_one_minus_tau = (1 - tau_tensor) ** 2
-        inv_r2 = (squared_one_minus_tau + tau_tensor**2) / (squared_one_minus_tau)
-        c = torch.nan_to_num((1 - tau_tensor) / tau_tensor, posinf=max_guidance_weight)
-        guidance_weight = torch.nan_to_num(c * inv_r2, posinf=max_guidance_weight)
-        guidance_weight = torch.minimum(guidance_weight, max_guidance_weight)
+        guidance_weight = self._guidance_weight(
+            tau, self.rtc_config.max_guidance_weight, x_t.device, x_t.dtype
+        )
 
         # LeRobot integrates with dt < 0 (t: 1→0) and uses ``v - gw * correction``.
         # robotfm integrates with dt > 0 (t: 0→1), so the guidance term sign flips.
@@ -165,6 +212,104 @@ class RTCProcessor:
         self.track(
             time=time,
             x1_t=x1_t,
+            correction=correction,
+            err=err,
+            weights=weights,
+            guidance_weight=guidance_weight,
+            inference_delay=inference_delay,
+            execution_horizon=execution_horizon,
+        )
+
+        return result
+
+    def _denoise_step_latent(
+        self,
+        x_t,
+        prev_chunk_left_over,
+        inference_delay,
+        time,
+        tau,
+        original_denoise_step_partial,
+        execution_horizon,
+        decode_x1: Callable[[Tensor], Tensor],
+    ) -> Tensor:
+        """Latent-space RTC (A2A): guide via decode_x1(x1_latent) vs action leftover."""
+        x_t = x_t.clone().detach()
+        if x_t.ndim != 2:
+            raise ValueError(f"decode_x1 path expects x_t shape (B, D), got {tuple(x_t.shape)}")
+
+        if prev_chunk_left_over.ndim == 2:
+            prev_chunk_left_over = prev_chunk_left_over.unsqueeze(0)
+        elif prev_chunk_left_over.ndim != 3:
+            raise ValueError(
+                f"leftover expects (H, A) or (B, H, A), got {tuple(prev_chunk_left_over.shape)}"
+            )
+
+        batch_size = x_t.shape[0]
+        if prev_chunk_left_over.shape[0] == 1 and batch_size > 1:
+            prev_chunk_left_over = prev_chunk_left_over.expand(batch_size, -1, -1)
+        elif prev_chunk_left_over.shape[0] != batch_size:
+            raise ValueError(
+                f"leftover batch {prev_chunk_left_over.shape[0]} != x_t batch {batch_size}"
+            )
+
+        # Probe decoder output shape for weights / leftover padding (no grad).
+        with torch.no_grad():
+            probe = decode_x1(x_t)
+        if probe.ndim != 3:
+            raise ValueError(f"decode_x1 must return (B, H, A), got {tuple(probe.shape)}")
+        action_chunk_size = probe.shape[1]
+        action_dim = probe.shape[2]
+
+        if execution_horizon is None:
+            execution_horizon = self.rtc_config.execution_horizon
+        if execution_horizon > prev_chunk_left_over.shape[1]:
+            execution_horizon = prev_chunk_left_over.shape[1]
+        # Cap soft-blend region to decoder horizon as well.
+        if execution_horizon > action_chunk_size:
+            execution_horizon = action_chunk_size
+
+        if (
+            prev_chunk_left_over.shape[1] != action_chunk_size
+            or prev_chunk_left_over.shape[2] != action_dim
+        ):
+            padded = torch.zeros(
+                batch_size,
+                action_chunk_size,
+                action_dim,
+                device=x_t.device,
+                dtype=x_t.dtype,
+            )
+            h = min(prev_chunk_left_over.shape[1], action_chunk_size)
+            a = min(prev_chunk_left_over.shape[2], action_dim)
+            padded[:, :h, :a] = prev_chunk_left_over[:, :h, :a]
+            prev_chunk_left_over = padded
+
+        weights = (
+            self.get_prefix_weights(inference_delay, execution_horizon, action_chunk_size)
+            .to(device=x_t.device, dtype=x_t.dtype)
+            .unsqueeze(0)
+            .unsqueeze(-1)
+        )
+
+        with torch.enable_grad():
+            v_t = original_denoise_step_partial(x_t).detach()
+            x_t = x_t.detach().requires_grad_(True)
+
+            x1_latent = x_t + (1.0 - time) * v_t
+            x1_actions = decode_x1(x1_latent)
+            err = (prev_chunk_left_over - x1_actions) * weights
+            grad_outputs = err.clone().detach()
+            correction = torch.autograd.grad(x1_actions, x_t, grad_outputs, retain_graph=False)[0]
+
+        guidance_weight = self._guidance_weight(
+            tau, self.rtc_config.max_guidance_weight, x_t.device, x_t.dtype
+        )
+        result = v_t + guidance_weight * correction
+
+        self.track(
+            time=time,
+            x1_t=x1_actions,
             correction=correction,
             err=err,
             weights=weights,

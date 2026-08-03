@@ -6,7 +6,7 @@
 - `unet1d.py`: ConditionalUnet1D + FiLM 动作骨干
 - `dit.py`: 旧版 DiT（保留作消融对照）
 - `flow_matching.py`: OT-CFM 训练损失与 Euler 采样（可选 RTC）
-- `a2a/`: Action-to-Action / N-A2A（torchcfm；obs_state history → future actions）
+- `a2a/`: Action-to-Action / N-A2A（torchcfm；obs_state history → future actions；可选 RTC）
 - `vita/`: Vision-to-Action Flow Matching（视觉潜变量 → 动作潜变量；复用 a2a AE/flow）
 - `act/`: Action Chunking Transformer（对齐 LeRobot / 原版 ACT）
 - `rtc/`: Real-Time Chunking 推理引导

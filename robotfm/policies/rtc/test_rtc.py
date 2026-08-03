@@ -113,3 +113,87 @@ def test_prefix_attention_schedules_shapes():
         weights = processor.get_prefix_weights(2, 6, 8)
         assert weights.shape == (8,)
         assert torch.allclose(weights[:2], torch.ones(2))
+
+
+def _linear_decode_x1(latent_dim: int, horizon: int, action_dim: int):
+    """Differentiable fake decoder: reshape/project latent → (B, H, A)."""
+    out_dim = horizon * action_dim
+    # Well-conditioned map so RTC correction reaches action space strongly.
+    weight = torch.eye(out_dim, latent_dim) if latent_dim >= out_dim else torch.randn(out_dim, latent_dim)
+    if latent_dim < out_dim:
+        weight = weight / weight.norm(dim=1, keepdim=True).clamp_min(1e-6)
+    bias = torch.zeros(out_dim)
+
+    def decode(z: torch.Tensor) -> torch.Tensor:
+        flat = torch.nn.functional.linear(z, weight.to(z.device, z.dtype), bias.to(z.device, z.dtype))
+        return flat.view(z.shape[0], horizon, action_dim)
+
+    return decode
+
+
+def test_rtc_decode_x1_without_leftover_matches_unguided():
+    processor = RTCProcessor(RTCConfig(execution_horizon=4, enabled=True))
+    latent_dim, horizon, action_dim = 8, 4, 2
+    decode = _linear_decode_x1(latent_dim, horizon, action_dim)
+    noise = torch.randn(2, latent_dim)
+
+    def denoise_fn(x_t, time):
+        return -0.5 * x_t
+
+    torch.manual_seed(0)
+    unguided = _euler_integrate(denoise_fn, noise.clone(), num_steps=4)
+
+    torch.manual_seed(0)
+    first_chunk = _euler_integrate(
+        denoise_fn,
+        noise.clone(),
+        num_steps=4,
+        rtc_processor=processor,
+        rtc_enabled=True,
+        prev_chunk_left_over=None,
+        inference_delay=2,
+        execution_horizon=4,
+        decode_x1=decode,
+    )
+
+    assert torch.allclose(unguided, first_chunk)
+
+
+def test_rtc_decode_x1_guidance_pulls_decoded_prefix():
+    processor = RTCProcessor(
+        RTCConfig(
+            execution_horizon=4,
+            max_guidance_weight=10.0,
+            prefix_attention_schedule=RTCAttentionSchedule.ONES,
+            enabled=True,
+        )
+    )
+    latent_dim, horizon, action_dim = 8, 4, 2
+    decode = _linear_decode_x1(latent_dim, horizon, action_dim)
+
+    def denoise_fn(x_t, time):
+        return torch.zeros_like(x_t)
+
+    noise = torch.randn(2, latent_dim)
+    prev_chunk = torch.full((2, horizon, action_dim), 1.5)
+
+    unguided_lat = _euler_integrate(denoise_fn, noise.clone(), num_steps=8)
+    guided_lat = _euler_integrate(
+        denoise_fn,
+        noise.clone(),
+        num_steps=8,
+        rtc_processor=processor,
+        rtc_enabled=True,
+        prev_chunk_left_over=prev_chunk,
+        inference_delay=2,
+        execution_horizon=4,
+        decode_x1=decode,
+    )
+
+    guided_actions = decode(guided_lat)
+    unguided_actions = decode(unguided_lat)
+    guided_dist = (guided_actions[:, :2] - prev_chunk[:, :2]).abs().mean()
+    unguided_dist = (unguided_actions[:, :2] - prev_chunk[:, :2]).abs().mean()
+    assert guided_dist < 0.5 * unguided_dist
+    assert torch.isfinite(guided_lat).all()
+    assert torch.isfinite(guided_actions).all()

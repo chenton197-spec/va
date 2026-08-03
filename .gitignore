@@ -26,3 +26,6 @@ checkpoints/
 # External / unrelated project trees
 /shine_shoes_fr3/
 /shine_shoes_fr3_roi_masked/
+/shine_shoes_fr3_s256/
+/shine_shoes_fr3_s256.tar.zst
+*.tar.zst

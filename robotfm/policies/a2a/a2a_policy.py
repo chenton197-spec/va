@@ -25,6 +25,7 @@ from robotfm.policies.a2a.flow_matchers import (
 )
 from robotfm.policies.a2a.flow_net import SimpleFlowNet
 from robotfm.policies.encoders import MultiCameraEncoder
+from robotfm.policies.rtc import RTCConfig, RTCProcessor
 
 
 @dataclass
@@ -58,6 +59,7 @@ class A2AConfig:
     ae_dropout: float = 0.0
     pretrained_encoder: bool = True
     use_frame_diff: bool = True
+    rtc: RTCConfig | None = None
 
 
 class A2APolicy(nn.Module):
@@ -69,6 +71,11 @@ class A2APolicy(nn.Module):
         if cfg.n_action_steps > cfg.horizon:
             raise ValueError(
                 f"n_action_steps ({cfg.n_action_steps}) must be <= horizon ({cfg.horizon})"
+            )
+        if cfg.rtc is not None and cfg.rtc.enabled and cfg.n_action_steps != cfg.horizon:
+            raise ValueError(
+                "A2A RTC requires n_action_steps == horizon "
+                f"(got n_action_steps={cfg.n_action_steps}, horizon={cfg.horizon})"
             )
 
         self.encoder = MultiCameraEncoder(
@@ -123,6 +130,13 @@ class A2APolicy(nn.Module):
             sigma=0.0,
             num_sampling_steps=cfg.num_inference_steps,
         )
+
+        self.rtc_processor: RTCProcessor | None = None
+        if cfg.rtc is not None and cfg.rtc.enabled:
+            self.rtc_processor = RTCProcessor(cfg.rtc)
+
+    def _rtc_enabled(self) -> bool:
+        return self.rtc_processor is not None and self.cfg.rtc is not None and self.cfg.rtc.enabled
 
     def _add_history_noise(self, history_states: torch.Tensor) -> torch.Tensor:
         std = self.cfg.history_noise_std
@@ -211,26 +225,73 @@ class A2APolicy(nn.Module):
         return loss
 
     @torch.no_grad()
-    def sample_actions(self, batch: dict[str, torch.Tensor], **_kwargs) -> torch.Tensor:
+    def sample_actions(
+        self,
+        batch: dict[str, torch.Tensor],
+        *,
+        prev_chunk_left_over: torch.Tensor | None = None,
+        inference_delay: int | None = None,
+        execution_horizon: int | None = None,
+    ) -> torch.Tensor:
         """Euler ODE from state-history latents → decode to (B, horizon, action_dim).
 
-        Extra kwargs (e.g. RTC) are ignored for A2A v1.
+        RTC (optional): each latent Euler step guides via ``decode_x1`` so prefix
+        actions match ``prev_chunk_left_over`` (same kwargs as FlowMatchingPolicy).
         """
         b = batch["obs_state"].shape[0]
         device = batch["obs_state"].device
+        dtype = batch["obs_state"].dtype
 
         obs_latents = self._encode_obs(batch)
         history_latents = self._encode_history(batch)
 
-        action_latents_pred = self.flow_matcher.sample(
-            self.flow_net,
-            shape=(b, self.cfg.latent_dim),
-            device=device,
-            num_steps=self.cfg.num_inference_steps,
-            start=history_latents,
-            global_cond=obs_latents,
-            return_traces=False,
-        )
+        rtc_enabled = self._rtc_enabled()
+        if rtc_enabled:
+            if inference_delay is None and self.cfg.rtc is not None:
+                inference_delay = self.cfg.rtc.inference_delay
+            if execution_horizon is None and self.cfg.rtc is not None:
+                execution_horizon = self.cfg.rtc.execution_horizon
+
+            x = history_latents
+            steps = self.cfg.num_inference_steps
+            dt = 1.0 / steps
+            for i in range(steps):
+                t_val = i / steps
+                t = torch.full((b,), t_val, device=device, dtype=dtype)
+
+                def denoise_step_partial(
+                    input_x_t,
+                    current_t=t,
+                    current_cond=obs_latents,
+                ):
+                    return self.flow_net(input_x_t, current_t, global_cond=current_cond)
+
+                v = self.rtc_processor.denoise_step(
+                    x_t=x,
+                    prev_chunk_left_over=prev_chunk_left_over,
+                    inference_delay=inference_delay,
+                    time=t_val,
+                    original_denoise_step_partial=denoise_step_partial,
+                    execution_horizon=execution_horizon,
+                    decode_x1=self.action_decoder,
+                )
+                x = x + dt * v
+
+                if self.rtc_processor is not None and self.rtc_processor.is_debug_enabled():
+                    self.rtc_processor.track(time=t_val, x_t=x, v_t=v)
+
+            action_latents_pred = x
+        else:
+            action_latents_pred = self.flow_matcher.sample(
+                self.flow_net,
+                shape=(b, self.cfg.latent_dim),
+                device=device,
+                num_steps=self.cfg.num_inference_steps,
+                start=history_latents,
+                global_cond=obs_latents,
+                return_traces=False,
+            )
+
         action_pred = self.action_decoder(action_latents_pred)  # (B, n_action_steps, A)
 
         # Pad to horizon if n_action_steps < horizon (FM interface compatibility).
