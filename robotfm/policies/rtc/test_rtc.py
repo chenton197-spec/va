@@ -162,6 +162,40 @@ def test_action_queue_merge_skips_inference_delay():
     assert torch.allclose(leftover[0], torch.tensor([3.0]))
 
 
+def test_guidance_disabled_matches_unguided_even_with_leftover():
+    """guidance_enabled=False → leftover ignored; same as unguided Euler."""
+    processor = RTCProcessor(
+        RTCConfig(
+            execution_horizon=4,
+            max_guidance_weight=10.0,
+            prefix_attention_schedule=RTCAttentionSchedule.ONES,
+            enabled=True,
+            guidance_enabled=False,
+        )
+    )
+    noise = torch.randn(2, 4, 2)
+    leftover = torch.full((2, 4, 2), 3.0)
+
+    def denoise_fn(x_t, time):
+        return -0.5 * x_t
+
+    torch.manual_seed(0)
+    unguided = _euler_integrate(denoise_fn, noise.clone(), num_steps=4)
+
+    torch.manual_seed(0)
+    no_guide = _euler_integrate(
+        denoise_fn,
+        noise.clone(),
+        num_steps=4,
+        rtc_processor=processor,
+        rtc_enabled=True,
+        prev_chunk_left_over=leftover,
+        inference_delay=2,
+        execution_horizon=4,
+    )
+    assert torch.allclose(unguided, no_guide)
+
+
 def test_prefix_attention_schedules_shapes():
     for schedule in RTCAttentionSchedule:
         processor = RTCProcessor(

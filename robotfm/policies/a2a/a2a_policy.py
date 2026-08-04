@@ -138,6 +138,9 @@ class A2APolicy(nn.Module):
     def _rtc_enabled(self) -> bool:
         return self.rtc_processor is not None and self.cfg.rtc is not None and self.cfg.rtc.enabled
 
+    def _rtc_guidance_enabled(self) -> bool:
+        return self._rtc_enabled() and bool(self.cfg.rtc.guidance_enabled)
+
     def _add_history_noise(self, history_states: torch.Tensor) -> torch.Tensor:
         std = self.cfg.history_noise_std
         if std > 0:
@@ -237,6 +240,8 @@ class A2APolicy(nn.Module):
 
         RTC (optional): each latent Euler step guides via ``decode_x1`` so prefix
         actions match ``prev_chunk_left_over`` (same kwargs as FlowMatchingPolicy).
+        Set ``rtc.guidance_enabled=False`` to keep RTC scheduling elsewhere but
+        sample without prefix guidance (naive async chunking).
         """
         b = batch["obs_state"].shape[0]
         device = batch["obs_state"].device
@@ -245,8 +250,9 @@ class A2APolicy(nn.Module):
         obs_latents = self._encode_obs(batch)
         history_latents = self._encode_history(batch)
 
-        rtc_enabled = self._rtc_enabled()
-        if rtc_enabled:
+        use_guidance = self._rtc_guidance_enabled()
+        if use_guidance:
+            assert self.rtc_processor is not None
             if inference_delay is None and self.cfg.rtc is not None:
                 inference_delay = self.cfg.rtc.inference_delay
             if execution_horizon is None and self.cfg.rtc is not None:

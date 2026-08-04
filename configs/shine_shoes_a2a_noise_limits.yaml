@@ -39,8 +39,10 @@ policy:
   ae_dec_hidden_dim: 512
   ae_num_layers: 4
   rtc:
-    # RTC 推理引导（训练不受影响）；A2A 要求 n_action_steps == horizon
+    # RTC 推理（训练不受影响）；A2A 要求 n_action_steps == horizon
+    # guidance_enabled=false → 仅 ActionQueue ahead+discard，不做前缀引导
     enabled: false
+    guidance_enabled: true
     execution_horizon: 4
     max_guidance_weight: 10.0
     prefix_attention_schedule: exp

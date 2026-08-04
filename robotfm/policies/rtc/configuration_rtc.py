@@ -28,6 +28,9 @@ class RTCConfig:
     """
 
     enabled: bool = True
+    # When False with enabled=True: keep ActionQueue ahead+discard scheduling, skip
+    # prefix guidance during sampling (naive async chunking).
+    guidance_enabled: bool = True
     prefix_attention_schedule: RTCAttentionSchedule | str = RTCAttentionSchedule.LINEAR
     max_guidance_weight: float = 10.0
     execution_horizon: int = 10

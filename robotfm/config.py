@@ -191,6 +191,7 @@ def _normalize_rtc_config(rtc: RTCConfig) -> RTCConfig:
     """Re-construct RTCConfig so string enums from YAML are coerced."""
     return RTCConfig(
         enabled=rtc.enabled,
+        guidance_enabled=rtc.guidance_enabled,
         prefix_attention_schedule=rtc.prefix_attention_schedule,
         max_guidance_weight=rtc.max_guidance_weight,
         execution_horizon=rtc.execution_horizon,

@@ -153,6 +153,8 @@ def _load_deploy_config(path: Path) -> dict[str, Any]:
             raise ValueError(f"deploy.yaml 的 rtc 必须是映射: {path}")
         if "enabled" in rtc_raw and rtc_raw["enabled"] is not None:
             rtc_override["enabled"] = bool(rtc_raw["enabled"])
+        if "guidance_enabled" in rtc_raw and rtc_raw["guidance_enabled"] is not None:
+            rtc_override["guidance_enabled"] = bool(rtc_raw["guidance_enabled"])
         if "inference_delay" in rtc_raw and rtc_raw["inference_delay"] is not None:
             rtc_override["inference_delay"] = int(rtc_raw["inference_delay"])
         if "execution_horizon" in rtc_raw and rtc_raw["execution_horizon"] is not None:
@@ -181,11 +183,14 @@ def _apply_rtc_overrides(cfg: Any, deploy_rtc: dict[str, Any], args: argparse.Na
     """按 CLI > deploy.yaml rtc > 训练 YAML 优先级覆盖 policy.rtc。"""
     rtc = _normalize_rtc_config(cfg.policy.rtc)
     enabled = rtc.enabled
+    guidance_enabled = rtc.guidance_enabled
     inference_delay = rtc.inference_delay
     execution_horizon = rtc.execution_horizon
 
     if "enabled" in deploy_rtc:
         enabled = bool(deploy_rtc["enabled"])
+    if "guidance_enabled" in deploy_rtc:
+        guidance_enabled = bool(deploy_rtc["guidance_enabled"])
     if "inference_delay" in deploy_rtc:
         inference_delay = int(deploy_rtc["inference_delay"])
     if "execution_horizon" in deploy_rtc:
@@ -193,6 +198,8 @@ def _apply_rtc_overrides(cfg: Any, deploy_rtc: dict[str, Any], args: argparse.Na
 
     if args.rtc:
         enabled = True
+    if getattr(args, "no_guidance", False):
+        guidance_enabled = False
     if args.inference_delay is not None:
         inference_delay = int(args.inference_delay)
     if args.execution_horizon is not None:
@@ -200,16 +207,19 @@ def _apply_rtc_overrides(cfg: Any, deploy_rtc: dict[str, Any], args: argparse.Na
 
     need_rebuild = (
         args.rtc
+        or getattr(args, "no_guidance", False)
         or args.inference_delay is not None
         or args.execution_horizon is not None
         or bool(deploy_rtc)
         or enabled != rtc.enabled
+        or guidance_enabled != rtc.guidance_enabled
         or inference_delay != rtc.inference_delay
         or execution_horizon != rtc.execution_horizon
     )
     if need_rebuild:
         cfg.policy.rtc = RTCConfig(
             enabled=enabled,
+            guidance_enabled=guidance_enabled,
             prefix_attention_schedule=rtc.prefix_attention_schedule,
             max_guidance_weight=rtc.max_guidance_weight,
             execution_horizon=execution_horizon,
@@ -295,7 +305,12 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--rtc",
         action="store_true",
-        help="启用 RTC 推理引导（覆盖训练 YAML / deploy.yaml；对齐 eval_flow_matching.py）",
+        help="启用 RTC（覆盖训练 YAML / deploy.yaml；对齐 eval_flow_matching.py）",
+    )
+    parser.add_argument(
+        "--no-guidance",
+        action="store_true",
+        help="RTC 调度保留（ahead+discard），关闭采样前缀引导（naive async）",
     )
     parser.add_argument(
         "--inference-delay",
@@ -1263,11 +1278,15 @@ def main() -> None:
     )
     print(f"[INFO] action_names={list(cfg.action_names)}")
     print(
-        f"[INFO] rtc.enabled={rtc_enabled} delay={rtc_cfg.inference_delay} "
-        f"exec_h={rtc_cfg.execution_horizon} schedule={rtc_cfg.prefix_attention_schedule}"
+        f"[INFO] rtc.enabled={rtc_enabled} guidance={rtc_cfg.guidance_enabled} "
+        f"delay={rtc_cfg.inference_delay} exec_h={rtc_cfg.execution_horizon} "
+        f"schedule={rtc_cfg.prefix_attention_schedule}"
     )
     if rtc_enabled:
-        print("[INFO] RTC mode: async think-while-moving (control loop not blocked)")
+        if rtc_cfg.guidance_enabled:
+            print("[INFO] RTC mode: async think-while-moving + prefix guidance")
+        else:
+            print("[INFO] RTC mode: async think-while-moving, guidance OFF (naive discard)")
 
     device = torch.device(cfg.train.device if torch.cuda.is_available() else "cpu")
     if device.type == "cuda":

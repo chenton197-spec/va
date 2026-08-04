@@ -7,6 +7,12 @@ Mirrors deploy replan cadence (every n_action_steps). Usage (from ct/va)::
       --checkpoint outputs/fm_shine_shoes_limits_260731181324/checkpoint_final.pt \\
       --config configs/shine_shoes_fm_limits.yaml \\
       --episode 100
+
+    # RTC with / without prefix guidance
+    PYTHONPATH=. python scripts/bench_episode_infer_latency.py \\
+      --checkpoint outputs/a2a_noise_shine_shoes_limits_260730175409/checkpoint_090000.pt \\
+      --config configs/shine_shoes_a2a_noise_limits.yaml \\
+      --episode 100 --rtc --compare-guidance
 """
 
 from __future__ import annotations
@@ -30,6 +36,7 @@ from robotfm.data.lerobot_dataset import (
 )
 from robotfm.data.stats import normalize
 from robotfm.policies.encoders import MultiCameraEncoder
+from robotfm.policies.rtc import RTCConfig
 from robotfm.train import build_policy
 
 
@@ -53,6 +60,16 @@ def _parse_args() -> argparse.Namespace:
         "--rtc",
         action="store_true",
         help="Enable RTC with leftover (matches deploy replan path; delay/horizon below)",
+    )
+    p.add_argument(
+        "--no-guidance",
+        action="store_true",
+        help="RTC on but guidance_enabled=False (naive async; ignored with --compare-guidance)",
+    )
+    p.add_argument(
+        "--compare-guidance",
+        action="store_true",
+        help="With --rtc: bench guidance ON then OFF (batched encoder) and print delta",
     )
     p.add_argument("--inference-delay", type=int, default=2)
     p.add_argument("--execution-horizon", type=int, default=4)
@@ -221,14 +238,31 @@ def _bench_mode(
         times.append(float(np.median(step_times)))
     mean, med, std = _summarize(times)
     print(
-        f"[RESULT] {mode_name:16s}  per-replan ms: mean={mean:.2f} median={med:.2f} "
+        f"[RESULT] {mode_name:24s}  per-replan ms: mean={mean:.2f} median={med:.2f} "
         f"std={std:.2f} (n={len(times)})"
     )
     return times
 
 
+def _apply_rtc_cfg(cfg, *, enabled: bool, guidance_enabled: bool, delay: int, exec_h: int) -> None:
+    rtc = cfg.policy.rtc
+    cfg.policy.rtc = RTCConfig(
+        enabled=enabled,
+        guidance_enabled=guidance_enabled,
+        prefix_attention_schedule=rtc.prefix_attention_schedule,
+        max_guidance_weight=rtc.max_guidance_weight,
+        execution_horizon=exec_h,
+        inference_delay=delay,
+        debug=rtc.debug,
+        debug_maxlen=rtc.debug_maxlen,
+    )
+
+
 def main() -> None:
     args = _parse_args()
+    if args.compare_guidance and not args.rtc:
+        raise SystemExit("--compare-guidance requires --rtc")
+
     va_root = Path(__file__).resolve().parents[1]
     cfg_path = Path(args.config)
     ckpt_path = Path(args.checkpoint)
@@ -244,11 +278,16 @@ def main() -> None:
     if args.data_root is not None:
         cfg.data_root = args.data_root
 
+    guidance_enabled = not args.no_guidance
     # RTC must be enabled before build_policy so rtc_processor is constructed.
     if args.rtc:
-        cfg.policy.rtc.enabled = True
-        cfg.policy.rtc.inference_delay = int(args.inference_delay)
-        cfg.policy.rtc.execution_horizon = int(args.execution_horizon)
+        _apply_rtc_cfg(
+            cfg,
+            enabled=True,
+            guidance_enabled=guidance_enabled,
+            delay=int(args.inference_delay),
+            exec_h=int(args.execution_horizon),
+        )
     elif getattr(cfg.policy, "rtc", None) is not None:
         cfg.policy.rtc.enabled = False
 
@@ -287,8 +326,10 @@ def main() -> None:
         f"num_inference_steps={cfg.policy.num_inference_steps} device={device}"
     )
     if args.rtc:
+        guide_label = "compare" if args.compare_guidance else str(guidance_enabled)
         print(
             f"[INFO] RTC ON delay={args.inference_delay} exec_h={args.execution_horizon} "
+            f"guidance={guide_label} "
             "(timing uses leftover; cold-start excluded from mean)"
         )
     else:
@@ -313,10 +354,71 @@ def main() -> None:
             )
         )
 
-    policy = build_policy(cfg, stats)
-    policy.load_state_dict(ckpt["policy_state_dict"])
-    policy.to(device)
-    policy.eval()
+    def _load_policy(*, guide: bool):
+        if args.rtc:
+            _apply_rtc_cfg(
+                cfg,
+                enabled=True,
+                guidance_enabled=guide,
+                delay=int(args.inference_delay),
+                exec_h=int(args.execution_horizon),
+            )
+        policy = build_policy(cfg, stats)
+        policy.load_state_dict(ckpt["policy_state_dict"])
+        policy.to(device)
+        policy.eval()
+        return policy
+
+    if args.compare_guidance:
+        # Batched encoder only; guidance ON vs OFF.
+        times_by_guide: dict[str, list[float]] = {}
+        for guide, label in ((True, "guidance=ON"), (False, "guidance=OFF")):
+            policy = _load_policy(guide=guide)
+            _set_encoder_mode(policy, "batched")
+            leftover = _make_leftover(
+                policy,
+                batches[0],
+                inference_delay=int(args.inference_delay),
+                device=device,
+            )
+            print(f"[INFO] {label} leftover shape={tuple(leftover.shape)}")
+            cold = [
+                _time_infer_ms(
+                    policy,
+                    batches[0],
+                    device,
+                    leftover=None,
+                    inference_delay=int(args.inference_delay),
+                    execution_horizon=int(args.execution_horizon),
+                )
+                for _ in range(max(3, args.repeats))
+            ]
+            print(
+                f"[RESULT] {('cold '+label):24s}  per-call ms: mean={np.mean(cold):.2f} "
+                f"median={np.median(cold):.2f}"
+            )
+            times_by_guide[label] = _bench_mode(
+                policy,
+                batches,
+                device,
+                mode_name=f"batched {label}",
+                warmup=args.warmup,
+                repeats=args.repeats,
+                leftover=leftover,
+                inference_delay=int(args.inference_delay),
+                execution_horizon=int(args.execution_horizon),
+            )
+        on = np.asarray(times_by_guide["guidance=ON"])
+        off = np.asarray(times_by_guide["guidance=OFF"])
+        saved = on - off
+        print(
+            f"[SAVE]   guidance OFF vs ON: mean_save={saved.mean():.2f}ms/replan "
+            f"({100.0 * saved.mean() / on.mean():.1f}%)  "
+            f"median_save={np.median(saved):.2f}ms"
+        )
+        return
+
+    policy = _load_policy(guide=guidance_enabled)
 
     rtc_kw: dict = {}
     leftover: torch.Tensor | None = None
@@ -340,7 +442,7 @@ def main() -> None:
             for _ in range(max(3, args.repeats))
         ]
         print(
-            f"[RESULT] {'cold-start':16s}  per-call ms: mean={np.mean(cold):.2f} "
+            f"[RESULT] {'cold-start':24s}  per-call ms: mean={np.mean(cold):.2f} "
             f"median={np.median(cold):.2f}"
         )
 
@@ -371,10 +473,7 @@ def main() -> None:
 
     if args.compile:
         # Fresh policy so compile starts from batched class forward
-        policy2 = build_policy(cfg, stats)
-        policy2.load_state_dict(ckpt["policy_state_dict"])
-        policy2.to(device)
-        policy2.eval()
+        policy2 = _load_policy(guide=guidance_enabled)
         compiled = _compile_submodules(policy2)
         print(f"[INFO] torch.compile: {compiled}")
 

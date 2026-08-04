@@ -115,7 +115,7 @@ class RTCProcessor:
         # robotfm / PI original: time goes from 0 (noise) to 1 (data)
         tau = time
 
-        if prev_chunk_left_over is None:
+        if prev_chunk_left_over is None or not self.rtc_config.guidance_enabled:
             v_t = original_denoise_step_partial(x_t)
             return v_t
 

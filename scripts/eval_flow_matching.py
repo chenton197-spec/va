@@ -25,6 +25,11 @@ def main() -> None:
         action="store_true",
         help="启用 RTC 推理引导（不改 yaml；训练 checkpoint 可直接用）",
     )
+    parser.add_argument(
+        "--no-guidance",
+        action="store_true",
+        help="RTC 开时关闭前缀引导（仅 ahead+discard）",
+    )
     parser.add_argument("--inference-delay", type=int, default=None, help="RTC 模拟推理延迟（步）")
     parser.add_argument("--execution-horizon", type=int, default=None, help="RTC execution_horizon")
     parser.add_argument(
@@ -59,10 +64,16 @@ def main() -> None:
         # ACTConfig 要求 temporal ensemble 时 n_action_steps=1
         cfg.policy.n_action_steps = 1
 
-    if args.rtc or args.inference_delay is not None or args.execution_horizon is not None:
+    if (
+        args.rtc
+        or getattr(args, "no_guidance", False)
+        or args.inference_delay is not None
+        or args.execution_horizon is not None
+    ):
         rtc = cfg.policy.rtc
         cfg.policy.rtc = RTCConfig(
             enabled=True if args.rtc else rtc.enabled,
+            guidance_enabled=False if getattr(args, "no_guidance", False) else rtc.guidance_enabled,
             prefix_attention_schedule=rtc.prefix_attention_schedule,
             max_guidance_weight=rtc.max_guidance_weight,
             execution_horizon=args.execution_horizon if args.execution_horizon is not None else rtc.execution_horizon,
@@ -73,8 +84,11 @@ def main() -> None:
 
     ckpt = Path(args.checkpoint) if args.checkpoint else resolve_path(base_dir, cfg.output_dir) / "checkpoint_final.pt"
     print(f"checkpoint: {ckpt}")
-    print(f"rtc.enabled={cfg.policy.rtc.enabled} delay={cfg.policy.rtc.inference_delay} "
-          f"exec_h={cfg.policy.rtc.execution_horizon} render={args.render}")
+    print(
+        f"rtc.enabled={cfg.policy.rtc.enabled} guidance={cfg.policy.rtc.guidance_enabled} "
+        f"delay={cfg.policy.rtc.inference_delay} "
+        f"exec_h={cfg.policy.rtc.execution_horizon} render={args.render}"
+    )
     print(
         f"n_action_steps={cfg.policy.n_action_steps} "
         f"temporal_ensemble_coeff={cfg.policy.temporal_ensemble_coeff}"

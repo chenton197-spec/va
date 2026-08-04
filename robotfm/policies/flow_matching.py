@@ -122,6 +122,9 @@ class FlowMatchingPolicy(nn.Module):
     def _rtc_enabled(self) -> bool:
         return self.rtc_processor is not None and self.cfg.rtc is not None and self.cfg.rtc.enabled
 
+    def _rtc_guidance_enabled(self) -> bool:
+        return self._rtc_enabled() and bool(self.cfg.rtc.guidance_enabled)
+
     def sample_time(self, batch_size: int, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
         """采样训练时间 t。
 
@@ -172,6 +175,9 @@ class FlowMatchingPolicy(nn.Module):
         - ``prev_chunk_left_over``: 上一 chunk 未执行尾部
         - ``inference_delay``: 前缀硬约束步数
         - ``execution_horizon``: soft blend 区域终点
+
+        ``rtc.guidance_enabled=False`` 时仍可在外层用 ActionQueue 做 ahead+discard，
+        但本函数不做前缀引导。
         """
         b = batch["obs_state"].shape[0]
         device = batch["obs_state"].device
@@ -182,7 +188,7 @@ class FlowMatchingPolicy(nn.Module):
         steps = self.cfg.num_inference_steps
         dt = 1.0 / steps
 
-        rtc_enabled = self._rtc_enabled()
+        use_guidance = self._rtc_guidance_enabled()
         if inference_delay is None and self.cfg.rtc is not None:
             inference_delay = self.cfg.rtc.inference_delay
         if execution_horizon is None and self.cfg.rtc is not None:
@@ -195,7 +201,8 @@ class FlowMatchingPolicy(nn.Module):
             def denoise_step_partial(input_x_t, current_t=t, current_cond=cond):
                 return self.unet(input_x_t, current_t, current_cond)
 
-            if rtc_enabled:
+            if use_guidance:
+                assert self.rtc_processor is not None
                 v = self.rtc_processor.denoise_step(
                     x_t=x,
                     prev_chunk_left_over=prev_chunk_left_over,
