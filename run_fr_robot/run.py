@@ -10,7 +10,11 @@ norm_mode、resize/crop、n_obs_steps、n_action_steps、fps 等）。
   /home/casbot/teleop_project/fairino390/linux/fairino/Robot.py
 
   - 启动时 MoveJ 到 deploy.yaml 中的 start_pose
-  - 闭环用独立后台线程 ServoJ 下发关节角（度，``cmdT`` 默认 1.0s）
+  - 闭环用独立后台线程 ServoJ 下发关节角（度，固定 ``cmdT=8ms``）
+  - 写入 ActionQueue 的同时做 Z 校验、五次插值与滤波，生成 8ms 密采样；
+    ServoJ 只回放；主循环负责观测 / RTC 推理
+  - 关节目标经样条插值 + 低通滤波，并用 ``max_joint_vel_deg_s`` 限速
+    （默认 150 deg/s），避免 action chunk 衔接跳变
   - GetForwardKin / Z 限位校验同在 ServoJ 线程，避免 XML-RPC 并发
   - 夹爪目标写入后台循环，按 ``gripper_rate_hz``（默认 125）连续
     ``send_normalized``（MIT 不能只偶发一帧）
@@ -67,6 +71,12 @@ from robotfm.data.stats import denormalize, normalize  # noqa: E402
 from robotfm.policies.rtc import ActionQueue, RTCConfig  # noqa: E402
 from robotfm.train import build_policy  # noqa: E402
 from robotfm.types import Observation  # noqa: E402
+
+from arm_control import (  # noqa: E402
+    SERVOJ_CMDT_S,
+    BackgroundServoJLoop,
+    forward_kin_desc_pos,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -139,9 +149,15 @@ def _load_deploy_config(path: Path) -> dict[str, Any]:
     gripper_rate_hz = float(data.get("gripper_rate_hz", 125.0))
     if gripper_rate_hz <= 0.0:
         raise ValueError("deploy.yaml 的 gripper_rate_hz 必须 > 0")
-    servoj_cmdt = float(data.get("servoj_cmdt", 1.0))
-    if servoj_cmdt <= 0.0:
-        raise ValueError("deploy.yaml 的 servoj_cmdt 必须 > 0")
+    max_joint_vel_deg_s = float(data.get("max_joint_vel_deg_s", 150.0))
+    if max_joint_vel_deg_s <= 0.0:
+        raise ValueError("deploy.yaml 的 max_joint_vel_deg_s 必须 > 0")
+    max_joint_step_raw = data.get("max_joint_step_deg", 15.0)
+    max_joint_step_deg = (
+        None if max_joint_step_raw is None else float(max_joint_step_raw)
+    )
+    if max_joint_step_deg is not None and max_joint_step_deg <= 0.0:
+        raise ValueError("deploy.yaml 的 max_joint_step_deg 必须 > 0")
 
     # torch.compile for encoder + denoiser; default off (RTC autograd path).
     compile_enabled = bool(data.get("compile", False))
@@ -173,7 +189,8 @@ def _load_deploy_config(path: Path) -> dict[str, Any]:
         "tcp_pose": tcp_pose,
         "z_limit": float(data["z_limit"]),
         "gripper_rate_hz": gripper_rate_hz,
-        "servoj_cmdt": servoj_cmdt,
+        "max_joint_vel_deg_s": max_joint_vel_deg_s,
+        "max_joint_step_deg": max_joint_step_deg,
         "compile": compile_enabled,
         "rtc": rtc_override,
     }
@@ -700,184 +717,6 @@ class HardwareBundle:
     start_joints_deg: list[float] | None = None
 
 
-class BackgroundServoJLoop:
-    """后台按 ``cmdT`` 周期刷 FAIRINO ``ServoJ``，策略只更新目标关节角。
-
-    ``GetForwardKin`` / Z 限位校验也在本线程执行，避免与主线程并发打 XML-RPC。
-    """
-
-    _AXIS_POS = [0.0, 0.0, 0.0, 0.0]
-
-    def __init__(self, robot: Any, *, cmdt_s: float = 1.0, z_limit: float):
-        if cmdt_s <= 0.0:
-            raise ValueError("servoj cmdt_s 必须 > 0")
-        self._robot = robot
-        self._cmdt_s = float(cmdt_s)
-        self._z_limit = float(z_limit)
-        self._lock = threading.Lock()
-        self._target: list[float] | None = None
-        self._pending: list[float] | None = None
-        self._stop = threading.Event()
-        self._wake = threading.Event()
-        self._thread: threading.Thread | None = None
-        self._servo_started = False
-        self._warn_every = max(1, int(round(1.0 / self._cmdt_s)))
-        self._fail_streak = 0
-
-    @property
-    def cmdt_s(self) -> float:
-        return self._cmdt_s
-
-    def set_joints_deg(
-        self,
-        joints_deg: list[float] | np.ndarray,
-        *,
-        check_z: bool = True,
-    ) -> None:
-        """提交关节目标。默认经后台 ``GetForwardKin`` 校验 Z；``check_z=False`` 直接生效。"""
-        values = [float(v) for v in joints_deg]
-        if len(values) != 6:
-            raise ValueError(f"ServoJ 目标必须是 6 轴，得到 {len(values)}")
-        with self._lock:
-            if check_z:
-                self._pending = values
-            else:
-                self._target = values
-                self._pending = None
-        self._wake.set()
-
-    def get_joints_deg(self) -> list[float] | None:
-        with self._lock:
-            return None if self._target is None else list(self._target)
-
-    def start(self, initial_joints_deg: list[float] | np.ndarray | None = None) -> None:
-        if self._thread is not None:
-            raise RuntimeError("ServoJ 后台循环已在运行")
-        if initial_joints_deg is not None:
-            # 已在起点，跳过 FK；启动前主线程仍可独占 RPC
-            self.set_joints_deg(initial_joints_deg, check_z=False)
-        if self.get_joints_deg() is None:
-            raise RuntimeError("启动 ServoJ 前必须提供初始目标关节角")
-
-        ret = self._robot.ServoMoveStart()
-        print(f"[INFO] ServoMoveStart -> {ret}")
-        if ret != 0:
-            raise RuntimeError(f"ServoMoveStart 失败 error={ret}")
-        self._servo_started = True
-
-        self._stop.clear()
-        self._wake.clear()
-        self._thread = threading.Thread(
-            target=self._run,
-            name="fairino-servoj-loop",
-            daemon=True,
-        )
-        self._thread.start()
-        print(
-            f"[INFO] ServoJ 后台循环已启动: cmdT={self._cmdt_s:g}s，"
-            f"z_limit={self._z_limit:g}，"
-            f"初始目标={[round(v, 3) for v in self.get_joints_deg() or []]}"
-        )
-
-    def stop(self, *, join_timeout_s: float = 2.0) -> None:
-        self._stop.set()
-        self._wake.set()
-        thread = self._thread
-        if thread is not None and thread.is_alive():
-            thread.join(timeout=join_timeout_s)
-        self._thread = None
-        if self._servo_started:
-            try:
-                ret = self._robot.ServoMoveEnd()
-                print(f"[INFO] ServoMoveEnd -> {ret}")
-            except Exception as exc:
-                print(f"[WARN] ServoMoveEnd 异常: {exc}")
-            self._servo_started = False
-
-    def _apply_pending(self, pending: list[float]) -> None:
-        """在 ServoJ 线程内做正运动学与 Z 限位；通过才更新 ``_target``。"""
-        try:
-            desc_pos = _forward_kin_desc_pos(self._robot, pending)
-        except Exception as exc:
-            print(f"[WARN] GetForwardKin 异常，跳过 ServoJ 目标更新: {exc}", flush=True)
-            return
-        if desc_pos is not None:
-            print(
-                f"  desc_pos={[round(v, 3) for v in desc_pos]}",
-                flush=True,
-            )
-            if desc_pos[2] < self._z_limit:
-                print(
-                    f"[WARN] Z={desc_pos[2]:.3f} < z_limit={self._z_limit}，"
-                    f"跳过 ServoJ 目标更新",
-                    flush=True,
-                )
-                return
-        else:
-            print(
-                "[WARN] GetForwardKin 失败，跳过 ServoJ 目标更新（无法校验 Z）",
-                flush=True,
-            )
-            return
-        with self._lock:
-            self._target = pending
-
-    def _run(self) -> None:
-        next_servoj_t = time.perf_counter()
-        while not self._stop.is_set():
-            with self._lock:
-                pending = self._pending
-                if pending is not None:
-                    self._pending = None
-            if pending is not None:
-                self._apply_pending(pending)
-
-            now = time.perf_counter()
-            if now >= next_servoj_t:
-                with self._lock:
-                    target = None if self._target is None else list(self._target)
-                if target is not None:
-                    try:
-                        ret = self._robot.ServoJ(
-                            joint_pos=target,
-                            axisPos=self._AXIS_POS,
-                            cmdT=self._cmdt_s,
-                        )
-                    except Exception as exc:
-                        ret = -1
-                        self._fail_streak += 1
-                        if (
-                            self._fail_streak == 1
-                            or self._fail_streak % self._warn_every == 0
-                        ):
-                            print(f"[WARN] ServoJ 后台异常: {exc}")
-                    else:
-                        if ret == 0:
-                            self._fail_streak = 0
-                        else:
-                            self._fail_streak += 1
-                            if (
-                                self._fail_streak == 1
-                                or self._fail_streak % self._warn_every == 0
-                            ):
-                                print(f"[WARN] ServoJ 错误码: {ret}")
-                next_servoj_t = now + self._cmdt_s
-
-            if self._stop.is_set():
-                break
-            with self._lock:
-                if self._pending is not None:
-                    continue
-            wait_s = max(0.0, next_servoj_t - time.perf_counter())
-            self._wake.clear()
-            with self._lock:
-                if self._pending is not None:
-                    continue
-            if self._stop.is_set():
-                break
-            self._wake.wait(timeout=wait_s)
-
-
 class BackgroundGripperLoop:
     """后台按固定频率刷 Gloria-M ``send_normalized``，策略只更新目标开合。"""
 
@@ -1000,15 +839,6 @@ def _connect_robot(robot_ip: str) -> Any:
     return robot
 
 
-def _forward_kin_desc_pos(robot, joints_deg: list[float]) -> list[float] | None:
-    """用 GetForwardKin 由关节角求笛卡尔位姿 [x,y,z,rx,ry,rz]，失败返回 None。"""
-    ret = robot.GetForwardKin(list(map(float, joints_deg)))
-    if not isinstance(ret, (list, tuple)) or ret[0] != 0 or ret[1] is None:
-        print(f"[WARN] GetForwardKin 失败: {ret}")
-        return None
-    return [float(v) for v in ret[1]]
-
-
 def _movej_start_pose(
     robot,
     joints_deg: list[float],
@@ -1023,7 +853,7 @@ def _movej_start_pose(
         tool = cur_tool if tool is None else tool
         user = cur_user if user is None else user
 
-    desc_pos = tcp_pose if tcp_pose is not None else _forward_kin_desc_pos(robot, joints_deg)
+    desc_pos = tcp_pose if tcp_pose is not None else forward_kin_desc_pos(robot, joints_deg)
     print(f"[INFO] MoveJ joints_deg = {joints_deg}")
     if desc_pos is not None:
         print(f"[INFO] MoveJ desc_pos (tcp) = {desc_pos}")
@@ -1135,34 +965,62 @@ def _read_observation(
     return Observation(images=images, state=state, timestamp=time.time())
 
 
-def _send_action(
-    hw: HardwareBundle,
-    action: np.ndarray,
-) -> None:
-    """打印并下发一步动作：先更新夹爪目标，再提交 ServoJ 目标关节角。
-
-    夹爪 / ServoJ 均由后台循环持续刷帧；本函数只改目标。
-    Z 限位由 ServoJ 后台线程内 ``GetForwardKin`` 校验。
-    """
-    joints = action[:6].astype(float).tolist()
-    gripper = float(np.clip(action[6], 0.0, 1.0))
-    print(
-        f"  joints_deg={[round(v, 3) for v in joints]}  gripper={gripper:.4f}",
-        flush=True,
-    )
-    if hw.robot is None:
-        raise RuntimeError("未连接机器人，无法下发 ServoJ")
-    if hw.servoj_loop is None:
-        raise RuntimeError("ServoJ 后台循环未启动")
-
+def _apply_gripper_opening(hw: HardwareBundle, opening: float) -> None:
+    """更新夹爪目标开合。"""
+    value = float(np.clip(opening, 0.0, 1.0))
     if hw.gripper_loop is not None:
-        hw.gripper_loop.set_opening(gripper)
+        hw.gripper_loop.set_opening(value)
     elif hw.gripper is not None:
-        ok = hw.gripper.send_normalized(gripper)
+        ok = hw.gripper.send_normalized(value)
         if not ok:
             print("[WARN] Gloria-M send_normalized 失败")
 
-    hw.servoj_loop.set_joints_deg(joints)
+
+def _wire_arm_queue(
+    hw: HardwareBundle,
+    action_queue: ActionQueue,
+) -> None:
+    """密采样回放时：推进 ActionQueue 索引 + 更新夹爪。"""
+    if hw.servoj_loop is None:
+        raise RuntimeError("ServoJ 后台循环未启动")
+
+    def _advance() -> None:
+        action_t = action_queue.get()
+        if action_t is not None:
+            arr = np.asarray(action_t.detach().cpu().numpy(), dtype=np.float64)
+            joints = arr[:6].tolist()
+            grip = float(arr[6]) if arr.shape[0] > 6 else float("nan")
+            print(
+                f"  [arm] sparse_done joints_deg={[round(v, 3) for v in joints]} "
+                f"gripper={grip:.4f}",
+                flush=True,
+            )
+
+    hw.servoj_loop.set_callbacks(
+        on_sparse_advance=_advance,
+        on_gripper=lambda g: _apply_gripper_opening(hw, g),
+    )
+
+
+def _enqueue_merged_actions(
+    hw: HardwareBundle,
+    action_queue: ActionQueue,
+    *,
+    fps: int,
+    replace: bool,
+) -> None:
+    """merge 之后立刻把剩余稀疏路点送去 Z/插值/滤波密采样。"""
+    if hw.servoj_loop is None:
+        raise RuntimeError("ServoJ 后台循环未启动")
+    leftover = action_queue.get_processed_left_over()
+    if leftover is None or leftover.shape[0] == 0:
+        return
+    actions = np.asarray(leftover.detach().cpu().numpy(), dtype=np.float64)
+    hw.servoj_loop.enqueue_waypoints(
+        actions,
+        action_period_s=1.0 / float(fps),
+        replace=replace,
+    )
 
 
 def _shutdown(hw: HardwareBundle) -> None:
@@ -1345,8 +1203,14 @@ def main() -> None:
 
         hw.servoj_loop = BackgroundServoJLoop(
             hw.robot,
-            cmdt_s=deploy["servoj_cmdt"],
             z_limit=deploy["z_limit"],
+            max_joint_vel_deg_s=deploy["max_joint_vel_deg_s"],
+            max_joint_step_deg=deploy["max_joint_step_deg"],
+        )
+        print(
+            f"[INFO] ServoJ cmdT={SERVOJ_CMDT_S:g}s，"
+            f"max_joint_vel_deg_s={deploy['max_joint_vel_deg_s']:g}，"
+            f"max_joint_step_deg={deploy['max_joint_step_deg']}"
         )
         hw.servoj_loop.start(initial_joints_deg=joints)
 
@@ -1369,15 +1233,20 @@ def main() -> None:
 
         print(f"[INFO] 开始闭环，最多 {max_steps} 步" + (" (RTC)" if rtc_enabled else ""))
 
+        action_queue = ActionQueue(rtc_cfg)
+
+        def _pull_done() -> bool:
+            assert hw.servoj_loop is not None
+            return hw.servoj_loop.actions_executed >= max_steps
+
         if rtc_enabled:
             infer_worker = _RtcInferWorker(device)
             infer_worker.start()
             print("[INFO] RTC infer worker ready (persistent CUDA thread)")
 
-            action_queue = ActionQueue(rtc_cfg)
-            step_i = 0
             infer_job: _RtcInferJob | None = None
             cold_started = False
+            arm_wired = False
 
             def _make_batch() -> dict[str, torch.Tensor]:
                 return _build_obs_batch(
@@ -1394,11 +1263,16 @@ def main() -> None:
             replan_threshold = int(rtc_cfg.inference_delay)
             print(
                 f"[INFO] RTC replan when qsize<={replan_threshold} "
-                f"(inference_delay={rtc_cfg.inference_delay})"
+                f"(inference_delay={rtc_cfg.inference_delay}); "
+                f"enqueue 时插值/滤波，ServoJ 回放密采样"
             )
             underrun_warned = False
+            last_logged_exec = -1
 
-            while step_i < max_steps:
+            while not _pull_done():
+                step_i = (
+                    hw.servoj_loop.actions_executed if hw.servoj_loop is not None else 0
+                )
                 merged_this_iter = False
 
                 # Merge completed async inference (use real consumed steps as delay).
@@ -1442,6 +1316,9 @@ def main() -> None:
                                 real_delay=real_delay,
                                 action_index_before_inference=infer_job.idx0,
                             )
+                            _enqueue_merged_actions(
+                                hw, action_queue, fps=fps, replace=True
+                            )
                             infer_job = None
                             underrun_warned = False
                             merged_this_iter = True
@@ -1469,6 +1346,12 @@ def main() -> None:
                     )
                     action_queue.merge(
                         pred.cpu(), processed.cpu(), real_delay=0
+                    )
+                    if not arm_wired:
+                        _wire_arm_queue(hw, action_queue)
+                        arm_wired = True
+                    _enqueue_merged_actions(
+                        hw, action_queue, fps=fps, replace=True
                     )
                     cold_started = True
                     merged_this_iter = True
@@ -1526,33 +1409,47 @@ def main() -> None:
                         leftover_len=leftover_len,
                     )
 
-                t0 = time.perf_counter()
-                action_t = action_queue.get()
-                if action_t is None:
-                    if infer_job is not None:
-                        # Leftover exhausted before inference finished → arm holds last target.
-                        if not underrun_warned:
-                            waited_ms = (
-                                time.perf_counter() - infer_job.started_at
-                            ) * 1000.0
-                            print(
-                                f"[WARN] step={step_i} action queue underrun while "
-                                f"inferring (~{waited_ms:.0f}ms so far); "
-                                f"arm holding last ServoJ target (stutter). "
-                                f"Increase rtc.execution_horizon / inference_delay "
-                                f"or lower num_inference_steps.",
-                                flush=True,
-                            )
-                            underrun_warned = True
-                        time.sleep(0.001)
-                        continue
+                dense_left = (
+                    hw.servoj_loop.dense_qsize if hw.servoj_loop is not None else 0
+                )
+                if (
+                    cold_started
+                    and dense_left == 0
+                    and action_queue.qsize() == 0
+                    and infer_job is not None
+                    and not underrun_warned
+                ):
+                    waited_ms = (time.perf_counter() - infer_job.started_at) * 1000.0
+                    print(
+                        f"[WARN] step={step_i} dense/action underrun while "
+                        f"inferring (~{waited_ms:.0f}ms so far); "
+                        f"arm holding last ServoJ target (stutter). "
+                        f"Increase rtc.execution_horizon / inference_delay "
+                        f"or lower num_inference_steps.",
+                        flush=True,
+                    )
+                    underrun_warned = True
+
+                if (
+                    cold_started
+                    and dense_left == 0
+                    and action_queue.qsize() == 0
+                    and infer_job is None
+                    and arm_wired
+                ):
                     print(
                         "[WARN] action queue empty and no inference in flight; stopping"
                     )
                     break
 
-                print(f"[INFO] step={step_i}", end="")
-                _send_action(hw, action_t.numpy())
+                t0 = time.perf_counter()
+                if step_i != last_logged_exec:
+                    print(
+                        f"[INFO] obs_loop exec_actions={step_i} "
+                        f"qsize={action_queue.qsize()} dense={dense_left}",
+                        flush=True,
+                    )
+                    last_logged_exec = step_i
                 obs = _prepare_observation(
                     _read_observation(hw, cameras, last_state=obs.state),
                     resize_size=resize_size,
@@ -1560,16 +1457,17 @@ def main() -> None:
                     eval_fixed_crop=eval_fixed_crop,
                 )
                 _append_observation(obs_history, obs, n_obs_steps=n_obs)
-                step_i += 1
                 _pace_step(t0, fps)
         else:
-            # action chunking：执行 n_action_steps 步后再 replan（与 eval.py 一致）
-            chunk_actions: list[np.ndarray] = []
-            chunk_idx = 0
+            # 非 RTC：merge 后立刻 enqueue 密采样；队列空再 replan。
+            arm_wired = False
+            last_logged_exec = -1
 
-            for step_i in range(max_steps):
-                t0 = time.perf_counter()
-                if chunk_idx >= len(chunk_actions):
+            while not _pull_done():
+                step_i = (
+                    hw.servoj_loop.actions_executed if hw.servoj_loop is not None else 0
+                )
+                if action_queue.qsize() == 0:
                     batch = _build_obs_batch(
                         obs_history,
                         cameras=cameras,
@@ -1584,22 +1482,31 @@ def main() -> None:
                     infer_ms = (time.perf_counter() - t_infer) * 1000.0
                     pred_phys = denormalize(
                         pred, stats, prefix="action", mode=norm_mode
-                    ).numpy()
-                    chunk_actions = [
-                        np.asarray(a, dtype=np.float32)
-                        for a in pred_phys[:n_action_steps]
-                    ]
-                    chunk_idx = 0
+                    )
+                    chunk = pred_phys[:n_action_steps].cpu()
+                    action_queue.merge(pred[:n_action_steps].cpu(), chunk, real_delay=0)
+                    if not arm_wired:
+                        _wire_arm_queue(hw, action_queue)
+                        arm_wired = True
+                    _enqueue_merged_actions(
+                        hw, action_queue, fps=fps, replace=True
+                    )
                     print(
-                        f"[INFO] step={step_i} 重新规划 chunk={len(chunk_actions)} "
+                        f"[INFO] step={step_i} 重新规划 chunk={chunk.shape[0]} "
                         f"推理耗时={infer_ms:.1f}ms"
                     )
 
-                action = chunk_actions[chunk_idx]
-                chunk_idx += 1
-                print(f"[INFO] step={step_i}", end="")
-                _send_action(hw, action)
-
+                dense_left = (
+                    hw.servoj_loop.dense_qsize if hw.servoj_loop is not None else 0
+                )
+                t0 = time.perf_counter()
+                if step_i != last_logged_exec:
+                    print(
+                        f"[INFO] obs_loop exec_actions={step_i} "
+                        f"qsize={action_queue.qsize()} dense={dense_left}",
+                        flush=True,
+                    )
+                    last_logged_exec = step_i
                 obs = _prepare_observation(
                     _read_observation(hw, cameras, last_state=obs.state),
                     resize_size=resize_size,

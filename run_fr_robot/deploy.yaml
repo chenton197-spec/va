@@ -45,8 +45,12 @@ z_limit: -69.5
 # Gloria-M MIT 后台刷帧频率（Hz）；与遥操默认 125 对齐
 gripper_rate_hz: 125
 
-# ServoJ 后台指令周期 cmdT（秒）；闭环关节控制按此周期刷目标
-servoj_cmdt: 1.0
+# 关节角最大速度（度/秒）；chunk 衔接与样条限速共用
+max_joint_vel_deg_s: 150
+
+# 相邻稀疏路点单轴最大跳变（度）；超过则丢弃该点（仍推进 ActionQueue）
+# 默认 15 ≈ 150deg/s × 0.1s；设 null 则用 vel×(1/fps)
+max_joint_step_deg: 15
 
 # torch.compile encoder + unet/flow_net；默认关闭（RTC grad 路径需台上验证）
 # CLI --compile 可强制开启
