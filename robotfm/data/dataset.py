@@ -127,6 +127,119 @@ def color_jitter_images(
     return flat.clamp(0.0, 1.0).reshape(*lead, c, h, w)
 
 
+def crop_images_batch(
+    images: torch.Tensor, crop_size: int | None, random: bool
+) -> torch.Tensor:
+    """Batched spatial crop for ``(B, Cams, T, 3, H, W)``.
+
+    Each batch item gets its own crop window; cams/T within an item share it.
+    """
+    if crop_size is None:
+        return images
+    if images.ndim != 6:
+        raise ValueError(f"Expected (B,Cams,T,3,H,W), got shape {tuple(images.shape)}")
+    b, cams, t, c, h, w = images.shape
+    if h == crop_size and w == crop_size:
+        return images
+    if h < crop_size or w < crop_size:
+        raise ValueError(f"Cannot crop {h}x{w} to {crop_size}")
+
+    if random:
+        tops = torch.randint(0, h - crop_size + 1, (b,), device=images.device)
+        lefts = torch.randint(0, w - crop_size + 1, (b,), device=images.device)
+    else:
+        tops = torch.full(
+            (b,), (h - crop_size) // 2, device=images.device, dtype=torch.long
+        )
+        lefts = torch.full(
+            (b,), (w - crop_size) // 2, device=images.device, dtype=torch.long
+        )
+
+    out = images.new_empty(b, cams, t, c, crop_size, crop_size)
+    for i in range(b):
+        top = int(tops[i])
+        left = int(lefts[i])
+        out[i] = images[i, ..., top : top + crop_size, left : left + crop_size]
+    return out
+
+
+def color_jitter_images_batch(
+    images: torch.Tensor,
+    brightness: float = 0.0,
+    contrast: float = 0.0,
+    saturation: float = 0.0,
+    hue: float = 0.0,
+) -> torch.Tensor:
+    """Batched photometric jitter for ``(B, Cams, T, 3, H, W)`` on any device.
+
+    Each batch item samples one factor set shared across its cams/T.
+    """
+    if brightness <= 0 and contrast <= 0 and saturation <= 0 and hue <= 0:
+        return images
+    if images.ndim != 6:
+        raise ValueError(f"Expected (B,Cams,T,3,H,W), got shape {tuple(images.shape)}")
+
+    from torchvision.transforms import functional as TF
+
+    b, cams, t, c, h, w = images.shape
+    out = images
+    # Apply per-sample so factors match CPU EpisodeDataset semantics.
+    pieces: list[torch.Tensor] = []
+    for i in range(b):
+        flat = out[i].reshape(-1, c, h, w)
+        if brightness > 0:
+            factor = float(
+                torch.empty(1, device=images.device).uniform_(
+                    max(0.0, 1.0 - brightness), 1.0 + brightness
+                )
+            )
+            flat = TF.adjust_brightness(flat, factor)
+        if contrast > 0:
+            factor = float(
+                torch.empty(1, device=images.device).uniform_(
+                    max(0.0, 1.0 - contrast), 1.0 + contrast
+                )
+            )
+            flat = TF.adjust_contrast(flat, factor)
+        if saturation > 0:
+            factor = float(
+                torch.empty(1, device=images.device).uniform_(
+                    max(0.0, 1.0 - saturation), 1.0 + saturation
+                )
+            )
+            flat = TF.adjust_saturation(flat, factor)
+        if hue > 0:
+            factor = float(
+                torch.empty(1, device=images.device).uniform_(-hue, hue)
+            )
+            flat = TF.adjust_hue(flat, max(-0.5, min(0.5, factor)))
+        pieces.append(flat.clamp(0.0, 1.0).reshape(cams, t, c, h, w))
+    return torch.stack(pieces, dim=0)
+
+
+def apply_image_augments_batch(
+    images: torch.Tensor,
+    *,
+    crop_size: int | None,
+    random_crop: bool,
+    brightness: float = 0.0,
+    contrast: float = 0.0,
+    saturation: float = 0.0,
+    hue: float = 0.0,
+) -> torch.Tensor:
+    """GPU/CPU batch crop (+ optional color jitter when ``random_crop``)."""
+    images = crop_images_batch(images, crop_size, random=random_crop)
+    if random_crop:
+        images = color_jitter_images_batch(
+            images,
+            brightness=brightness,
+            contrast=contrast,
+            saturation=saturation,
+            hue=hue,
+        )
+    return images
+
+
 class EpisodeDataset(Dataset):
     """帧级索引的数据集，支持多相机与 action chunking。
 
@@ -153,6 +266,9 @@ class EpisodeDataset(Dataset):
         color_jitter_contrast: float = 0.0,
         color_jitter_saturation: float = 0.0,
         color_jitter_hue: float = 0.0,
+        defer_augment: bool = False,
+        uint8_cache: bool = False,
+        uint8_cache_dir: str | Path | None = None,
     ) -> None:
         self.run_dir = Path(run_dir)
         self.meta = load_meta(self.run_dir)
@@ -180,6 +296,10 @@ class EpisodeDataset(Dataset):
         self.color_jitter_contrast = color_jitter_contrast
         self.color_jitter_saturation = color_jitter_saturation
         self.color_jitter_hue = color_jitter_hue
+        self.defer_augment = bool(defer_augment)
+        if uint8_cache:
+            raise ValueError("uint8_cache is only supported for LeRobot image-sequence datasets")
+        _ = uint8_cache_dir
 
         if drop_n_last_frames is None:
             drop_n_last_frames = 0
@@ -261,16 +381,17 @@ class EpisodeDataset(Dataset):
         obs_images = torch.stack(images, dim=0)  # (Cams, T_obs, 3, H, W)
         # 可选：先放大再裁（SlowFast 常用 resize→crop）
         obs_images = resize_images(obs_images, self.resize_size)
-        # 训练时 random_crop=True：随机裁到 crop_size×crop_size
-        obs_images = crop_images(obs_images, self.crop_size, random=self.random_crop)
-        if self.random_crop:
-            obs_images = color_jitter_images(
-                obs_images,
-                brightness=self.color_jitter_brightness,
-                contrast=self.color_jitter_contrast,
-                saturation=self.color_jitter_saturation,
-                hue=self.color_jitter_hue,
-            )
+        if not self.defer_augment:
+            # 训练时 random_crop=True：随机裁到 crop_size×crop_size
+            obs_images = crop_images(obs_images, self.crop_size, random=self.random_crop)
+            if self.random_crop:
+                obs_images = color_jitter_images(
+                    obs_images,
+                    brightness=self.color_jitter_brightness,
+                    contrast=self.color_jitter_contrast,
+                    saturation=self.color_jitter_saturation,
+                    hue=self.color_jitter_hue,
+                )
 
         # ---- 4) 状态取 obs_indices，并用 stats 归一化 ----
         state = self._normalize_state(arrays["state"][obs_indices].astype(np.float32))

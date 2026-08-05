@@ -28,7 +28,7 @@ from robotfm.config import (
     resolve_path,
 )
 from robotfm.collect.loop import get_run_dir
-from robotfm.data.dataset import build_episode_dataset
+from robotfm.data.dataset import apply_image_augments_batch, build_episode_dataset
 from robotfm.data.stats import ensure_stats, resolve_image_stats
 from robotfm.policies.act import ACTConfig, ACTPolicy
 from robotfm.policies.flow_matching import FlowMatchingConfig, FlowMatchingPolicy
@@ -404,6 +404,7 @@ def train_flow_matching(
             )
             logger.log("stats: recomputed with image_mean/image_std for ACT dataset norm")
 
+        gpu_augment = bool(cfg.dataset.gpu_augment)
         dataset = build_episode_dataset(
             run_dir=run_dir,
             n_obs_steps=cfg.dataset.n_obs_steps,
@@ -420,8 +421,19 @@ def train_flow_matching(
             color_jitter_contrast=cfg.dataset.color_jitter_contrast,
             color_jitter_saturation=cfg.dataset.color_jitter_saturation,
             color_jitter_hue=cfg.dataset.color_jitter_hue,
+            defer_augment=gpu_augment,
+            uint8_cache=bool(cfg.dataset.uint8_cache),
+            uint8_cache_dir=cfg.dataset.uint8_cache_dir,
         )
         logger.log(f"dataset: run_dir={run_dir} num_samples={len(dataset)}")
+        if cfg.dataset.uint8_cache:
+            cache = getattr(dataset, "_image_cache", None)
+            cache_dir = getattr(cache, "cache_dir", None)
+            logger.log(f"dataset.uint8_cache: enabled path={cache_dir}")
+        if gpu_augment:
+            logger.log(
+                "dataset.gpu_augment: crop/color_jitter deferred to GPU batch path"
+            )
         loader_kwargs: dict = {
             "batch_size": cfg.train.batch_size,
             "shuffle": True,
@@ -469,6 +481,16 @@ def train_flow_matching(
         while step < cfg.train.steps:
             for batch in loader:
                 batch = {k: v.to(device) for k, v in batch.items()}
+                if gpu_augment:
+                    batch["obs_images"] = apply_image_augments_batch(
+                        batch["obs_images"],
+                        crop_size=cfg.dataset.crop_size,
+                        random_crop=True,
+                        brightness=cfg.dataset.color_jitter_brightness,
+                        contrast=cfg.dataset.color_jitter_contrast,
+                        saturation=cfg.dataset.color_jitter_saturation,
+                        hue=cfg.dataset.color_jitter_hue,
+                    )
                 if cfg.train.cosine_lr:
                     _set_cosine_lr(optim, step, cfg)
                 loss = policy.compute_loss(batch)

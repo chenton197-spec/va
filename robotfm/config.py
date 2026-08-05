@@ -46,6 +46,11 @@ class DatasetConfig:
     # ACT 图像归一化: imagenet=旧硬编码；dataset=LeRobot VISUAL MEAN_STD（stats.json）
     # FM/A2A 忽略此字段（编码器内仍用 ImageNet）
     image_norm_mode: str = "imagenet"
+    # LeRobot: 使用 {run_dir}/cache/uint8_rgb_{H}x{W} 跳过 JPEG decode
+    uint8_cache: bool = False
+    uint8_cache_dir: str | None = None  # 可选显式缓存目录
+    # True: Dataset 不裁剪/不抖动，由训练循环在 GPU 上做（需配合 train）
+    gpu_augment: bool = False
 
 
 @dataclass

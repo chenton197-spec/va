@@ -22,6 +22,7 @@ from torch.utils.data import Dataset
 
 from robotfm.data.dataset import color_jitter_images, crop_images
 from robotfm.data.stats import is_limits_mode, normalize, validate_norm_mode
+from robotfm.data.uint8_cache import Uint8ImageCache, resolve_cache_dir
 from robotfm.types import EpisodeMeta
 
 IMAGE_FEATURE_PREFIX = "observation.images."
@@ -228,6 +229,9 @@ class LeRobotImageSequenceDataset(Dataset):
         color_jitter_contrast: float = 0.0,
         color_jitter_saturation: float = 0.0,
         color_jitter_hue: float = 0.0,
+        defer_augment: bool = False,
+        uint8_cache: bool = False,
+        uint8_cache_dir: str | Path | None = None,
     ) -> None:
         self.run_dir = Path(run_dir)
         self.info = load_lerobot_info(self.run_dir)
@@ -261,6 +265,8 @@ class LeRobotImageSequenceDataset(Dataset):
         self.color_jitter_contrast = color_jitter_contrast
         self.color_jitter_saturation = color_jitter_saturation
         self.color_jitter_hue = color_jitter_hue
+        self.defer_augment = bool(defer_augment)
+        self._image_cache: Uint8ImageCache | None = None
 
         if drop_n_last_frames is None:
             drop_n_last_frames = 0
@@ -324,6 +330,40 @@ class LeRobotImageSequenceDataset(Dataset):
             )
         self.meta.num_episodes = len(self._episode_ids)
 
+        if uint8_cache:
+            cache_path = resolve_cache_dir(
+                self.run_dir,
+                resize_size=self.resize_size,
+                cache_dir=uint8_cache_dir,
+            )
+            if not (cache_path / "meta.json").is_file():
+                raise FileNotFoundError(
+                    f"uint8_cache enabled but missing {cache_path / 'meta.json'}. "
+                    "Build it with: python scripts/build_uint8_image_cache.py "
+                    f"--run-dir {self.run_dir} --resize-size {self.resize_size}"
+                )
+            self._image_cache = Uint8ImageCache(cache_path)
+            if self._image_cache.cameras != list(self.meta.camera_names):
+                raise ValueError(
+                    f"cache cameras {self._image_cache.cameras} != "
+                    f"dataset cameras {list(self.meta.camera_names)}"
+                )
+            if not self._image_cache.matches_episodes(
+                self._episode_ids, self._episode_lengths
+            ):
+                raise ValueError(
+                    f"uint8 cache at {cache_path} does not match episode ids/lengths "
+                    f"under {self.run_dir}; rebuild with --overwrite"
+                )
+            if self.resize_size is not None and (
+                self._image_cache.height != self.resize_size
+                or self._image_cache.width != self.resize_size
+            ):
+                raise ValueError(
+                    f"cache HxW={self._image_cache.height}x{self._image_cache.width} "
+                    f"!= resize_size={self.resize_size}"
+                )
+
     def __len__(self) -> int:
         return len(self.index)
 
@@ -338,6 +378,8 @@ class LeRobotImageSequenceDataset(Dataset):
         return normalize(action, self.stats, prefix="action", mode=self.norm_mode)
 
     def _load_cam_frames(self, ep_local: int, cam: str, frame_indices: list[int]) -> np.ndarray:
+        if self._image_cache is not None:
+            return self._image_cache.load_cam_frames(ep_local, cam, frame_indices)
         paths = self._image_paths[ep_local][cam]
         frames = []
         for fi in frame_indices:
@@ -363,16 +405,17 @@ class LeRobotImageSequenceDataset(Dataset):
             images.append(torch.from_numpy(cam_frames))
 
         obs_images = torch.stack(images, dim=0)
-        # resize already done in uint8 via OpenCV when resize_size is set
-        obs_images = crop_images(obs_images, self.crop_size, random=self.random_crop)
-        if self.random_crop:
-            obs_images = color_jitter_images(
-                obs_images,
-                brightness=self.color_jitter_brightness,
-                contrast=self.color_jitter_contrast,
-                saturation=self.color_jitter_saturation,
-                hue=self.color_jitter_hue,
-            )
+        if not self.defer_augment:
+            # resize already done in uint8 via OpenCV / cache when resize_size is set
+            obs_images = crop_images(obs_images, self.crop_size, random=self.random_crop)
+            if self.random_crop:
+                obs_images = color_jitter_images(
+                    obs_images,
+                    brightness=self.color_jitter_brightness,
+                    contrast=self.color_jitter_contrast,
+                    saturation=self.color_jitter_saturation,
+                    hue=self.color_jitter_hue,
+                )
 
         state = self._normalize_state(state_all[obs_indices].astype(np.float32))
 
