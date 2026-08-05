@@ -2,6 +2,7 @@
 
 支持模式（与 Diffusion Policy ``LinearNormalizer`` 对齐）:
 - ``gaussian``: ``(x - mean) / std``
+- ``gaussian_2std``: ``(x - mean) / (2 * std)``（约将 ±2σ 映到 ±1）
 - ``limits``: 线性映射到 ``[-1, 1]``（按 min/max）
 - ``limits_01``: 线性映射到 ``[0, 1]``（按 min/max）
 
@@ -23,11 +24,12 @@ import torch
 
 from robotfm.data.schema import image_key, load_episode, load_meta, stats_path, validate_episode_arrays
 
-NormMode = Literal["gaussian", "limits", "limits_01"]
+NormMode = Literal["gaussian", "gaussian_2std", "limits", "limits_01"]
 ImageNormMode = Literal["imagenet", "dataset"]
-NORM_MODES: tuple[str, ...] = ("gaussian", "limits", "limits_01")
+NORM_MODES: tuple[str, ...] = ("gaussian", "gaussian_2std", "limits", "limits_01")
 IMAGE_NORM_MODES: tuple[str, ...] = ("imagenet", "dataset")
 LIMITS_MODES: tuple[str, ...] = ("limits", "limits_01")
+GAUSSIAN_MODES: tuple[str, ...] = ("gaussian", "gaussian_2std")
 _RANGE_EPS = 1e-4
 _IMAGENET_MEAN = np.asarray([0.485, 0.456, 0.406], dtype=np.float32)
 _IMAGENET_STD = np.asarray([0.229, 0.224, 0.225], dtype=np.float32)
@@ -35,6 +37,15 @@ _IMAGENET_STD = np.asarray([0.229, 0.224, 0.225], dtype=np.float32)
 
 def is_limits_mode(mode: str) -> bool:
     return mode in LIMITS_MODES
+
+
+def is_gaussian_mode(mode: str) -> bool:
+    return mode in GAUSSIAN_MODES
+
+
+def _gaussian_std_scale(mode: NormMode) -> float:
+    """``gaussian_2std`` 用 2×std 作除数，使约 ±2σ 落在 ±1。"""
+    return 2.0 if mode == "gaussian_2std" else 1.0
 
 
 def validate_image_norm_mode(mode: str) -> ImageNormMode:
@@ -266,7 +277,7 @@ def ensure_stats(
     path = stats_path(run_dir)
     if path.exists():
         stats = load_stats(run_dir)
-        need_limits = mode != "gaussian" and not _has_limits_keys(stats)
+        need_limits = is_limits_mode(mode) and not _has_limits_keys(stats)
         need_image = require_image_stats and not _has_image_keys(stats)
         if not need_limits and not need_image:
             return stats
@@ -345,8 +356,9 @@ def normalize(
 ) -> np.ndarray:
     """按 ``mode`` 归一化 ``prefix``（``state`` / ``action``）数据。"""
     mode = validate_norm_mode(mode)
-    if mode == "gaussian":
-        return (x - stats[f"{prefix}_mean"]) / stats[f"{prefix}_std"]
+    if is_gaussian_mode(mode):
+        scale = _gaussian_std_scale(mode)
+        return (x - stats[f"{prefix}_mean"]) / (scale * stats[f"{prefix}_std"])
 
     lo = stats[f"{prefix}_min"]
     hi = stats[f"{prefix}_max"]
@@ -384,8 +396,9 @@ def _denormalize_numpy(
     prefix: str,
     mode: NormMode,
 ) -> np.ndarray:
-    if mode == "gaussian":
-        return x * stats[f"{prefix}_std"] + stats[f"{prefix}_mean"]
+    if is_gaussian_mode(mode):
+        scale = _gaussian_std_scale(mode)
+        return x * (scale * stats[f"{prefix}_std"]) + stats[f"{prefix}_mean"]
 
     lo = stats[f"{prefix}_min"]
     hi = stats[f"{prefix}_max"]
@@ -412,8 +425,9 @@ def _denormalize_torch(
     def _t(key: str) -> torch.Tensor:
         return torch.as_tensor(stats[key], dtype=x.dtype, device=x.device)
 
-    if mode == "gaussian":
-        return x * _t(f"{prefix}_std") + _t(f"{prefix}_mean")
+    if is_gaussian_mode(mode):
+        scale = _gaussian_std_scale(mode)
+        return x * (scale * _t(f"{prefix}_std")) + _t(f"{prefix}_mean")
 
     lo = _t(f"{prefix}_min")
     hi = _t(f"{prefix}_max")

@@ -1,14 +1,16 @@
-# 离线 BC：A2A+noise + limits([-1,1])，无 OT
-# 硬件：RTX 5060 8GB（桌面约占 ~0.9GB，训练可用 ~7GB）+ i5-13500 (14C/20T) + 31GB RAM
+# 离线 BC：A2A+noise + gaussian_2std（(x-mean)/(2*std)），无 OT
+# 硬件：RTX 5060 Ti 16GB（桌面约占 ~0.6GB）+ i5-12400F (6C/12T) + 15GB RAM
 # 数据：shine_shoes_fr3_s256_prefix_speedup（JPEG 已预缩到 256×256，训练时再 crop 到 224）
-# N=105232（drop_n_last_frames=0，与 horizon 无关）→ floor(N/16)=6577 steps/epoch → 20 epoch = 131540
+# N=105232（drop_n_last_frames=0，与 horizon 无关）
+# → floor(N/48)=2192 steps/epoch → 40 epoch = 87680
 # 加速：uint8 盘缓存跳过 JPEG + GPU 上 crop/color_jitter（先 build_uint8_image_cache.py）
+# 吞吐：VRAM 充裕；15GB RAM+swap 会被 DataLoader 打满 → bs=48 + workers=1
 # chunk≈0.8s @30Hz；history_noise 略加强以利于状态扰动下纠错
 cameras: [hand, head]
 state_dim: 7
 action_dim: 7
-data_root: /home/casbot/ct/data
-output_dir: outputs/a2a_noise_shine_shoes_limits_s256_prefix_speedup
+data_root: .
+output_dir: outputs/a2a_noise_shine_shoes_gaussian_2std_s256_prefix_speedup
 
 dataset:
   n_obs_steps: 8
@@ -20,7 +22,8 @@ dataset:
   color_jitter_contrast: 0.2
   color_jitter_saturation: 0.1
   color_jitter_hue: 0.02
-  norm_mode: limits
+  # gaussian | gaussian_2std | limits([-1,1]) | limits_01([0,1])
+  norm_mode: gaussian_2std
   uint8_cache: true
   gpu_augment: true
 
@@ -52,17 +55,17 @@ policy:
     debug: false
 
 train:
-  # 8GB 显存 + 桌面占用：bs=16 已在同卡 horizon=32 跑通；勿盲目加到 20+
-  # uint8 cache 后 worker 主要做 memmap→float；4 够用，省 RAM 给未裁剪 256 图传输
-  batch_size: 16
-  steps: 131540
-  lr: 0.0003
+  # 16GB VRAM 充裕；15GB RAM 是瓶颈 → bs=48 + workers=1（workers≥2 易打满 swap）
+  # 相对旧 bs=16 略抬 lr；每 2 epoch 存盘
+  batch_size: 48
+  steps: 87680
+  lr: 0.0005
   weight_decay: 0.000001
   log_freq: 50
-  save_freq: 6600
+  save_freq: 4384
   device: cuda
-  num_workers: 4
+  num_workers: 1
   cosine_lr: true
-  warmup_steps: 1000
+  warmup_steps: 500
   encoder_lr_scale: 0.1
   max_grad_norm: 1.0

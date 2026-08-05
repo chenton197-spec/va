@@ -29,7 +29,7 @@ from robotfm.config import (
 )
 from robotfm.collect.loop import get_run_dir
 from robotfm.data.dataset import apply_image_augments_batch, build_episode_dataset
-from robotfm.data.stats import ensure_stats, resolve_image_stats
+from robotfm.data.stats import ensure_stats, is_limits_mode, resolve_image_stats
 from robotfm.policies.act import ACTConfig, ACTPolicy
 from robotfm.policies.flow_matching import FlowMatchingConfig, FlowMatchingPolicy
 from robotfm.policies.vita import VITAConfig, VITAPolicy
@@ -389,7 +389,7 @@ def train_flow_matching(
                 )
 
         # limits / limits_01 需要 min/max；旧 stats/ckpt 可能没有，自动补齐
-        if cfg.dataset.norm_mode in ("limits", "limits_01"):
+        if is_limits_mode(cfg.dataset.norm_mode):
             needed = ("state_min", "state_max", "action_min", "action_max")
             if any(k not in stats for k in needed):
                 stats = ensure_stats(run_dir, cfg.dataset.norm_mode)

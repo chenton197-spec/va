@@ -28,5 +28,6 @@ checkpoints/
 /shine_shoes_fr3_roi_masked/
 /shine_shoes_fr3_s256/
 /shine_shoes_fr3_s256_ep0_150/
+/shine_shoes_fr3_s256_prefix_speedup/
 /shine_shoes_fr3_s256.tar.zst
 *.tar.zst

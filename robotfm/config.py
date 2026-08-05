@@ -41,7 +41,8 @@ class DatasetConfig:
     color_jitter_contrast: float = 0.0
     color_jitter_saturation: float = 0.0
     color_jitter_hue: float = 0.0
-    # state/action 归一化: gaussian=(x-mean)/std；limits→[-1,1]；limits_01→[0,1]
+    # state/action 归一化: gaussian=(x-mean)/std；gaussian_2std=(x-mean)/(2*std)；
+    # limits→[-1,1]；limits_01→[0,1]
     norm_mode: str = "gaussian"
     # ACT 图像归一化: imagenet=旧硬编码；dataset=LeRobot VISUAL MEAN_STD（stats.json）
     # FM/A2A 忽略此字段（编码器内仍用 ImageNet）
