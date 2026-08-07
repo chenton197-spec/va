@@ -1,10 +1,8 @@
 """FAIRINO FR3 关节空间 ServoJ 控制。
 
-在路点 ``enqueue``（写入 ActionQueue 的同时）完成：
-  Z 校验 → 相邻点五次插值（名义 1/fps，超速拉长）→ 一阶低通，
-并生成 ``cmdT=8ms`` 密采样指令缓冲。
-
-ServoJ 后台只回放密采样，不再在取队列时做插值。
+调用方线程 ``enqueue`` 只提交稀疏路点；ServoJ 后台线程内完成：
+  GetForwardKin / Z 校验 → 相邻点五次插值 → 一阶低通 → 按 ``cmdT=8ms``
+  回放 ``ServoJ``。所有 robot XML-RPC 仅在该线程调用，避免并发。
 """
 
 from __future__ import annotations
@@ -26,6 +24,9 @@ _N_JOINTS = 6
 
 SparseAdvanceCallback = Callable[[], None]
 GripperCallback = Callable[[float], None]
+
+# pending plan: (waypoints, action_period_s, replace, q0, generation)
+_PendingPlan = tuple[np.ndarray, float, bool, np.ndarray, int]
 
 
 def forward_kin_desc_pos(robot: Any, joints_deg: list[float]) -> list[float] | None:
@@ -79,14 +80,17 @@ def densify_waypoints(
     z_limit: float,
     max_joint_step_deg: float | None = None,
     dt_s: float = SERVOJ_CMDT_S,
+    on_before_rpc: Callable[[], None] | None = None,
 ) -> list[tuple[list[float], float, bool]]:
     """对稀疏路点做跳变门控 + Z 校验 + 五次插值 + 低通，返回密采样。
 
-    相对上一**接受**路点，若 ``max|Δq_i| > max_joint_step_deg`` 则丢弃该点
-    （保持姿态，仍打 ``sparse_boundary`` 以推进 ActionQueue）。
+    相对上一**接受**路点，若 ``max|Δq_i| > max_joint_step_deg`` 则按比例截断
+    ``Δq``，使单轴最大跳变恰好为上限（方向不变，继续插值执行）。
     ``max_joint_step_deg is None`` 时默认 ``max_joint_vel_deg_s * action_period_s``。
 
     每个元素 ``(joints_deg[6], gripper, sparse_boundary)``。
+    ``robot`` 非空时会调用 ``GetForwardKin``，调用方须保证不与其它 XML-RPC 并发。
+    ``on_before_rpc`` 在每次 FK 前调用（可用于 ServoJ 保活）。
     """
     if action_period_s <= 0.0:
         raise ValueError("action_period_s 必须 > 0")
@@ -123,21 +127,23 @@ def densify_waypoints(
         if max_abs > step_limit:
             print(
                 f"[WARN] 路点跳变 max|Δq|={max_abs:.3f}° > "
-                f"max_joint_step_deg={step_limit:.3f}°，丢弃该点",
+                f"max_joint_step_deg={step_limit:.3f}°，按比例截断",
                 flush=True,
             )
-            out.append((q_cursor.tolist(), grip, True))
-            continue
+            q1 = q_cursor + dq * (step_limit / max_abs)
+            max_abs = step_limit
 
         if robot is not None:
+            if on_before_rpc is not None:
+                on_before_rpc()
             try:
                 desc_pos = forward_kin_desc_pos(robot, q1.tolist())
             except Exception as exc:
-                print(f"[WARN] enqueue GetForwardKin 异常，跳过路点: {exc}", flush=True)
+                print(f"[WARN] GetForwardKin 异常，跳过路点: {exc}", flush=True)
                 out.append((q_cursor.tolist(), grip, True))
                 continue
             if desc_pos is None:
-                print("[WARN] enqueue GetForwardKin 失败，跳过路点", flush=True)
+                print("[WARN] GetForwardKin 失败，跳过路点", flush=True)
                 out.append((q_cursor.tolist(), grip, True))
                 continue
             print(f"  desc_pos={[round(v, 3) for v in desc_pos]}", flush=True)
@@ -176,7 +182,7 @@ def densify_waypoints(
 
 
 class BackgroundServoJLoop:
-    """后台 ``ServoJ``：回放 enqueue 时已插值/滤波好的密采样。"""
+    """后台 ``ServoJ``：在本线程做 Z 校验/密采样，再按 ``cmdT`` 回放。"""
 
     _AXIS_POS = [0.0, 0.0, 0.0, 0.0]
 
@@ -206,8 +212,11 @@ class BackgroundServoJLoop:
 
         self._lock = threading.Lock()
         self._cmd_q: deque[tuple[list[float], float, bool]] = deque()
+        self._pending_plans: deque[_PendingPlan] = deque()
+        self._plan_gen = 0
+        # 已提交稀疏链的末端关节（用于 replace=False 衔接）
+        self._submit_tail: np.ndarray | None = None
         self._q_cmd: list[float] | None = None
-        self._ingest_req: tuple[np.ndarray, float, bool] | None = None
         self._on_sparse_advance: SparseAdvanceCallback | None = None
         self._on_gripper: GripperCallback | None = None
         self._actions_executed = 0
@@ -217,6 +226,7 @@ class BackgroundServoJLoop:
         self._servo_started = False
         self._warn_every = max(1, int(round(1.0 / self._cmdt_s)))
         self._fail_streak = 0
+        self._last_keepalive_t = 0.0
 
     @property
     def cmdt_s(self) -> float:
@@ -257,12 +267,20 @@ class BackgroundServoJLoop:
         if len(values) != _N_JOINTS:
             raise ValueError(f"ServoJ 目标必须是 {_N_JOINTS} 轴，得到 {len(values)}")
         if check_z:
+            if self._thread is not None and self._thread.is_alive():
+                raise RuntimeError(
+                    "set_joints_deg(check_z=True) 不能在 ServoJ 运行时调用"
+                    "（GetForwardKin 仅限 ServoJ 线程）"
+                )
             desc = forward_kin_desc_pos(self._robot, values)
             if desc is None or desc[2] < self._z_limit:
                 raise RuntimeError(f"初始关节 Z 校验失败: {desc}")
         with self._lock:
             self._q_cmd = values
             self._cmd_q.clear()
+            self._pending_plans.clear()
+            self._plan_gen += 1
+            self._submit_tail = np.asarray(values, dtype=np.float64).copy()
         self._wake.set()
 
     def get_joints_deg(self) -> list[float] | None:
@@ -276,10 +294,9 @@ class BackgroundServoJLoop:
         action_period_s: float,
         replace: bool = True,
     ) -> None:
-        """在入队时刻请求：Z 校验 + 插值 + 滤波，写入密采样缓冲。
+        """调用方线程：只提交稀疏路点；Z 校验/密采样在 ServoJ 线程执行。
 
-        实际规划在 ServoJ 线程执行，避免与 ``ServoJ`` RPC 并发。
-        ``replace=True``（RTC）：丢掉未播放密采样，从当前关节重规划。
+        ``replace=True``（RTC）：丢掉未播放密采样与未处理计划，从当前关节重规划。
         ``replace=False``（非 RTC append）：接在缓冲末尾继续规划。
         """
         arr = np.asarray(actions, dtype=np.float64)
@@ -287,8 +304,37 @@ class BackgroundServoJLoop:
             arr = arr.reshape(1, -1)
         if arr.size == 0:
             return
+        arr = arr.copy()
+
         with self._lock:
-            self._ingest_req = (arr.copy(), float(action_period_s), bool(replace))
+            if replace:
+                q0 = (
+                    np.asarray(self._q_cmd, dtype=np.float64)
+                    if self._q_cmd is not None
+                    else arr[0, :_N_JOINTS].copy()
+                )
+                self._cmd_q.clear()
+                self._pending_plans.clear()
+                self._plan_gen += 1
+            elif self._submit_tail is not None:
+                q0 = np.asarray(self._submit_tail, dtype=np.float64)
+            elif self._cmd_q:
+                q0 = np.asarray(self._cmd_q[-1][0], dtype=np.float64)
+            elif self._q_cmd is not None:
+                q0 = np.asarray(self._q_cmd, dtype=np.float64)
+            else:
+                q0 = arr[0, :_N_JOINTS].copy()
+            gen = self._plan_gen
+            self._submit_tail = arr[-1, :_N_JOINTS].copy()
+            self._pending_plans.append(
+                (arr, float(action_period_s), bool(replace), q0.copy(), gen)
+            )
+
+        print(
+            f"[INFO] enqueue 提交稀疏路点: sparse={arr.shape[0]} "
+            f"replace={replace}（Z/密采样在 ServoJ 线程）",
+            flush=True,
+        )
         self._wake.set()
 
     def start(self, initial_joints_deg: list[float] | np.ndarray | None = None) -> None:
@@ -336,43 +382,84 @@ class BackgroundServoJLoop:
                 print(f"[WARN] ServoMoveEnd 异常: {exc}")
             self._servo_started = False
 
-    def _process_ingest(self) -> None:
+    def _pop_pending_plan(self) -> _PendingPlan | None:
         with self._lock:
-            req = self._ingest_req
-            self._ingest_req = None
-            if req is None:
-                return
-            actions, period, replace = req
-            q0 = (
-                np.asarray(self._q_cmd, dtype=np.float64)
-                if self._q_cmd is not None
-                else actions[0, :_N_JOINTS].copy()
-            )
-            if not replace and self._cmd_q:
-                # 从缓冲里最后一个密采样终点接着规划。
-                q0 = np.asarray(self._cmd_q[-1][0], dtype=np.float64)
+            if not self._pending_plans:
+                return None
+            return self._pending_plans.popleft()
 
-        samples = densify_waypoints(
-            actions,
-            q0=q0,
-            action_period_s=period,
-            max_joint_vel_deg_s=self._max_vel,
-            filter_tau_s=self._tau,
-            robot=self._robot,
-            z_limit=self._z_limit,
-            max_joint_step_deg=self._max_step,
-            dt_s=self._cmdt_s,
-        )
+    def _commit_dense_samples(
+        self,
+        samples: list[tuple[list[float], float, bool]],
+        *,
+        gen: int,
+        sparse_n: int,
+    ) -> None:
         with self._lock:
-            if replace:
-                self._cmd_q.clear()
+            if gen != self._plan_gen:
+                print(
+                    f"[INFO] 丢弃过期密采样: sparse≈{sparse_n} dense={len(samples)} "
+                    f"(gen={gen} now={self._plan_gen})",
+                    flush=True,
+                )
+                return
             self._cmd_q.extend(samples)
             n_sparse = int(sum(1 for *_, b in samples if b))
         print(
-            f"[INFO] enqueue 密采样: sparse≈{actions.shape[0]} → dense={len(samples)} "
-            f"(boundaries={n_sparse}) replace={replace}",
+            f"[INFO] ServoJ 密采样就绪: sparse≈{sparse_n} → dense={len(samples)} "
+            f"(boundaries={n_sparse})",
             flush=True,
         )
+
+    def _servo_hold(self) -> None:
+        """在 ServoJ 线程刷一次当前目标，FK 长时间阻塞时保活。"""
+        with self._lock:
+            joints = None if self._q_cmd is None else list(self._q_cmd)
+        if joints is None:
+            return
+        try:
+            self._robot.ServoJ(
+                joint_pos=joints,
+                axisPos=self._AXIS_POS,
+                cmdT=self._cmdt_s,
+            )
+            self._last_keepalive_t = time.perf_counter()
+        except Exception:
+            pass
+
+    def _keepalive_before_fk(self) -> None:
+        now = time.perf_counter()
+        if now - self._last_keepalive_t >= self._cmdt_s:
+            self._servo_hold()
+
+    def _process_pending_plans(self) -> None:
+        """在 ServoJ 线程：对排队稀疏路点做 GetForwardKin / 密采样。"""
+        while not self._stop.is_set():
+            plan = self._pop_pending_plan()
+            if plan is None:
+                return
+            arr, action_period_s, _replace, q0, gen = plan
+            with self._lock:
+                if gen != self._plan_gen:
+                    print(
+                        f"[INFO] 跳过过期稀疏计划: sparse={arr.shape[0]} "
+                        f"(gen={gen} now={self._plan_gen})",
+                        flush=True,
+                    )
+                    continue
+            samples = densify_waypoints(
+                arr,
+                q0=q0,
+                action_period_s=action_period_s,
+                max_joint_vel_deg_s=self._max_vel,
+                filter_tau_s=self._tau,
+                robot=self._robot,
+                z_limit=self._z_limit,
+                max_joint_step_deg=self._max_step,
+                dt_s=self._cmdt_s,
+                on_before_rpc=self._keepalive_before_fk,
+            )
+            self._commit_dense_samples(samples, gen=gen, sparse_n=int(arr.shape[0]))
 
     def _pop_dense(self) -> tuple[list[float], float, bool] | None:
         with self._lock:
@@ -382,8 +469,10 @@ class BackgroundServoJLoop:
 
     def _run(self) -> None:
         next_servoj_t = time.perf_counter()
+        self._last_keepalive_t = time.perf_counter()
         while not self._stop.is_set():
-            self._process_ingest()
+            # 先消化稀疏计划（含 GetForwardKin），再按节拍下发 ServoJ。
+            self._process_pending_plans()
 
             now = time.perf_counter()
             if now >= next_servoj_t:
@@ -405,6 +494,7 @@ class BackgroundServoJLoop:
                             axisPos=self._AXIS_POS,
                             cmdT=self._cmdt_s,
                         )
+                        self._last_keepalive_t = time.perf_counter()
                     except Exception as exc:
                         ret = -1
                         self._fail_streak += 1
@@ -433,17 +523,7 @@ class BackgroundServoJLoop:
                                 print(f"[WARN] sparse advance 回调异常: {exc}")
                 else:
                     # 缓冲空：保持上一目标继续刷，避免 Servo 失联。
-                    with self._lock:
-                        joints = None if self._q_cmd is None else list(self._q_cmd)
-                    if joints is not None:
-                        try:
-                            self._robot.ServoJ(
-                                joint_pos=joints,
-                                axisPos=self._AXIS_POS,
-                                cmdT=self._cmdt_s,
-                            )
-                        except Exception:
-                            pass
+                    self._servo_hold()
 
                 next_servoj_t = now + self._cmdt_s
 
@@ -451,10 +531,11 @@ class BackgroundServoJLoop:
                 break
             wait_s = max(0.0, next_servoj_t - time.perf_counter())
             self._wake.clear()
-            with self._lock:
-                has_ingest = self._ingest_req is not None
-            if has_ingest:
-                continue
             if self._stop.is_set():
                 break
+            # 有新计划时立刻醒来做 FK/密采样，不必等满 cmdT。
+            with self._lock:
+                has_pending = bool(self._pending_plans)
+            if has_pending:
+                continue
             self._wake.wait(timeout=wait_s)

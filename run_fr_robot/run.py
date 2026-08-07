@@ -11,11 +11,11 @@ norm_mode、resize/crop、n_obs_steps、n_action_steps、fps 等）。
 
   - 启动时 MoveJ 到 deploy.yaml 中的 start_pose
   - 闭环用独立后台线程 ServoJ 下发关节角（度，固定 ``cmdT=8ms``）
-  - 写入 ActionQueue 的同时做 Z 校验、五次插值与滤波，生成 8ms 密采样；
-    ServoJ 只回放；主循环负责观测 / RTC 推理
+  - 主循环把稀疏路点提交给 ServoJ 线程；该线程内做 Z 校验、五次插值
+    与滤波，生成 8ms 密采样并回放；主循环负责观测 / RTC 推理
   - 关节目标经样条插值 + 低通滤波，并用 ``max_joint_vel_deg_s`` 限速
     （默认 150 deg/s），避免 action chunk 衔接跳变
-  - GetForwardKin / Z 限位校验同在 ServoJ 线程，避免 XML-RPC 并发
+  - GetForwardKin / Z 限位校验与 ServoJ 同在后台线程，避免 XML-RPC 并发
   - 夹爪目标写入后台循环，按 ``gripper_rate_hz``（默认 125）连续
     ``send_normalized``（MIT 不能只偶发一帧）
 
@@ -41,10 +41,11 @@ from __future__ import annotations
 import argparse
 import importlib.util
 import queue
+import signal
 import sys
 import threading
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any
 
@@ -1009,7 +1010,7 @@ def _enqueue_merged_actions(
     fps: int,
     replace: bool,
 ) -> None:
-    """merge 之后立刻把剩余稀疏路点送去 Z/插值/滤波密采样。"""
+    """merge 之后立刻把剩余稀疏路点提交给 ServoJ 线程做 Z/密采样。"""
     if hw.servoj_loop is None:
         raise RuntimeError("ServoJ 后台循环未启动")
     leftover = action_queue.get_processed_left_over()
@@ -1023,43 +1024,154 @@ def _enqueue_merged_actions(
     )
 
 
-def _shutdown(hw: HardwareBundle) -> None:
-    """安全退出：停 ServoJ 后台、停运动、停夹爪后台、失能夹爪、停相机。"""
-    if hw.servoj_loop is not None:
-        try:
-            hw.servoj_loop.stop()
-            print("[INFO] ServoJ 后台循环已停止")
-        except Exception as exc:
-            print(f"[WARN] 停止 ServoJ 后台时出错: {exc}")
-        hw.servoj_loop = None
-    if hw.robot is not None:
-        try:
-            hw.robot.StopMotion()
-            print("[INFO] FR3 StopMotion")
-        except Exception as exc:
-            print(f"[WARN] 停止 FR3 时出错: {exc}")
+def _set_gripper_opening_cmd(hw: HardwareBundle, opening: float) -> None:
+    """下发夹爪开合目标（优先走后台循环）。"""
+    value = float(np.clip(opening, 0.0, 1.0))
     if hw.gripper_loop is not None:
+        hw.gripper_loop.set_opening(value)
+        return
+    if hw.gripper is None:
+        return
+    try:
+        ok = bool(hw.gripper.send_normalized(value))
+        if not ok:
+            print("[WARN] Gloria-M send_normalized 失败", flush=True)
+    except Exception as exc:
+        print(f"[WARN] Gloria-M send_normalized 异常: {exc}", flush=True)
+
+
+def _open_gripper_for_shutdown(
+    hw: HardwareBundle,
+    *,
+    target: float = 0.92,
+    timeout_s: float = 2.5,
+    settle_opening: float = 0.80,
+    ramp_s: float = 1.0,
+    soft_max_torque_nm: float = 0.25,
+    soft_stiffness_nm_per_rad: float = 2.0,
+) -> None:
+    """停止前柔和张开夹爪，避免满扭矩冲开限位异响。
+
+    - 目标斜坡到 soft target（默认 0.92，不顶死 1.0）
+    - 临时降低 max_torque / stiffness，张开方向不再打满 0.75 Nm
+    - 到位后把目标收到当前开合，卸掉弹簧力矩再失能
+    """
+    if hw.gripper is None:
+        return
+    target = float(np.clip(target, 0.0, 1.0))
+    start = float(_read_gripper(hw.gripper, fallback=0.0))
+    if start >= settle_opening:
+        print(f"[INFO] Gloria-M 已接近张开，跳过: opening={start:.4f}", flush=True)
+        _set_gripper_opening_cmd(hw, start)
+        time.sleep(0.05)
+        return
+
+    # GloriaMGripperConfig 是 frozen dataclass，只能 replace 后回写 gripper.config。
+    cfg = getattr(hw.gripper, "config", None)
+    old_cfg = cfg
+    soft_applied = False
+    if cfg is not None:
         try:
-            hw.gripper_loop.stop()
-            print("[INFO] Gloria-M 后台循环已停止")
+            hw.gripper.config = replace(
+                cfg,
+                max_torque_nm=min(
+                    float(cfg.max_torque_nm), float(soft_max_torque_nm)
+                ),
+                stiffness_nm_per_rad=min(
+                    float(cfg.stiffness_nm_per_rad),
+                    float(soft_stiffness_nm_per_rad),
+                ),
+            )
+            soft_applied = True
         except Exception as exc:
-            print(f"[WARN] 停止夹爪后台时出错: {exc}")
-        hw.gripper_loop = None
-    if hw.gripper is not None:
+            print(f"[WARN] Gloria-M 软张开参数设置失败: {exc}", flush=True)
+
+    print(
+        f"[INFO] Gloria-M 停止前柔和张开: {start:.3f} -> {target:.2f} "
+        f"(ramp={ramp_s:.1f}s, τ≤{soft_max_torque_nm:.2f}Nm)",
+        flush=True,
+    )
+    t0 = time.perf_counter()
+    deadline = t0 + float(timeout_s)
+    opened = False
+    try:
+        while time.perf_counter() < deadline:
+            elapsed = time.perf_counter() - t0
+            alpha = 1.0 if ramp_s <= 0.0 else min(1.0, elapsed / float(ramp_s))
+            cmd = start + alpha * (target - start)
+            _set_gripper_opening_cmd(hw, cmd)
+            opening = float(_read_gripper(hw.gripper, fallback=start))
+            if opening >= settle_opening:
+                # 目标收到当前位置，卸弹簧力，避免顶开限位异响。
+                _set_gripper_opening_cmd(hw, opening)
+                time.sleep(0.08)
+                print(f"[INFO] Gloria-M 已张开: opening={opening:.4f}", flush=True)
+                opened = True
+                break
+            time.sleep(0.02)
+        if not opened:
+            opening = float(_read_gripper(hw.gripper, fallback=float("nan")))
+            if np.isfinite(opening):
+                _set_gripper_opening_cmd(hw, opening)
+            print(f"[WARN] Gloria-M 张开超时 (opening={opening})", flush=True)
+    finally:
+        if soft_applied and old_cfg is not None:
+            try:
+                hw.gripper.config = old_cfg
+            except Exception:
+                pass
+
+
+def _shutdown(hw: HardwareBundle) -> None:
+    """安全退出：停 ServoJ、停运动、先张开夹爪再失能/断开、停相机。
+
+    关闭期间忽略 SIGINT，避免二次 Ctrl+C 打断夹爪张开。
+    """
+    prev_sigint = signal.getsignal(signal.SIGINT)
+    signal.signal(signal.SIGINT, signal.SIG_IGN)
+    try:
+        print("[INFO] 安全退出中（忽略 Ctrl+C，请等待夹爪张开）", flush=True)
+        if hw.servoj_loop is not None:
+            try:
+                hw.servoj_loop.stop()
+                print("[INFO] ServoJ 后台循环已停止")
+            except Exception as exc:
+                print(f"[WARN] 停止 ServoJ 后台时出错: {exc}")
+            hw.servoj_loop = None
+        if hw.robot is not None:
+            try:
+                hw.robot.StopMotion()
+                print("[INFO] FR3 StopMotion")
+            except Exception as exc:
+                print(f"[WARN] 停止 FR3 时出错: {exc}")
         try:
-            hw.gripper.disable()
-        except Exception:
-            pass
-        try:
-            hw.gripper.disconnect()
+            _open_gripper_for_shutdown(hw)
         except Exception as exc:
-            print(f"[WARN] 断开夹爪时出错: {exc}")
-    if hw.camera_manager is not None:
-        try:
-            hw.camera_manager.stop()
-            print("[INFO] Orbbec 已停止")
-        except Exception as exc:
-            print(f"[WARN] 停止相机时出错: {exc}")
+            print(f"[WARN] 停止前张开夹爪时出错: {exc}")
+        if hw.gripper_loop is not None:
+            try:
+                hw.gripper_loop.stop()
+                print("[INFO] Gloria-M 后台循环已停止")
+            except Exception as exc:
+                print(f"[WARN] 停止夹爪后台时出错: {exc}")
+            hw.gripper_loop = None
+        if hw.gripper is not None:
+            try:
+                hw.gripper.disable()
+            except Exception:
+                pass
+            try:
+                hw.gripper.disconnect()
+            except Exception as exc:
+                print(f"[WARN] 断开夹爪时出错: {exc}")
+        if hw.camera_manager is not None:
+            try:
+                hw.camera_manager.stop()
+                print("[INFO] Orbbec 已停止")
+            except Exception as exc:
+                print(f"[WARN] 停止相机时出错: {exc}")
+    finally:
+        signal.signal(signal.SIGINT, prev_sigint)
 
 
 # ---------------------------------------------------------------------------
@@ -1520,10 +1632,16 @@ def main() -> None:
     except KeyboardInterrupt:
         print("\n[INFO] 用户中断")
     finally:
-        if infer_worker is not None:
-            infer_worker.shutdown()
-            infer_worker = None
-        _shutdown(hw)
+        # 二次 Ctrl+C 不应打断安全退出（尤其是夹爪张开）。
+        prev_sigint = signal.getsignal(signal.SIGINT)
+        signal.signal(signal.SIGINT, signal.SIG_IGN)
+        try:
+            if infer_worker is not None:
+                infer_worker.shutdown()
+                infer_worker = None
+            _shutdown(hw)
+        finally:
+            signal.signal(signal.SIGINT, prev_sigint)
 
 
 if __name__ == "__main__":

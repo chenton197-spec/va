@@ -260,5 +260,6 @@ def backup_train_config(
     if source_config_path is None:
         return
     src = Path(source_config_path)
-    if src.is_file():
-        shutil.copy2(src, output_dir / "config_source.yaml")
+    dst = output_dir / "config_source.yaml"
+    if src.is_file() and src.resolve() != dst.resolve():
+        shutil.copy2(src, dst)
