@@ -118,7 +118,10 @@ def _build_obs_batch(
 
 def _serial_forward(self: MultiCameraEncoder, obs_images, obs_state):
     b, cams, t, _, _, _ = obs_images.shape
-    cam_feats = [self.image_encoder(obs_images[:, c]) for c in range(cams)]
+    if getattr(self, "share_image_encoder", True):
+        cam_feats = [self.image_encoder(obs_images[:, c]) for c in range(cams)]
+    else:
+        cam_feats = [self.image_encoders[c](obs_images[:, c]) for c in range(cams)]
     img_feat = torch.cat(cam_feats, dim=-1)
     state = obs_state.reshape(b * t, -1)
     state_feat = self.state_encoder(state).reshape(b, -1)

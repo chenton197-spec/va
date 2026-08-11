@@ -180,6 +180,9 @@ class MultiCameraEncoder(nn.Module):
     """多相机 + 多步状态编码器。
 
     每个相机将 T 帧堆叠（可选帧差）经 ResNet18 编码一次，再与状态特征融合。
+
+    ``share_image_encoder=True``（默认）：所有相机共用一份 ResNet 权重。
+    ``share_image_encoder=False``：每相机独立一份权重（参数量约 ×Cams）。
     """
 
     def __init__(
@@ -192,17 +195,27 @@ class MultiCameraEncoder(nn.Module):
         cond_dim: int = 256,
         pretrained_encoder: bool = True,
         use_frame_diff: bool = True,
+        share_image_encoder: bool = True,
     ) -> None:
         super().__init__()
         self.num_cameras = num_cameras
         self.n_obs_steps = n_obs_steps
+        self.share_image_encoder = share_image_encoder
 
-        self.image_encoder = ResNet18Encoder(
-            n_obs_steps=n_obs_steps,
-            out_dim=image_out_dim,
-            pretrained=pretrained_encoder,
-            use_frame_diff=use_frame_diff,
-        )
+        def _make_image_encoder() -> ResNet18Encoder:
+            return ResNet18Encoder(
+                n_obs_steps=n_obs_steps,
+                out_dim=image_out_dim,
+                pretrained=pretrained_encoder,
+                use_frame_diff=use_frame_diff,
+            )
+
+        if share_image_encoder:
+            self.image_encoder = _make_image_encoder()
+        else:
+            self.image_encoders = nn.ModuleList(
+                [_make_image_encoder() for _ in range(num_cameras)]
+            )
         self.state_encoder = StateEncoder(state_dim=state_dim, out_dim=state_out_dim)
 
         fused_dim = num_cameras * image_out_dim + state_out_dim * n_obs_steps
@@ -213,26 +226,49 @@ class MultiCameraEncoder(nn.Module):
             nn.ReLU(inplace=True),
         )
 
+    def vision_parameters(self):
+        """Yield visual backbone parameters（供 optimizer 分组）。"""
+        if self.share_image_encoder:
+            yield from self.image_encoder.parameters()
+        else:
+            yield from self.image_encoders.parameters()
+
+    def _encode_images(self, obs_images: torch.Tensor) -> torch.Tensor:
+        """obs_images (B, Cams, T, 3, H, W) -> (B, Cams * image_out_dim)."""
+        b, cams, t, _, _, _ = obs_images.shape
+        if cams != self.num_cameras:
+            raise ValueError(
+                f"Expected {self.num_cameras} cameras, got {cams}"
+            )
+
+        if not self.share_image_encoder:
+            cam_feats = [
+                self.image_encoders[c](obs_images[:, c]) for c in range(cams)
+            ]
+            return torch.cat(cam_feats, dim=-1)
+
+        if self.training:
+            # 串行按相机 forward：5060 Ti 上比 B*Cams 一次过更快（激活更贴合 L2），
+            # 且 BN 统计按 batch=B，不混相机。eval 仍用下方 batched 路径。
+            cam_feats = [self.image_encoder(obs_images[:, c]) for c in range(cams)]
+            return torch.cat(cam_feats, dim=-1)
+
+        # Shared + eval: (B, Cams, ...) -> (B*Cams, ...) for one ResNet pass.
+        flat = obs_images.reshape(b * cams, t, *obs_images.shape[3:])
+        cam_feats = self.image_encoder(flat)
+        return cam_feats.reshape(b, cams, -1).flatten(1)
+
     def forward(self, obs_images: torch.Tensor, obs_state: torch.Tensor) -> torch.Tensor:
         """
         obs_images: (B, Cams, T, 3, H, W)
         obs_state: (B, T, state_dim)
         returns: cond (B, cond_dim)
 
-        Train: per-camera serial forward (BN batch stats stay size B per camera).
-        Eval: cameras stacked on batch dim (B*Cams) for one ResNet pass; BN uses
-        running stats so output matches serial up to float noise.
+        Shared encoder — train: per-camera serial (BN batch = B);
+        eval: cameras stacked on batch (B*Cams). Separate encoders always serial.
         """
-        b, cams, t, _, _, _ = obs_images.shape
-
-        if self.training:
-            cam_feats = [self.image_encoder(obs_images[:, c]) for c in range(cams)]
-            img_feat = torch.cat(cam_feats, dim=-1)
-        else:
-            # (B, Cams, T, 3, H, W) -> (B*Cams, T, 3, H, W) -> (B, Cams*out_dim)
-            flat = obs_images.reshape(b * cams, t, *obs_images.shape[3:])
-            cam_feats = self.image_encoder(flat)
-            img_feat = cam_feats.reshape(b, cams, -1).flatten(1)
+        b, _, t, _, _, _ = obs_images.shape
+        img_feat = self._encode_images(obs_images)
 
         state = obs_state.reshape(b * t, -1)
         state_feat = self.state_encoder(state).reshape(b, -1)

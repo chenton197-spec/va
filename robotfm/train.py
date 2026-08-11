@@ -28,7 +28,12 @@ from robotfm.config import (
     resolve_path,
 )
 from robotfm.collect.loop import get_run_dir
-from robotfm.data.dataset import apply_image_augments_batch, build_episode_dataset
+from robotfm.data.dataset import (
+    apply_camera_dropout,
+    apply_image_augments_batch,
+    build_episode_dataset,
+    camera_dropout_prob,
+)
 from robotfm.data.stats import ensure_stats, is_limits_mode, resolve_image_stats
 from robotfm.policies.act import ACTConfig, ACTPolicy
 from robotfm.policies.flow_matching import FlowMatchingConfig, FlowMatchingPolicy
@@ -158,6 +163,7 @@ def _build_a2a_policy(cfg: RobotFMConfig) -> torch.nn.Module:
         ae_dropout=cfg.policy.ae_dropout,
         pretrained_encoder=cfg.policy.pretrained_encoder,
         use_frame_diff=cfg.policy.use_frame_diff,
+        share_image_encoder=cfg.policy.share_image_encoder,
         rtc=rtc if rtc.enabled else None,
     )
     return A2APolicy(a2a_cfg)
@@ -192,6 +198,7 @@ def _build_vita_policy(cfg: RobotFMConfig) -> VITAPolicy:
         ae_dropout=cfg.policy.ae_dropout,
         pretrained_encoder=cfg.policy.pretrained_encoder,
         use_frame_diff=cfg.policy.use_frame_diff,
+        share_image_encoder=cfg.policy.share_image_encoder,
     )
     return VITAPolicy(vita_cfg)
 
@@ -269,6 +276,7 @@ def build_policy(cfg: RobotFMConfig, stats: dict | None = None) -> PolicyModule:
         n_groups=cfg.policy.n_groups,
         pretrained_encoder=cfg.policy.pretrained_encoder,
         use_frame_diff=cfg.policy.use_frame_diff,
+        share_image_encoder=cfg.policy.share_image_encoder,
         vision_backbone=cfg.policy.vision_backbone,
         rtc=rtc if rtc.enabled else None,
     )
@@ -282,7 +290,11 @@ def _build_optimizer(policy: PolicyModule, cfg: RobotFMConfig) -> torch.optim.Op
         encoder_params = [p for p in policy.parameters() if id(p) in backbone_ids]
         other_params = [p for p in policy.parameters() if id(p) not in backbone_ids]
     else:
-        encoder_ids = {id(p) for p in policy.encoder.image_encoder.parameters()}
+        vision_fn = getattr(policy.encoder, "vision_parameters", None)
+        if callable(vision_fn):
+            encoder_ids = {id(p) for p in vision_fn()}
+        else:
+            encoder_ids = {id(p) for p in policy.encoder.image_encoder.parameters()}
         encoder_params = [p for p in policy.parameters() if id(p) in encoder_ids]
         other_params = [p for p in policy.parameters() if id(p) not in encoder_ids]
     encoder_lr = cfg.train.lr * cfg.train.encoder_lr_scale
@@ -491,6 +503,24 @@ def train_flow_matching(
                         saturation=cfg.dataset.color_jitter_saturation,
                         hue=cfg.dataset.color_jitter_hue,
                     )
+                cam_drop_p = 0.0
+                cam_drop_cfg = cfg.dataset.camera_dropout
+                if cam_drop_cfg.enabled:
+                    cam_drop_p = camera_dropout_prob(
+                        step,
+                        cfg.train.steps,
+                        schedule_steps=cam_drop_cfg.schedule_steps,
+                        early_frac=cam_drop_cfg.early_frac,
+                        mid_frac=cam_drop_cfg.mid_frac,
+                        early_prob=cam_drop_cfg.early_prob,
+                        mid_prob=cam_drop_cfg.mid_prob,
+                        late_prob=cam_drop_cfg.late_prob,
+                    )
+                    batch["obs_images"] = apply_camera_dropout(
+                        batch["obs_images"],
+                        cam_drop_p,
+                        keep_at_least_one=cam_drop_cfg.keep_at_least_one,
+                    )
                 if cfg.train.cosine_lr:
                     _set_cosine_lr(optim, step, cfg)
                 loss = policy.compute_loss(batch)
@@ -514,18 +544,24 @@ def train_flow_matching(
                         and grad_norm_v == grad_norm_v  # not NaN
                         and grad_norm_v > cfg.train.max_grad_norm
                     )
-                    pbar.set_postfix(
-                        loss=loss_v,
-                        lr=lr,
-                        gnorm=grad_norm_v,
-                        clip=int(clipped),
-                    )
+                    postfix = {
+                        "loss": loss_v,
+                        "lr": lr,
+                        "gnorm": grad_norm_v,
+                        "clip": int(clipped),
+                    }
+                    if cam_drop_cfg.enabled:
+                        postfix["cam_drop_p"] = cam_drop_p
+                    pbar.set_postfix(**postfix)
                     # 只写文件，避免打断 tqdm 进度条
+                    drop_msg = (
+                        f" cam_drop_p={cam_drop_p:.4g}" if cam_drop_cfg.enabled else ""
+                    )
                     logger.log(
                         f"step={step}/{cfg.train.steps} loss={loss_v:.6f} "
                         f"lr={lr:.8g} grad_norm={grad_norm_v:.6f} "
                         f"max_grad_norm={cfg.train.max_grad_norm:g} "
-                        f"clipped={int(clipped)}",
+                        f"clipped={int(clipped)}{drop_msg}",
                         also_print=False,
                     )
                 if step > 0 and step % cfg.train.save_freq == 0:

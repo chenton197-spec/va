@@ -27,6 +27,25 @@ class EnvConfig:
 
 
 @dataclass
+class CameraDropoutConfig:
+    """训练时整路相机全局遮挡（按固定日程长度三阶段切换概率）。
+
+    ``schedule_steps``：日程锚定步数；``None``/``0`` 时退回 ``train.steps``。
+    续训把 ``train.steps`` 拉大时仍按 ``schedule_steps`` 算进度，超出后固定 ``late_prob``，
+    避免出现后期 0.12 又跳回中期 0.25。
+    """
+
+    enabled: bool = False
+    keep_at_least_one: bool = True
+    schedule_steps: int | None = None
+    early_frac: float = 0.30
+    mid_frac: float = 0.40
+    early_prob: float = 0.40
+    mid_prob: float = 0.25
+    late_prob: float = 0.12
+
+
+@dataclass
 class DatasetConfig:
     """数据集与 action chunking 相关配置。"""
 
@@ -52,6 +71,7 @@ class DatasetConfig:
     uint8_cache_dir: str | None = None  # 可选显式缓存目录
     # True: Dataset 不裁剪/不抖动，由训练循环在 GPU 上做（需配合 train）
     gpu_augment: bool = False
+    camera_dropout: CameraDropoutConfig = field(default_factory=CameraDropoutConfig)
 
 
 @dataclass
@@ -74,6 +94,7 @@ class PolicyConfig:
     n_groups: int = 8
     pretrained_encoder: bool = True  # ImageNet / Kinetics 预训练（微调）
     use_frame_diff: bool = True  # ResNet 路径：[I0, I1-I0, ...] 通道堆叠
+    share_image_encoder: bool = True  # False: 每相机独立视觉权重（≈×Cams 参数）
     # A2A / N-A2A / VITA（flow_matching 忽略）
     latent_dim: int = 512
     consistency_weight: float = 1.0

@@ -46,6 +46,7 @@ class FlowMatchingConfig:
     n_groups: int = 8
     pretrained_encoder: bool = True
     use_frame_diff: bool = True
+    share_image_encoder: bool = True
     vision_backbone: str = "resnet18"
     rtc: RTCConfig | None = None
 
@@ -89,6 +90,7 @@ class FlowMatchingPolicy(nn.Module):
                 cond_dim=cfg.hidden_dim,
                 pretrained_encoder=cfg.pretrained_encoder,
                 use_frame_diff=cfg.use_frame_diff,
+                share_image_encoder=cfg.share_image_encoder,
             )
         elif backbone in {"slowfast_r50", "slowfast"}:
             self.encoder = MultiCameraSlowFastEncoder(
@@ -97,6 +99,7 @@ class FlowMatchingPolicy(nn.Module):
                 n_obs_steps=cfg.n_obs_steps,
                 cond_dim=cfg.hidden_dim,
                 pretrained_encoder=cfg.pretrained_encoder,
+                share_image_encoder=cfg.share_image_encoder,
             )
         else:
             raise ValueError(

@@ -1,0 +1,91 @@
+# 离线 BC：A2A+noise + 三阶段整路相机全局遮挡 + gaussian_2std，无 OT
+# 硬件：RTX 5060 Ti 16GB + i5-12400F (6C/12T) + 15GB RAM（桌面约占 ~0.6GB VRAM）
+# 数据：openarm_hcx_dual_arm（双臂 14 关节 + L/R gripper → 16-D；三相机）
+# N=32497（drop_n_last_frames=0，与 horizon 无关）
+# → floor(N/16)=2031 steps/epoch → 50 epoch = 101550
+# crop 关闭；resize→256；horizon=32（A2A 要求 n_action_steps == horizon；兼容 CNN L//8）
+# 加速：uint8 盘缓存跳过 JPEG + GPU color_jitter（先 build_uint8_image_cache.py）
+# 吞吐实测（horizon=32，workers=1）：bs16≈58 samp/s > bs48≈48 > bs32≈42
+#   → 三相机 train 态串行 ResNet，加大 bs 几乎不涨吞吐，反而更吃 RAM
+#   VRAM：bs16≈2.4GB / bs48≈6.3GB / bs64≈8.2GB（显存充裕）；15GB RAM+swap 是瓶颈
+#   → bs=16 + workers=1；勿 workers≥2（易打满 swap 被杀）
+# lr=5e-4 + cosine/warmup500：与同机 shine_shoes A2A 一致，适配 bs=16
+# 相机遮挡日程锚定 schedule_steps（与首轮 train.steps 对齐）：
+#   early/mid/late 三段；超出后固定 late_prob；续训加大 steps 不跳回 mid
+cameras: [head, left_hand, right_hand]
+state_dim: 16
+action_dim: 16
+state_names:
+  [L0, L1, L2, L3, L4, L5, L6, R0, R1, R2, R3, R4, R5, R6, left_gripper, right_gripper]
+action_names:
+  [L0, L1, L2, L3, L4, L5, L6, R0, R1, R2, R3, R4, R5, R6, left_gripper, right_gripper]
+fps: 15
+data_root: data
+output_dir: outputs/a2a_noise_camdrop_openarm_hcx_dual_arm_gaussian_2std
+
+dataset:
+  n_obs_steps: 8
+  horizon: 32
+  run_name: openarm_hcx_dual_arm
+  resize_size: 256
+  crop_size: null
+  color_jitter_brightness: 0.2
+  color_jitter_contrast: 0.2
+  color_jitter_saturation: 0.1
+  color_jitter_hue: 0.02
+  # gaussian | gaussian_2std | limits([-1,1]) | limits_01([0,1])
+  norm_mode: gaussian_2std
+  uint8_cache: true
+  gpu_augment: true
+  camera_dropout:
+    enabled: true
+    keep_at_least_one: true
+    # 日程长度；续训把 train.steps 调大时保持此值，超出后固定 late_prob
+    schedule_steps: 101550
+    early_frac: 0.20
+    mid_frac: 0.40
+    early_prob: 0.30
+    mid_prob: 0.2
+    late_prob: 0.05
+
+policy:
+  type: a2a
+  hidden_dim: 256
+  num_inference_steps: 6
+  n_action_steps: 32
+  pretrained_encoder: true
+  use_frame_diff: true
+  latent_dim: 512
+  consistency_weight: 1.0
+  enc_recon_weight: 0.5
+  flow_recon_weight: 0.5
+  history_noise_std: 0.15
+  flow_hidden_dim: 512
+  flow_num_layers: 4
+  flow_mlp_ratio: 4.0
+  ae_enc_hidden_dim: 512
+  ae_dec_hidden_dim: 512
+  ae_num_layers: 4
+  rtc:
+    # RTC 推理引导（训练不受影响）；A2A 要求 n_action_steps == horizon
+    enabled: false
+    execution_horizon: 8
+    max_guidance_weight: 10.0
+    prefix_attention_schedule: exp
+    inference_delay: 2
+    debug: false
+
+train:
+  # 实测最快且最稳：bs=16 + workers=1；每 epoch 存盘防 RAM 杀进程丢进度
+  batch_size: 16
+  steps: 101550
+  lr: 0.0005
+  weight_decay: 0.000001
+  log_freq: 50
+  save_freq: 2031
+  device: cuda
+  num_workers: 1
+  cosine_lr: true
+  warmup_steps: 500
+  encoder_lr_scale: 0.1
+  max_grad_norm: 1.0

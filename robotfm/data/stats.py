@@ -84,21 +84,35 @@ def _stats_from_state_action(
 
 
 def _merge_episode_stats_jsonl(run_dir: Path) -> dict[str, np.ndarray] | None:
-    """Weighted merge of ``meta/episodes_stats.jsonl`` into robotfm stats (7-D).
+    """Weighted merge of ``meta/episodes_stats.jsonl`` into robotfm stats.
 
-    Returns None if the file is missing or incomplete.
+    Supports single gripper (``*.gripper``) and dual grippers
+    (``*.left_gripper`` + ``*.right_gripper``). Returns None if the file is
+    missing or incomplete.
     """
     path = Path(run_dir) / "meta" / "episodes_stats.jsonl"
     if not path.is_file():
         return None
 
+    info_path = Path(run_dir) / "meta" / "info.json"
+    gripper_suffixes: tuple[str, ...] = ()
+    if info_path.is_file():
+        with info_path.open() as f:
+            features = json.load(f).get("features", {})
+        from robotfm.data.lerobot_dataset import resolve_gripper_suffixes
+
+        try:
+            gripper_suffixes = resolve_gripper_suffixes(features)
+        except ValueError:
+            return None
+
     # Accumulators for mean / min / max / second moment via count-weighted merge
     keys = (
-        ("observation.state", "observation.gripper", "state"),
-        ("action", "action.gripper", "action"),
+        ("observation.state", "observation", "state"),
+        ("action", "action", "action"),
     )
     acc: dict[str, dict[str, np.ndarray | float]] = {}
-    for arm_key, grip_key, prefix in keys:
+    for arm_key, _prefix, prefix in keys:
         acc[prefix] = {
             "count": 0.0,
             "sum": None,
@@ -108,18 +122,22 @@ def _merge_episode_stats_jsonl(run_dir: Path) -> dict[str, np.ndarray] | None:
         }
 
     def _as_vec(
-        arm: dict, grip: dict | None
+        arm: dict, grips: list[dict]
     ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, float]:
         arm_mean = np.asarray(arm["mean"], dtype=np.float64)
         arm_std = np.asarray(arm["std"], dtype=np.float64)
         arm_min = np.asarray(arm["min"], dtype=np.float64)
         arm_max = np.asarray(arm["max"], dtype=np.float64)
         count = float(arm["count"])
-        if isinstance(grip, dict):
-            mean = np.concatenate([arm_mean, np.asarray([grip["mean"]], dtype=np.float64)])
-            std = np.concatenate([arm_std, np.asarray([grip["std"]], dtype=np.float64)])
-            vmin = np.concatenate([arm_min, np.asarray([grip["min"]], dtype=np.float64)])
-            vmax = np.concatenate([arm_max, np.asarray([grip["max"]], dtype=np.float64)])
+        if grips:
+            g_mean = np.asarray([g["mean"] for g in grips], dtype=np.float64)
+            g_std = np.asarray([g["std"] for g in grips], dtype=np.float64)
+            g_min = np.asarray([g["min"] for g in grips], dtype=np.float64)
+            g_max = np.asarray([g["max"] for g in grips], dtype=np.float64)
+            mean = np.concatenate([arm_mean, g_mean])
+            std = np.concatenate([arm_std, g_std])
+            vmin = np.concatenate([arm_min, g_min])
+            vmax = np.concatenate([arm_max, g_max])
         else:
             mean, std, vmin, vmax = arm_mean, arm_std, arm_min, arm_max
         return mean, std, vmin, vmax, count
@@ -133,13 +151,16 @@ def _merge_episode_stats_jsonl(run_dir: Path) -> dict[str, np.ndarray] | None:
             raw = json.loads(line)
             ep_stats = raw["stats"]
             n_lines += 1
-            for arm_key, grip_key, prefix in keys:
+            for arm_key, feat_prefix, prefix in keys:
                 if arm_key not in ep_stats:
                     return None
-                grip = ep_stats.get(grip_key)
-                if grip is not None and not isinstance(grip, dict):
-                    return None
-                mean, std, vmin, vmax, count = _as_vec(ep_stats[arm_key], grip)
+                grips: list[dict] = []
+                for suffix in gripper_suffixes:
+                    grip = ep_stats.get(f"{feat_prefix}.{suffix}")
+                    if grip is None or not isinstance(grip, dict):
+                        return None
+                    grips.append(grip)
+                mean, std, vmin, vmax, count = _as_vec(ep_stats[arm_key], grips)
                 bucket = acc[prefix]
                 sq = np.square(std) + np.square(mean)  # E[x^2] = var + mean^2
                 if bucket["sum"] is None:

@@ -114,6 +114,8 @@ class MultiCameraSlowFastEncoder(nn.Module):
     """多相机 SlowFast + 多步状态 → global cond。
 
     与 ``MultiCameraEncoder`` 输出约定一致，供 FlowMatchingPolicy 直接替换。
+
+    ``share_image_encoder``: True 共用一份 SlowFast；False 每相机独立权重。
     """
 
     def __init__(
@@ -125,15 +127,25 @@ class MultiCameraSlowFastEncoder(nn.Module):
         state_out_dim: int = 128,
         cond_dim: int = 256,
         pretrained_encoder: bool = True,
+        share_image_encoder: bool = True,
     ) -> None:
         super().__init__()
         self.num_cameras = num_cameras
         self.n_obs_steps = n_obs_steps
+        self.share_image_encoder = share_image_encoder
 
-        self.image_encoder = SlowFastVideoEncoder(
-            out_dim=image_out_dim,
-            pretrained=pretrained_encoder,
-        )
+        def _make_image_encoder() -> SlowFastVideoEncoder:
+            return SlowFastVideoEncoder(
+                out_dim=image_out_dim,
+                pretrained=pretrained_encoder,
+            )
+
+        if share_image_encoder:
+            self.image_encoder = _make_image_encoder()
+        else:
+            self.image_encoders = nn.ModuleList(
+                [_make_image_encoder() for _ in range(num_cameras)]
+            )
         self.state_encoder = StateEncoder(state_dim=state_dim, out_dim=state_out_dim)
 
         fused_dim = num_cameras * image_out_dim + state_out_dim * n_obs_steps
@@ -144,23 +156,45 @@ class MultiCameraSlowFastEncoder(nn.Module):
             nn.ReLU(inplace=True),
         )
 
+    def vision_parameters(self):
+        """Yield visual backbone parameters（供 optimizer 分组）。"""
+        if self.share_image_encoder:
+            yield from self.image_encoder.parameters()
+        else:
+            yield from self.image_encoders.parameters()
+
+    def _encode_images(self, obs_images: torch.Tensor) -> torch.Tensor:
+        """obs_images (B, Cams, T, 3, H, W) -> (B, Cams * image_out_dim)."""
+        b, cams, t, _, _, _ = obs_images.shape
+        if cams != self.num_cameras:
+            raise ValueError(
+                f"Expected {self.num_cameras} cameras, got {cams}"
+            )
+
+        if not self.share_image_encoder:
+            cam_feats = [
+                self.image_encoders[c](obs_images[:, c]) for c in range(cams)
+            ]
+            return torch.cat(cam_feats, dim=-1)
+
+        if self.training:
+            cam_feats = [self.image_encoder(obs_images[:, c]) for c in range(cams)]
+            return torch.cat(cam_feats, dim=-1)
+
+        flat = obs_images.reshape(b * cams, t, *obs_images.shape[3:])
+        cam_feats = self.image_encoder(flat)
+        return cam_feats.reshape(b, cams, -1).flatten(1)
+
     def forward(self, obs_images: torch.Tensor, obs_state: torch.Tensor) -> torch.Tensor:
         """
         obs_images: (B, Cams, T, 3, H, W)
         obs_state: (B, T, state_dim)
         returns: cond (B, cond_dim)
 
-        Train: per-camera serial; eval: batch cameras (B*Cams) for one backbone pass.
+        Shared: train serial / eval batched; separate encoders always serial.
         """
-        b, cams, t, _, _, _ = obs_images.shape
-
-        if self.training:
-            cam_feats = [self.image_encoder(obs_images[:, c]) for c in range(cams)]
-            img_feat = torch.cat(cam_feats, dim=-1)
-        else:
-            flat = obs_images.reshape(b * cams, t, *obs_images.shape[3:])
-            cam_feats = self.image_encoder(flat)
-            img_feat = cam_feats.reshape(b, cams, -1).flatten(1)
+        b, _, t, _, _, _ = obs_images.shape
+        img_feat = self._encode_images(obs_images)
 
         state = obs_state.reshape(b * t, -1)
         state_feat = self.state_encoder(state).reshape(b, -1)

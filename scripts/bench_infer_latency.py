@@ -70,8 +70,13 @@ def _time_ms(fn, device: torch.device) -> float:
 
 
 def _check_encoder_equiv(policy: torch.nn.Module, batch: dict[str, torch.Tensor]) -> float:
-    """Return max abs diff between eval batched forward and serial reference."""
+    """Return max abs diff between eval batched forward and serial reference.
+
+    Only meaningful for shared-weight encoders (batched B*Cams path).
+    """
     enc = policy.encoder
+    if getattr(enc, "share_image_encoder", True) is False:
+        return float("nan")
     if not hasattr(enc, "image_encoder"):
         return float("nan")
     obs_images = batch["obs_images"]

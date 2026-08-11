@@ -240,6 +240,70 @@ def apply_image_augments_batch(
     return images
 
 
+def camera_dropout_prob(
+    step: int,
+    total_steps: int,
+    *,
+    schedule_steps: int | None = None,
+    early_frac: float = 0.30,
+    mid_frac: float = 0.40,
+    early_prob: float = 0.40,
+    mid_prob: float = 0.25,
+    late_prob: float = 0.12,
+) -> float:
+    """三阶段全局相机遮挡概率：前期 / 中期 / 后期。
+
+    进度按 ``horizon = schedule_steps or total_steps``：
+    ``progress = min(1, step / horizon)``。超出日程后固定 ``late_prob``，
+    续训加大 ``train.steps`` 时不会回落到中期概率。
+    """
+    horizon = int(schedule_steps) if schedule_steps else int(total_steps)
+    if horizon <= 0:
+        return float(late_prob)
+    progress = min(1.0, float(step) / float(horizon))
+    early_end = float(early_frac)
+    mid_end = early_end + float(mid_frac)
+    if progress < early_end:
+        return float(early_prob)
+    if progress < mid_end:
+        return float(mid_prob)
+    return float(late_prob)
+
+
+def apply_camera_dropout(
+    images: torch.Tensor,
+    p: float,
+    *,
+    keep_at_least_one: bool = True,
+) -> torch.Tensor:
+    """按相机独立 Bernoulli 整路置零。
+
+    ``images``: (B, Cams, T, 3, H, W)。``p<=0`` 时原样返回。
+    若 ``keep_at_least_one`` 且某样本所有相机都被抽中，随机放回一路。
+    """
+    if p <= 0.0:
+        return images
+    if images.ndim != 6:
+        raise ValueError(
+            f"apply_camera_dropout expects (B, Cams, T, 3, H, W), got {tuple(images.shape)}"
+        )
+    b, cams = images.shape[:2]
+    if cams == 0:
+        return images
+    device = images.device
+    drop = torch.rand(b, cams, device=device) < float(p)
+    if keep_at_least_one and cams > 0:
+        all_dropped = drop.all(dim=1)
+        if bool(all_dropped.any()):
+            # 对全灭样本随机保留一路
+            keep_idx = torch.randint(0, cams, (int(all_dropped.sum().item()),), device=device)
+            drop[all_dropped, :] = True
+            drop[all_dropped, keep_idx] = False
+    # (B, Cams, 1, 1, 1, 1) 广播到整路时空
+    mask = (~drop).to(dtype=images.dtype).view(b, cams, 1, 1, 1, 1)
+    return images * mask
+
+
 class EpisodeDataset(Dataset):
     """帧级索引的数据集，支持多相机与 action chunking。
 

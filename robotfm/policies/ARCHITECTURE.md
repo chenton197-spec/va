@@ -83,7 +83,8 @@ actions <- action_decoder(x)
 
 - 每相机一次时序编码
 - 状态 MLP 按时间步编码后拼接
-- 配置：`pretrained_encoder`、`use_frame_diff`
+- 配置：`pretrained_encoder`、`use_frame_diff`、`share_image_encoder`
+- `share_image_encoder=false`：每相机独立 ResNet 权重（参数约 ×Cams）
 
 ## `video_encoders.py`（SlowFast）
 

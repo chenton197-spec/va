@@ -37,6 +37,8 @@ policy:
   noise_s: 0.999
   pretrained_encoder: true
   use_frame_diff: true
+  # false: hand / head 各一套 ResNet 权重（约 2× 视觉参数）
+  share_image_encoder: false
   down_dims: [256, 512, 1024]
   diffusion_step_embed_dim: 256
   kernel_size: 5

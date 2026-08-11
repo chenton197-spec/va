@@ -4,7 +4,9 @@ Reads parquet + on-disk JPEG sequences (``leobot_image_sequence_v1``) and
 returns the same batch keys as ``EpisodeDataset``:
 ``obs_images``, ``obs_state``, ``action``, ``action_mask``.
 
-State/action concatenate the 6-D arm vector with the scalar gripper → 7-D.
+State/action concatenate the arm vector with gripper scalar(s):
+- single-arm: ``observation.gripper`` / ``action.gripper`` → +1-D
+- dual-arm: ``*.left_gripper`` + ``*.right_gripper`` → +2-D
 Camera feature keys ``observation.images.<name>`` map to short names ``<name>``.
 """
 
@@ -26,6 +28,10 @@ from robotfm.data.uint8_cache import Uint8ImageCache, resolve_cache_dir
 from robotfm.types import EpisodeMeta
 
 IMAGE_FEATURE_PREFIX = "observation.images."
+
+# Gripper feature layouts supported by this loader / stats merge.
+_SINGLE_GRIPPER = ("gripper",)
+_DUAL_GRIPPER = ("left_gripper", "right_gripper")
 
 
 def is_lerobot_image_sequence_root(run_dir: Path) -> bool:
@@ -63,6 +69,44 @@ def load_lerobot_info(run_dir: Path) -> dict[str, Any]:
         return json.load(f)
 
 
+def resolve_gripper_suffixes(features: dict[str, Any]) -> tuple[str, ...]:
+    """Return gripper name suffixes present for both state and action.
+
+    Supports:
+    - ``()``: no gripper columns
+    - ``(\"gripper\",)``: single-arm
+    - ``(\"left_gripper\", \"right_gripper\")``: dual-arm (openarm etc.)
+    """
+    def _present(prefix: str, suffixes: tuple[str, ...]) -> bool:
+        return all(f"{prefix}.{s}" in features for s in suffixes)
+
+    dual_state = _present("observation", _DUAL_GRIPPER)
+    dual_action = _present("action", _DUAL_GRIPPER)
+    single_state = _present("observation", _SINGLE_GRIPPER)
+    single_action = _present("action", _SINGLE_GRIPPER)
+
+    if dual_state or dual_action:
+        if dual_state != dual_action:
+            raise ValueError(
+                "Dual-arm grippers require both observation.{left,right}_gripper "
+                "and action.{left,right}_gripper"
+            )
+        if single_state or single_action:
+            raise ValueError(
+                "Cannot mix single gripper (*.gripper) with dual "
+                "(*.left_gripper / *.right_gripper)"
+            )
+        return _DUAL_GRIPPER
+
+    if single_state != single_action:
+        raise ValueError(
+            "action.gripper and observation.gripper must both exist or both be absent"
+        )
+    if single_state:
+        return _SINGLE_GRIPPER
+    return ()
+
+
 def build_episode_meta_from_info(
     info: dict[str, Any],
     *,
@@ -86,19 +130,15 @@ def build_episode_meta_from_info(
 
     action_dim_arm = int(features["action"]["shape"][0])
     state_dim_arm = int(features["observation.state"]["shape"][0])
-    has_action_gripper = "action.gripper" in features
-    has_state_gripper = "observation.gripper" in features
-    if has_action_gripper != has_state_gripper:
-        raise ValueError("action.gripper and observation.gripper must both exist or both be absent")
-    gripper_extra = 1 if has_action_gripper else 0
+    gripper_suffixes = resolve_gripper_suffixes(features)
+    gripper_extra = len(gripper_suffixes)
     action_dim = action_dim_arm + gripper_extra
     state_dim = state_dim_arm + gripper_extra
 
     state_names = [f"state_{i}" for i in range(state_dim_arm)]
     action_names = [f"action_{i}" for i in range(action_dim_arm)]
-    if gripper_extra:
-        state_names.append("gripper")
-        action_names.append("gripper")
+    state_names.extend(gripper_suffixes)
+    action_names.extend(gripper_suffixes)
 
     robot_type = str(info.get("robot_type") or "unknown")
     return EpisodeMeta(
@@ -171,10 +211,16 @@ def load_episode_arrays_from_parquet(
 
     state = _vector_column_to_array(data["observation.state"])
     action = _vector_column_to_array(data["action"])
-    if "observation.gripper" in data:
-        state = np.concatenate([state, _gripper_column_to_array(data["observation.gripper"])], axis=1)
-    if "action.gripper" in data:
-        action = np.concatenate([action, _gripper_column_to_array(data["action.gripper"])], axis=1)
+    gripper_suffixes = resolve_gripper_suffixes(info["features"])
+    if gripper_suffixes:
+        state_grips = [
+            _gripper_column_to_array(data[f"observation.{s}"]) for s in gripper_suffixes
+        ]
+        action_grips = [
+            _gripper_column_to_array(data[f"action.{s}"]) for s in gripper_suffixes
+        ]
+        state = np.concatenate([state, *state_grips], axis=1)
+        action = np.concatenate([action, *action_grips], axis=1)
 
     image_paths: dict[str, list[str]] = {}
     for feat_key in camera_feature_keys:

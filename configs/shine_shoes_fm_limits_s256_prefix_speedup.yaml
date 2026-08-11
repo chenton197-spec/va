@@ -1,0 +1,64 @@
+# 离线 BC：Flow Matching + gaussian_2std（(x-mean)/(2*std)）
+# 硬件：RTX 5060 Ti 16GB + i5-12400F 6C/12T + 15GB RAM
+# 数据：shine_shoes_fr3_s256_prefix_speedup（JPEG 已预缩到 256×256，训练时再 crop 到 224）
+# N=105232（drop_n_last_frames=0，与 horizon 无关）
+# → floor(N/128)=822 steps/epoch → 140 epoch = 115080
+# action trunk=16；n_action_steps=12（相对旧 6/8 同比例闭环执行）
+# 加速：uint8 盘缓存跳过 JPEG + GPU 上 crop/color_jitter
+# 吞吐：FM n_obs=2 显存充裕（bs=128 ~7.3GB）；15GB RAM → workers=1
+# 每 10 epoch 存盘：save_freq = 10 * 822 = 8220
+cameras: [hand, head]
+state_dim: 7
+action_dim: 7
+state_names: [j1, j2, j3, j4, j5, j6, gripper]
+action_names: [j1, j2, j3, j4, j5, j6, gripper]
+fps: 30
+data_root: .
+output_dir: outputs/fm_shine_shoes_gaussian_2std_s256_prefix_speedup
+
+dataset:
+  n_obs_steps: 2
+  horizon: 16
+  run_name: shine_shoes_fr3_s256_prefix_speedup
+  resize_size: 256
+  crop_size: 224`-
+  eval_fixed_crop: true
+  # 训练光度增强（评估不加）；0=关闭。同一样本共用一组随机因子。
+  color_jitter_brightness: 0.2
+  color_jitter_contrast: 0.2
+  color_jitter_saturation: 0.1
+  color_jitter_hue: 0.02
+  # gaussian | gaussian_2std | limits([-1,1]) | limits_01([0,1])
+  norm_mode: gaussian_2std
+  uint8_cache: true
+  gpu_augment: true
+
+policy:
+  type: flow_matching
+  hidden_dim: 256
+  num_inference_steps: 10
+  n_action_steps: 12
+  beta_alpha: 1.5
+  beta_beta: 1.0
+  noise_s: 0.999
+  pretrained_encoder: true
+  use_frame_diff: true
+  down_dims: [256, 512, 1024]
+  diffusion_step_embed_dim: 256
+  kernel_size: 5
+  n_groups: 8
+
+train:
+  # horizon=16 对 VRAM 影响很小，仍用 bs=128；workers=1 保 RAM
+  batch_size: 128
+  steps: 115080
+  lr: 0.0008
+  weight_decay: 0.000001
+  log_freq: 50
+  save_freq: 8220
+  device: cuda
+  num_workers: 1
+  cosine_lr: true
+  warmup_steps: 1000
+  encoder_lr_scale: 0.1
+  max_grad_norm: 1.0
