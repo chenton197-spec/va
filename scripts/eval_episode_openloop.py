@@ -229,6 +229,16 @@ def main() -> None:
     mae = np.mean(np.abs(err), axis=0)
     rmse = np.sqrt(np.mean(err**2, axis=0))
 
+    # Dual-arm 16-D: [L0..L6, R0..R6, left_gripper, right_gripper]
+    # Single-arm 7-D: [j1..j6, gripper]
+    gripper_mask = np.array(["gripper" in n.lower() for n in action_names], dtype=bool)
+    if not gripper_mask.any() and len(mae) >= 7:
+        gripper_mask = np.zeros(len(mae), dtype=bool)
+        gripper_mask[-1] = True
+    joint_mask = ~gripper_mask
+    mae_joints = float(np.mean(mae[joint_mask])) if joint_mask.any() else float("nan")
+    mae_gripper = float(np.mean(mae[gripper_mask])) if gripper_mask.any() else float("nan")
+
     metrics = {
         "checkpoint": str(ckpt_path),
         "train_config": str(train_cfg_path) if train_cfg_path is not None else None,
@@ -248,8 +258,8 @@ def main() -> None:
         "seed": args.seed,
         "mae_per_dim": {n: float(v) for n, v in zip(action_names, mae)},
         "rmse_per_dim": {n: float(v) for n, v in zip(action_names, rmse)},
-        "mae_joints": float(np.mean(mae[:6])),
-        "mae_gripper": float(mae[6]),
+        "mae_joints": mae_joints,
+        "mae_gripper": mae_gripper,
         "mae_all": float(np.mean(mae)),
     }
     (out_dir / "metrics.json").write_text(json.dumps(metrics, indent=2) + "\n")
@@ -263,8 +273,11 @@ def main() -> None:
     )
 
     steps = np.arange(length)
-    fig, axes = plt.subplots(4, 2, figsize=(14, 12), sharex=True)
-    axes = axes.ravel()
+    n_dim = len(action_names)
+    ncols = 2
+    nrows = int(np.ceil(n_dim / ncols))
+    fig, axes = plt.subplots(nrows, ncols, figsize=(14, max(3.0 * nrows, 6.0)), sharex=True)
+    axes = np.atleast_1d(axes).ravel()
     for i, name in enumerate(action_names):
         ax = axes[i]
         ax.plot(steps, actions_gt[:, i], label="GT", color="#1f77b4", linewidth=1.2)
@@ -274,8 +287,9 @@ def main() -> None:
         ax.set_title(f"{name}  MAE={mae[i]:.4f}  RMSE={rmse[i]:.4f}")
         if i == 0:
             ax.legend(loc="upper right")
-    axes[-1].set_visible(False)
-    for ax in axes[-3:-1]:
+    for j in range(n_dim, len(axes)):
+        axes[j].set_visible(False)
+    for ax in axes[max(0, n_dim - ncols) : n_dim]:
         ax.set_xlabel("frame")
     fig.suptitle(
         f"Episode {args.episode} open-loop  |  {ckpt_path.name}  |  "
