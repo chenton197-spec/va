@@ -1,0 +1,19 @@
+# run_w2 使用说明（HCX 双臂）
+
+## 启动命令
+
+在 `ct/va` 目录下运行：
+
+```bash
+PYTHONPATH=. python run_w2/run.py --deploy run_w2/deploy.yaml
+```
+
+脚本仅支持 `--deploy` 参数。`checkpoint`、`config`、`teleop_yaml` 等均从 deploy 文件读取。
+机械臂接口已切换为 `hcx_sdk`（`RobotClient` + 双臂 `move_joints`），不再使用法奥 FR3 SDK。
+
+## 最小检查清单
+
+- 启动日志包含 `部署配置`、`加载 checkpoint`、`训练配置`。
+- 日志出现 `策略已就绪`，表示模型权重已加载成功并完成 `policy.eval()`。
+- 日志持续输出 `step=...` 且无 `HCX` 报警/使能错误、无维度/相机键错误，表示推理与实机循环已进入稳定阶段。
+

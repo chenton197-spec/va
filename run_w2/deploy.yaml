@@ -1,0 +1,27 @@
+# run_w2/run.py 部署配置（HCX 双臂；脚本仅支持 --deploy）
+
+# 策略 checkpoint；相对路径相对于 ct/va/
+checkpoint: outputs/a2a_noise_camdrop_openarm_hcx_dual_arm_gaussian_2std_260811190022/checkpoint_071085.pt
+
+# teleop 部署 YAML（HCX、Orbbec、Gloria-M）
+teleop_yaml: /home/casbot/teleop_project/teleop.yaml
+
+# 闭环最大步数
+max_steps: 500
+
+# 启动时 HCX 左右臂可选起始位（关节角单位：度，7轴）
+# 可设为 null 跳过起始位动作。
+start_pose:
+  left_joints_deg: null
+  right_joints_deg: null
+
+# HCX move_joints 规划参数
+move_joints:
+  speed_ratio: 0.1
+  acceleration_seconds: 0.5
+  deceleration_seconds: 0.5
+  feedback_confirm_timeout_s: 30.0
+  feedback_confirm_poll_interval_s: 0.05
+  angle_tolerance_deg: 0.01
+
+# 夹爪频率由 teleop.yaml 的 gloria_m_dual.rate_hz 统一控制

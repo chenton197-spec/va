@@ -1,0 +1,776 @@
+#!/usr/bin/env python3
+"""W2 实机闭环运行入口（HCX 双臂，CLI 仅支持 --deploy）。"""
+
+from __future__ import annotations
+
+import argparse
+import math
+import sys
+import threading
+import time
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any
+
+import numpy as np
+import torch
+import yaml
+
+VA_ROOT = Path(__file__).resolve().parents[1]
+TELEOP_ROOT = Path("/home/casbot/teleop_project")
+SCRIPT_DIR = Path(__file__).resolve().parent
+DEPLOY_YAML = SCRIPT_DIR / "deploy.yaml"
+
+if str(TELEOP_ROOT) not in sys.path:
+    sys.path.insert(0, str(TELEOP_ROOT))
+if str(VA_ROOT) not in sys.path:
+    sys.path.insert(0, str(VA_ROOT))
+
+from hcx_sdk import RobotClient  # noqa: E402
+from robotfm.config import load_config  # noqa: E402
+from robotfm.data.dataset import crop_images, resize_images  # noqa: E402
+from robotfm.data.stats import denormalize, normalize  # noqa: E402
+from robotfm.train import build_policy  # noqa: E402
+from robotfm.types import Observation  # noqa: E402
+from teleop_sdk.adapters.gloria_m import GloriaMGripperFollower  # noqa: E402
+from teleop_sdk.config import load_runtime_config  # noqa: E402
+
+
+def _resolve_path(value: str | Path, *, base: Path) -> Path:
+    path = Path(value)
+    if not path.is_absolute():
+        path = base / path
+    return path
+
+
+def _parse_start_pose(
+    start: Any, source: Path
+) -> tuple[list[float] | None, list[float] | None]:
+    if start is None:
+        return None, None
+    if not isinstance(start, dict):
+        raise ValueError(f"start_pose 必须是映射: {source}")
+    left = start.get("left_joints_deg")
+    right = start.get("right_joints_deg")
+    left_j = [float(v) for v in left] if left is not None else None
+    right_j = [float(v) for v in right] if right is not None else None
+    if left_j is not None and len(left_j) != 7:
+        raise ValueError("start_pose.left_joints_deg 必须是 7 维")
+    if right_j is not None and len(right_j) != 7:
+        raise ValueError("start_pose.right_joints_deg 必须是 7 维")
+    return left_j, right_j
+
+
+def _load_deploy_config(path: Path) -> dict[str, Any]:
+    if not path.is_file():
+        raise FileNotFoundError(f"找不到部署配置: {path}")
+    with path.open("r", encoding="utf-8") as f:
+        data = yaml.safe_load(f) or {}
+    if not isinstance(data, dict):
+        raise ValueError(f"部署配置根节点必须是映射: {path}")
+
+    required = ("checkpoint", "config", "teleop_yaml", "max_steps")
+    missing = [k for k in required if k not in data or data[k] in (None, "")]
+    if missing:
+        raise ValueError(f"deploy.yaml 缺少字段: {missing}")
+
+    left_start, right_start = _parse_start_pose(data.get("start_pose"), path)
+    move = data.get("move_joints", {}) or {}
+    if not isinstance(move, dict):
+        raise ValueError("deploy.yaml 的 move_joints 必须是映射")
+
+    return {
+        "checkpoint": _resolve_path(data["checkpoint"], base=VA_ROOT),
+        "config": _resolve_path(data["config"], base=VA_ROOT),
+        "teleop_yaml": _resolve_path(data["teleop_yaml"], base=SCRIPT_DIR),
+        "max_steps": int(data["max_steps"]),
+        "left_start_joints_deg": left_start,
+        "right_start_joints_deg": right_start,
+        "move_speed_ratio": (
+            None if move.get("speed_ratio", 0.1) is None else float(move.get("speed_ratio", 0.1))
+        ),
+        "move_acceleration_seconds": (
+            None
+            if move.get("acceleration_seconds", 0.5) is None
+            else float(move.get("acceleration_seconds", 0.5))
+        ),
+        "move_deceleration_seconds": (
+            None
+            if move.get("deceleration_seconds", 0.5) is None
+            else float(move.get("deceleration_seconds", 0.5))
+        ),
+        "move_feedback_confirm_timeout_s": float(
+            move.get("feedback_confirm_timeout_s", 30.0)
+        ),
+        "move_feedback_confirm_poll_interval_s": float(
+            move.get("feedback_confirm_poll_interval_s", 0.05)
+        ),
+        "move_angle_tolerance_deg": float(move.get("angle_tolerance_deg", 0.01)),
+    }
+
+
+def _parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="W2 HCX 双臂实机闭环部署")
+    parser.add_argument("--deploy", type=str, default=str(DEPLOY_YAML))
+    return parser.parse_args()
+
+
+def _pace_step(step_start: float, fps: int) -> None:
+    if fps <= 0:
+        return
+    remain = (1.0 / fps) - (time.perf_counter() - step_start)
+    if remain > 0:
+        time.sleep(remain)
+
+
+def _preprocess_images(
+    images: dict[str, np.ndarray],
+    *,
+    resize_size: int | None,
+    crop_size: int | None,
+    eval_fixed_crop: bool,
+) -> dict[str, np.ndarray]:
+    out: dict[str, np.ndarray] = {}
+    for name, rgb in images.items():
+        arr = np.asarray(rgb)
+        if arr.dtype != np.uint8:
+            arr = np.clip(arr, 0, 255).astype(np.uint8)
+        t = torch.from_numpy(arr.astype(np.float32) / 255.0).permute(2, 0, 1).unsqueeze(0)
+        t = resize_images(t, resize_size)
+        if crop_size is not None and eval_fixed_crop:
+            t = crop_images(t, crop_size, random=False)
+        out[name] = t.squeeze(0).permute(1, 2, 0).contiguous().numpy()
+    return out
+
+
+def _prepare_observation(
+    obs: Observation,
+    *,
+    resize_size: int | None,
+    crop_size: int | None,
+    eval_fixed_crop: bool,
+) -> Observation:
+    return Observation(
+        images=_preprocess_images(
+            obs.images,
+            resize_size=resize_size,
+            crop_size=crop_size,
+            eval_fixed_crop=eval_fixed_crop,
+        ),
+        state=np.asarray(obs.state, dtype=np.float32),
+        timestamp=obs.timestamp,
+    )
+
+
+def _append_observation(obs_history: list[Observation], obs: Observation, *, n_obs_steps: int) -> None:
+    obs_history.append(obs)
+    overflow = len(obs_history) - n_obs_steps
+    if overflow > 0:
+        del obs_history[:overflow]
+
+
+def _build_obs_batch(
+    obs_history: list[Observation],
+    cameras: list[str],
+    n_obs_steps: int,
+    stats: dict,
+    norm_mode: str,
+    device: torch.device,
+) -> dict[str, torch.Tensor]:
+    history = obs_history[-n_obs_steps:]
+    while len(history) < n_obs_steps:
+        history.insert(0, history[0])
+
+    camera_histories = []
+    for cam in cameras:
+        frames = []
+        for obs in history:
+            img = np.asarray(obs.images[cam], dtype=np.float32)
+            frames.append(torch.from_numpy(np.transpose(img, (2, 0, 1))))
+        camera_histories.append(torch.stack(frames, dim=0))
+
+    states = [
+        torch.from_numpy(
+            normalize(obs.state.astype(np.float32), stats, prefix="state", mode=norm_mode)
+        )
+        for obs in history
+    ]
+    return {
+        "obs_images": torch.stack(camera_histories, dim=0).unsqueeze(0).to(device),
+        "obs_state": torch.stack(states, dim=0).unsqueeze(0).to(device),
+    }
+
+
+@dataclass
+class HardwareBundle:
+    hcx_client: Any | None = None
+    left_arm: Any | None = None
+    right_arm: Any | None = None
+    left_gripper: Any | None = None
+    right_gripper: Any | None = None
+    left_gripper_loop: "BackgroundGripperLoop | None" = None
+    right_gripper_loop: "BackgroundGripperLoop | None" = None
+    camera_manager: Any | None = None
+    left_start_joints_deg: list[float] | None = None
+    right_start_joints_deg: list[float] | None = None
+
+
+class BackgroundGripperLoop:
+    def __init__(self, gripper: Any, *, rate_hz: float = 125.0):
+        if rate_hz <= 0.0:
+            raise ValueError("gripper rate_hz 必须 > 0")
+        self._gripper = gripper
+        self._period_s = 1.0 / float(rate_hz)
+        self._lock = threading.Lock()
+        self._target = 1.0
+        self._stop = threading.Event()
+        self._thread: threading.Thread | None = None
+
+    def set_opening(self, opening: float) -> None:
+        with self._lock:
+            self._target = float(np.clip(opening, 0.0, 1.0))
+
+    def start(self, initial_opening: float | None = None) -> None:
+        if self._thread is not None:
+            raise RuntimeError("夹爪后台循环已在运行")
+        if initial_opening is not None:
+            self.set_opening(initial_opening)
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+
+    def stop(self, *, join_timeout_s: float = 2.0) -> None:
+        self._stop.set()
+        if self._thread is not None and self._thread.is_alive():
+            self._thread.join(timeout=join_timeout_s)
+        self._thread = None
+
+    def _run(self) -> None:
+        next_t = time.perf_counter()
+        while not self._stop.is_set():
+            with self._lock:
+                target = self._target
+            try:
+                _ = bool(self._gripper.send_normalized(target))
+            except Exception:
+                pass
+            next_t += self._period_s
+            sleep_s = next_t - time.perf_counter()
+            if sleep_s > 0.0:
+                if self._stop.wait(timeout=sleep_s):
+                    break
+            else:
+                next_t = time.perf_counter()
+
+
+def _connect_cameras(teleop_yaml: Path, required: list[str]) -> Any:
+    from orbbec_sdk import OrbbecManager, load_orbbec_camera_configs
+
+    all_configs = load_orbbec_camera_configs(teleop_yaml)
+    by_name = {c.name: c for c in all_configs}
+    missing = [n for n in required if n not in by_name]
+    if missing:
+        raise ValueError(f"teleop.yaml 缺少训练所需相机: {missing}")
+    configs = tuple(by_name[n] for n in required)
+    manager = OrbbecManager(configs)
+    manager.start()
+    return manager
+
+
+def _connect_hcx_arms(teleop_yaml: Path) -> tuple[Any, Any, Any]:
+    runtime = load_runtime_config(teleop_yaml)
+    h = runtime.hcx
+    client = RobotClient(h.local_ip, h.remote_ip, h.port)
+    client.connect(timeout_s=h.connect_timeout_s)
+    time.sleep(float(h.controller_initialization_wait_s))
+
+    if h.auto_detach_hmi and not client.hmi_detached:
+        client.detach_hmi()
+    if h.auto_clear_alarms:
+        for _ in range(int(h.alarm_clear_retry_count) + 1):
+            if not client.active_alarms:
+                break
+            client.clear_alarms()
+            time.sleep(float(h.alarm_clear_retry_interval_s))
+    if client.active_alarms:
+        raise RuntimeError(f"HCX 活动报警未清除: {client.active_alarms}")
+    if not client.soft_emergency_stop_normal:
+        raise RuntimeError("HCX soft emergency stop 非正常状态")
+
+    for master in h.ethercat_master_indices:
+        if not client.ethercat_master_operational(master):
+            raise RuntimeError(f"HCX EtherCAT 主站未 OP: {master}")
+
+    if h.auto_enable and not client.global_enabled:
+        client.set_global_enable(True)
+    if not client.global_enabled:
+        raise RuntimeError("HCX global enable=false，请现场使能或开启 hcx.auto_enable")
+
+    left_arm = client.arm(h.left_robot_id)
+    right_arm = client.arm(h.right_robot_id)
+    if h.auto_enable:
+        if not left_arm.enabled:
+            left_arm.set_enabled(True)
+        if not right_arm.enabled:
+            right_arm.set_enabled(True)
+    if not left_arm.enabled or not right_arm.enabled:
+        raise RuntimeError("HCX 左右臂未使能，请现场使能或开启 hcx.auto_enable")
+    return client, left_arm, right_arm
+
+
+def _positive_finite(name: str, value: object) -> float:
+    if isinstance(value, bool):
+        raise ValueError(f"{name} 必须是正的有限数")
+    try:
+        numeric = float(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{name} 必须是正的有限数") from exc
+    if not math.isfinite(numeric) or numeric <= 0.0:
+        raise ValueError(f"{name} 必须是正的有限数")
+    return numeric
+
+
+def _validate_gloria_dual_config(runtime: Any) -> tuple[bool, bool, float]:
+    cfg = runtime.gloria_m_dual
+    left_enabled = bool(cfg.left.enabled)
+    right_enabled = bool(cfg.right.enabled)
+    rate_hz = _positive_finite("gloria_m_dual.rate_hz", cfg.rate_hz)
+    _ = _positive_finite("gloria_m_dual.status_print_interval_s", cfg.status_print_interval_s)
+    if not (left_enabled or right_enabled):
+        return False, False, rate_hz
+
+    used_ports = {
+        runtime.openarm_mini.port_left: "openarm_mini.port_left",
+        runtime.openarm_mini.port_right: "openarm_mini.port_right",
+    }
+    for side in ("left", "right"):
+        side_cfg = cfg.side_config(side)
+        if not bool(side_cfg.enabled):
+            continue
+        port = side_cfg.port
+        if not isinstance(port, str) or not port.strip():
+            raise ValueError(f"gloria_m_dual.{side}.port 不能为空")
+        if port.lower() == "auto":
+            raise ValueError(f"gloria_m_dual.{side}.port 不能为 auto")
+        if not isinstance(side_cfg.baudrate, int) or isinstance(side_cfg.baudrate, bool) or side_cfg.baudrate <= 0:
+            raise ValueError(f"gloria_m_dual.{side}.baudrate 必须为正整数")
+        duplicate = used_ports.get(port)
+        if duplicate is not None:
+            raise ValueError(f"gloria_m_dual.{side}.port 与 {duplicate} 不能使用同一串口")
+        used_ports[port] = f"gloria_m_dual.{side}.port"
+    return left_enabled, right_enabled, rate_hz
+
+
+def _connect_dual_grippers(teleop_yaml: Path) -> tuple[Any | None, Any | None, float]:
+    runtime = load_runtime_config(teleop_yaml)
+    left_enabled, right_enabled, rate_hz = _validate_gloria_dual_config(runtime)
+    left_cfg = runtime.gloria_m_dual.side_config("left")
+    right_cfg = runtime.gloria_m_dual.side_config("right")
+    left = None
+    right = None
+    if left_enabled:
+        left = GloriaMGripperFollower(left_cfg)
+        left.connect()
+    if right_enabled:
+        right = GloriaMGripperFollower(right_cfg)
+        right.connect()
+    return left, right, rate_hz
+
+
+def _read_hcx_joints(arm, fallback: list[float] | None) -> np.ndarray:
+    if arm is None:
+        if fallback is None:
+            raise RuntimeError("无机械臂且无 fallback 关节角")
+        return np.asarray(fallback, dtype=np.float32)
+    values = np.asarray(arm.joint_angles(), dtype=np.float32)
+    if values.shape == (7,) and np.isfinite(values).all():
+        return values
+    if fallback is not None:
+        return np.asarray(fallback, dtype=np.float32)
+    raise RuntimeError("HCX 关节反馈异常")
+
+
+def _read_gripper(gripper, fallback: float = 1.0) -> float:
+    if gripper is None:
+        return float(fallback)
+    opening = gripper.read_cached_normalized_opening()
+    if opening is None:
+        opening = gripper.read_normalized_opening()
+    if opening is None or not np.isfinite(opening):
+        return float(fallback)
+    return float(np.clip(opening, 0.0, 1.0))
+
+
+def _read_images(
+    camera_manager,
+    camera_names: list[str],
+    *,
+    timeout_s: float = 2.0,
+) -> dict[str, np.ndarray]:
+    if camera_manager is None:
+        raise RuntimeError("相机未连接，无法读取图像")
+    deadline = time.perf_counter() + timeout_s
+    while time.perf_counter() < deadline:
+        images: dict[str, np.ndarray] = {}
+        ready = True
+        for name in camera_names:
+            cam = camera_manager.camera(name)
+            frame = cam.get_frame()
+            if frame is None or frame.rgb is None:
+                ready = False
+                break
+            rgb = np.asarray(frame.rgb)
+            if rgb.dtype != np.uint8:
+                rgb = np.clip(rgb, 0, 255).astype(np.uint8)
+            if rgb.ndim != 3 or rgb.shape[-1] != 3:
+                raise RuntimeError(f"相机 {name} RGB 形状异常: {rgb.shape}")
+            images[name] = np.ascontiguousarray(rgb)
+        if ready and len(images) == len(camera_names):
+            return images
+        time.sleep(0.01)
+    raise TimeoutError(f"等待相机帧超时 ({timeout_s}s): {camera_names}")
+
+
+def _read_observation(hw: HardwareBundle, cameras: list[str], *, last_state: np.ndarray | None) -> Observation:
+    images = _read_images(hw.camera_manager, cameras)
+    left_fb = last_state[:7].tolist() if last_state is not None else hw.left_start_joints_deg
+    right_fb = (
+        last_state[7:14].tolist() if last_state is not None else hw.right_start_joints_deg
+    )
+    left = _read_hcx_joints(hw.left_arm, left_fb)
+    right = _read_hcx_joints(hw.right_arm, right_fb)
+    lg_fb = float(last_state[14]) if last_state is not None else 1.0
+    rg_fb = float(last_state[15]) if last_state is not None else 1.0
+    left_g = _read_gripper(hw.left_gripper, fallback=lg_fb)
+    right_g = _read_gripper(hw.right_gripper, fallback=rg_fb)
+    state = np.concatenate(
+        [
+            left.astype(np.float32),
+            right.astype(np.float32),
+            np.asarray([left_g, right_g], dtype=np.float32),
+        ]
+    )
+    return Observation(images=images, state=state, timestamp=time.time())
+
+
+def _send_action(
+    hw: HardwareBundle,
+    action: np.ndarray,
+    *,
+    speed_ratio: float | None,
+    acceleration_seconds: float | None,
+    deceleration_seconds: float | None,
+    feedback_confirm_timeout_s: float,
+    feedback_confirm_poll_interval_s: float,
+    angle_tolerance_deg: float,
+) -> None:
+    left = action[:7].astype(float).tolist()
+    right = action[7:14].astype(float).tolist()
+    left_g = float(np.clip(action[14], 0.0, 1.0))
+    right_g = float(np.clip(action[15], 0.0, 1.0))
+    print(
+        f"  left={[round(v, 3) for v in left]} right={[round(v, 3) for v in right]} "
+        f"left_gripper={left_g:.4f} right_gripper={right_g:.4f}",
+        flush=True,
+    )
+    if hw.left_arm is None or hw.right_arm is None:
+        raise RuntimeError("HCX 双臂未连接")
+
+    if hw.left_gripper_loop is not None:
+        hw.left_gripper_loop.set_opening(left_g)
+    elif hw.left_gripper is not None:
+        _ = hw.left_gripper.send_normalized(left_g)
+    if hw.right_gripper_loop is not None:
+        hw.right_gripper_loop.set_opening(right_g)
+    elif hw.right_gripper is not None:
+        _ = hw.right_gripper.send_normalized(right_g)
+
+    left_h = hw.left_arm.move_joints(
+        left,
+        interrupt=False,
+        acceleration_seconds=acceleration_seconds,
+        deceleration_seconds=deceleration_seconds,
+        speed_ratio=speed_ratio,
+        smooth=1,
+        wait=False,
+    )
+    right_h = hw.right_arm.move_joints(
+        right,
+        interrupt=False,
+        acceleration_seconds=acceleration_seconds,
+        deceleration_seconds=deceleration_seconds,
+        speed_ratio=speed_ratio,
+        smooth=1,
+        wait=False,
+    )
+    del left_h, right_h
+
+    _confirm_targets_by_feedback(
+        hw,
+        left,
+        right,
+        timeout_s=feedback_confirm_timeout_s,
+        poll_interval_s=feedback_confirm_poll_interval_s,
+        angle_tolerance_deg=angle_tolerance_deg,
+    )
+
+
+def _confirm_targets_by_feedback(
+    hw: HardwareBundle,
+    left_target: list[float],
+    right_target: list[float],
+    *,
+    timeout_s: float,
+    poll_interval_s: float,
+    angle_tolerance_deg: float,
+) -> None:
+    if not math.isfinite(timeout_s) or timeout_s <= 0.0:
+        raise ValueError("move_joints.feedback_confirm_timeout_s 必须是正的有限秒数")
+    if not math.isfinite(poll_interval_s) or poll_interval_s <= 0.0:
+        raise ValueError(
+            "move_joints.feedback_confirm_poll_interval_s 必须是正的有限秒数"
+        )
+    if not math.isfinite(angle_tolerance_deg) or angle_tolerance_deg <= 0.0:
+        raise ValueError("move_joints.angle_tolerance_deg 必须是正的有限数")
+    if hw.left_arm is None or hw.right_arm is None:
+        raise RuntimeError("HCX 双臂未连接，无法确认反馈到位")
+
+    deadline = time.monotonic() + timeout_s
+    left_target_np = np.asarray(left_target, dtype=np.float64)
+    right_target_np = np.asarray(right_target, dtype=np.float64)
+    while True:
+        left_fb = np.asarray(hw.left_arm.joint_angles(), dtype=np.float64)
+        right_fb = np.asarray(hw.right_arm.joint_angles(), dtype=np.float64)
+        left_ok = np.all(np.abs(left_fb - left_target_np) <= angle_tolerance_deg)
+        right_ok = np.all(np.abs(right_fb - right_target_np) <= angle_tolerance_deg)
+        if left_ok and right_ok:
+            return
+        remaining = deadline - time.monotonic()
+        if remaining <= 0.0:
+            raise RuntimeError("move_joints 反馈确认超时：关节未在容差内到位")
+        time.sleep(min(poll_interval_s, remaining))
+
+
+def _shutdown(hw: HardwareBundle) -> None:
+    if hw.left_gripper_loop is not None:
+        try:
+            hw.left_gripper_loop.stop()
+        except Exception as exc:
+            print(f"[WARN] 停止左侧夹爪后台时出错: {exc}")
+    if hw.right_gripper_loop is not None:
+        try:
+            hw.right_gripper_loop.stop()
+        except Exception as exc:
+            print(f"[WARN] 停止右侧夹爪后台时出错: {exc}")
+    if hw.left_gripper is not None:
+        try:
+            hw.left_gripper.disable()
+        except Exception:
+            pass
+        try:
+            hw.left_gripper.disconnect()
+        except Exception as exc:
+            print(f"[WARN] 断开左侧夹爪时出错: {exc}")
+    if hw.right_gripper is not None:
+        try:
+            hw.right_gripper.disable()
+        except Exception:
+            pass
+        try:
+            hw.right_gripper.disconnect()
+        except Exception as exc:
+            print(f"[WARN] 断开右侧夹爪时出错: {exc}")
+    if hw.camera_manager is not None:
+        try:
+            hw.camera_manager.stop()
+        except Exception as exc:
+            print(f"[WARN] 停止相机时出错: {exc}")
+    if hw.hcx_client is not None:
+        try:
+            hw.hcx_client.close()
+        except Exception as exc:
+            print(f"[WARN] 关闭 HCX 客户端时出错: {exc}")
+
+
+def _validate_runtime_contract(cfg: Any, cameras: list[str], stats: dict) -> None:
+    if not cameras:
+        raise ValueError("训练配置 cameras 为空")
+    if int(cfg.state_dim) != 16:
+        raise ValueError(f"当前 HCX 双臂脚本要求 state_dim=16，实际为 {cfg.state_dim}")
+    if int(cfg.action_dim) != 16:
+        raise ValueError(f"当前 HCX 双臂脚本要求 action_dim=16，实际为 {cfg.action_dim}")
+    if int(cfg.dataset.n_obs_steps) <= 0:
+        raise ValueError("dataset.n_obs_steps 必须 > 0")
+    if int(cfg.policy.n_action_steps) <= 0:
+        raise ValueError("policy.n_action_steps 必须 > 0")
+    if "state" not in stats or "action" not in stats:
+        raise ValueError("checkpoint stats 缺少 state/action 归一化信息")
+
+
+def main() -> None:
+    args = _parse_args()
+    deploy_path = Path(args.deploy)
+    if not deploy_path.is_absolute():
+        deploy_path = _resolve_path(deploy_path, base=VA_ROOT)
+    deploy = _load_deploy_config(deploy_path)
+
+    ckpt_path = deploy["checkpoint"]
+    train_cfg_path = deploy["config"]
+    teleop_yaml = deploy["teleop_yaml"]
+    if not ckpt_path.is_file():
+        raise FileNotFoundError(f"找不到 checkpoint: {ckpt_path}")
+    if not train_cfg_path.is_file():
+        raise FileNotFoundError(f"找不到训练配置: {train_cfg_path}")
+    if not teleop_yaml.is_file():
+        raise FileNotFoundError(f"找不到 teleop.yaml: {teleop_yaml}")
+
+    print(f"[INFO] 部署配置: {deploy_path}")
+    print(f"[INFO] 加载 checkpoint: {ckpt_path}")
+    print(f"[INFO] 训练配置: {train_cfg_path}")
+
+    ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+    cfg = load_config(train_cfg_path)
+    stats = ckpt["stats"]
+    cameras = list(cfg.cameras)
+    _validate_runtime_contract(cfg, cameras, stats)
+
+    norm_mode = cfg.dataset.norm_mode
+    n_obs = int(cfg.dataset.n_obs_steps)
+    n_action_steps = int(cfg.policy.n_action_steps)
+    fps = int(cfg.fps)
+    max_steps = deploy["max_steps"]
+
+    device = torch.device(cfg.train.device if torch.cuda.is_available() else "cpu")
+    policy = build_policy(cfg, stats)
+    policy.load_state_dict(ckpt["policy_state_dict"])
+    policy.to(device)
+    policy.eval()
+
+    hw = HardwareBundle(
+        left_start_joints_deg=deploy["left_start_joints_deg"],
+        right_start_joints_deg=deploy["right_start_joints_deg"],
+    )
+    try:
+        hw.hcx_client, hw.left_arm, hw.right_arm = _connect_hcx_arms(teleop_yaml)
+        hw.left_gripper, hw.right_gripper, gripper_rate_hz = _connect_dual_grippers(
+            teleop_yaml
+        )
+        if hw.left_gripper is not None:
+            hold_left = _read_gripper(hw.left_gripper, fallback=1.0)
+            hw.left_gripper_loop = BackgroundGripperLoop(
+                hw.left_gripper, rate_hz=gripper_rate_hz
+            )
+            hw.left_gripper_loop.start(initial_opening=hold_left)
+        if hw.right_gripper is not None:
+            hold_right = _read_gripper(hw.right_gripper, fallback=1.0)
+            hw.right_gripper_loop = BackgroundGripperLoop(
+                hw.right_gripper, rate_hz=gripper_rate_hz
+            )
+            hw.right_gripper_loop.start(initial_opening=hold_right)
+        hw.camera_manager = _connect_cameras(teleop_yaml, cameras)
+
+        if deploy["left_start_joints_deg"] is not None:
+            hw.left_arm.move_joints(
+                deploy["left_start_joints_deg"],
+                interrupt=False,
+                wait=False,
+                speed_ratio=deploy["move_speed_ratio"],
+                acceleration_seconds=deploy["move_acceleration_seconds"],
+                deceleration_seconds=deploy["move_deceleration_seconds"],
+            )
+            _confirm_targets_by_feedback(
+                hw,
+                deploy["left_start_joints_deg"],
+                _read_hcx_joints(hw.right_arm, hw.right_start_joints_deg).astype(float).tolist(),
+                timeout_s=deploy["move_feedback_confirm_timeout_s"],
+                poll_interval_s=deploy["move_feedback_confirm_poll_interval_s"],
+                angle_tolerance_deg=deploy["move_angle_tolerance_deg"],
+            )
+        if deploy["right_start_joints_deg"] is not None:
+            hw.right_arm.move_joints(
+                deploy["right_start_joints_deg"],
+                interrupt=False,
+                wait=False,
+                speed_ratio=deploy["move_speed_ratio"],
+                acceleration_seconds=deploy["move_acceleration_seconds"],
+                deceleration_seconds=deploy["move_deceleration_seconds"],
+            )
+            _confirm_targets_by_feedback(
+                hw,
+                _read_hcx_joints(hw.left_arm, hw.left_start_joints_deg).astype(float).tolist(),
+                deploy["right_start_joints_deg"],
+                timeout_s=deploy["move_feedback_confirm_timeout_s"],
+                poll_interval_s=deploy["move_feedback_confirm_poll_interval_s"],
+                angle_tolerance_deg=deploy["move_angle_tolerance_deg"],
+            )
+
+        obs = _read_observation(hw, cameras, last_state=None)
+        obs.validate(cameras, int(cfg.state_dim))
+        resize_size = cfg.dataset.resize_size
+        crop_size = cfg.dataset.crop_size
+        eval_fixed_crop = bool(cfg.dataset.eval_fixed_crop)
+        obs = _prepare_observation(
+            obs,
+            resize_size=resize_size,
+            crop_size=crop_size,
+            eval_fixed_crop=eval_fixed_crop,
+        )
+        obs_history: list[Observation] = [obs]
+
+        chunk_actions: list[np.ndarray] = []
+        chunk_idx = 0
+        print(f"[INFO] 开始闭环，最多 {max_steps} 步")
+
+        for step_i in range(max_steps):
+            t0 = time.perf_counter()
+            if chunk_idx >= len(chunk_actions):
+                batch = _build_obs_batch(
+                    obs_history,
+                    cameras=cameras,
+                    n_obs_steps=n_obs,
+                    stats=stats,
+                    norm_mode=norm_mode,
+                    device=device,
+                )
+                with torch.no_grad():
+                    pred = policy.sample_actions(batch)[0].cpu()
+                pred_phys = denormalize(
+                    pred, stats, prefix="action", mode=norm_mode
+                ).numpy()
+                chunk_actions = [
+                    np.asarray(a, dtype=np.float32) for a in pred_phys[:n_action_steps]
+                ]
+                chunk_idx = 0
+                print(f"[INFO] step={step_i} 重新规划 chunk={len(chunk_actions)}")
+
+            action = chunk_actions[chunk_idx]
+            chunk_idx += 1
+            print(f"[INFO] step={step_i}", end="")
+            _send_action(
+                hw,
+                action,
+                speed_ratio=deploy["move_speed_ratio"],
+                acceleration_seconds=deploy["move_acceleration_seconds"],
+                deceleration_seconds=deploy["move_deceleration_seconds"],
+                feedback_confirm_timeout_s=deploy["move_feedback_confirm_timeout_s"],
+                feedback_confirm_poll_interval_s=deploy[
+                    "move_feedback_confirm_poll_interval_s"
+                ],
+                angle_tolerance_deg=deploy["move_angle_tolerance_deg"],
+            )
+
+            obs = _prepare_observation(
+                _read_observation(hw, cameras, last_state=obs.state),
+                resize_size=resize_size,
+                crop_size=crop_size,
+                eval_fixed_crop=eval_fixed_crop,
+            )
+            _append_observation(obs_history, obs, n_obs_steps=n_obs)
+            _pace_step(t0, fps)
+    except KeyboardInterrupt:
+        print("\n[INFO] 用户中断")
+    finally:
+        _shutdown(hw)
+
+
+if __name__ == "__main__":
+    main()
