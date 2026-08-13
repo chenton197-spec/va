@@ -125,6 +125,20 @@ def main() -> None:
         default=None,
         help="Output directory (default: <ckpt_dir>/eval_epXXXX)",
     )
+    parser.add_argument(
+        "--exec-steps",
+        type=int,
+        default=None,
+        help="Only execute the first N steps of each predicted chunk before replanning "
+        "(default: policy.n_action_steps). Model still predicts full n_action_steps.",
+    )
+    parser.add_argument(
+        "--num-inference-steps",
+        type=int,
+        default=None,
+        help="Override flow-matching Euler steps at inference "
+        "(default: policy.num_inference_steps).",
+    )
     args = parser.parse_args()
 
     base_dir = Path(__file__).resolve().parents[1]
@@ -150,6 +164,20 @@ def main() -> None:
     n_obs = cfg.dataset.n_obs_steps
     horizon = cfg.dataset.horizon
     n_action_steps = int(cfg.policy.n_action_steps)
+    exec_steps = int(args.exec_steps) if args.exec_steps is not None else n_action_steps
+    if exec_steps <= 0:
+        raise ValueError(f"--exec-steps must be > 0, got {exec_steps}")
+    if exec_steps > n_action_steps:
+        raise ValueError(
+            f"--exec-steps ({exec_steps}) cannot exceed policy.n_action_steps ({n_action_steps})"
+        )
+    if args.num_inference_steps is not None:
+        if int(args.num_inference_steps) <= 0:
+            raise ValueError(
+                f"--num-inference-steps must be > 0, got {args.num_inference_steps}"
+            )
+        cfg.policy.num_inference_steps = int(args.num_inference_steps)
+    num_inference_steps = int(cfg.policy.num_inference_steps)
     action_names = _action_names_from_cfg(cfg)
     cameras = list(cfg.cameras)
 
@@ -188,7 +216,8 @@ def main() -> None:
     print(f"episode: {args.episode} length={length}")
     print(
         f"norm_mode={norm_mode} n_obs={n_obs} horizon={horizon} "
-        f"n_action_steps={n_action_steps} num_inference_steps={cfg.policy.num_inference_steps}"
+        f"n_action_steps={n_action_steps} exec_steps={exec_steps} "
+        f"num_inference_steps={num_inference_steps}"
     )
     print(
         f"resize={cfg.dataset.resize_size} crop={cfg.dataset.crop_size} "
@@ -217,7 +246,7 @@ def main() -> None:
             pred_norm = policy.sample_actions(batch)[0].cpu()
         pred_phys = denormalize(pred_norm, stats, prefix="action", mode=norm_mode).numpy()
 
-        take = min(n_action_steps, length - t, pred_phys.shape[0])
+        take = min(exec_steps, length - t, pred_phys.shape[0])
         pred_actions[t : t + take] = pred_phys[:take]
         replan_ts.append(t)
         t += take
@@ -251,7 +280,8 @@ def main() -> None:
         "n_obs_steps": n_obs,
         "horizon": horizon,
         "n_action_steps": n_action_steps,
-        "num_inference_steps": int(cfg.policy.num_inference_steps),
+        "exec_steps": exec_steps,
+        "num_inference_steps": num_inference_steps,
         "resize_size": cfg.dataset.resize_size,
         "crop_size": cfg.dataset.crop_size,
         "run_name": cfg.dataset.run_name,
@@ -293,6 +323,7 @@ def main() -> None:
         ax.set_xlabel("frame")
     fig.suptitle(
         f"Episode {args.episode} open-loop  |  {ckpt_path.name}  |  "
+        f"fm={num_inference_steps} exec={exec_steps}/{n_action_steps}  |  "
         f"MAE joints={metrics['mae_joints']:.4f} gripper={metrics['mae_gripper']:.4f}",
         fontsize=12,
     )
