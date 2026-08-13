@@ -427,6 +427,7 @@ def train_flow_matching(
             normalize=True,
             norm_mode=cfg.dataset.norm_mode,
             resize_size=cfg.dataset.resize_size,
+            pre_crop_size=cfg.dataset.pre_crop_size,
             crop_size=cfg.dataset.crop_size,
             random_crop=True,
             color_jitter_brightness=cfg.dataset.color_jitter_brightness,

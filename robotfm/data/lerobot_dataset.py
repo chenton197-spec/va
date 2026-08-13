@@ -156,16 +156,36 @@ def build_episode_meta_from_info(
     )
 
 
-def _load_image_rgb(path: Path, resize_size: int | None = None) -> np.ndarray:
-    """Decode JPEG via OpenCV (faster than PIL); optionally resize in uint8.
+def _center_crop_hwc(img: np.ndarray, crop_size: int) -> np.ndarray:
+    """Center-crop HWC array to ``crop_size×crop_size``."""
+    h, w = img.shape[:2]
+    if h == crop_size and w == crop_size:
+        return img
+    if h < crop_size or w < crop_size:
+        raise ValueError(f"Cannot crop {h}x{w} to {crop_size}")
+    top = (h - crop_size) // 2
+    left = (w - crop_size) // 2
+    return img[top : top + crop_size, left : left + crop_size]
 
-    When ``resize_size`` is set, try half-resolution JPEG decode first
-    (``IMREAD_REDUCED_COLOR_2``), then ``cv2.resize`` to target. This avoids
+
+def _load_image_rgb(
+    path: Path,
+    resize_size: int | None = None,
+    pre_crop_size: int | None = None,
+) -> np.ndarray:
+    """Decode JPEG via OpenCV (faster than PIL); optional center pre-crop then resize.
+
+    When only ``resize_size`` is set (no pre-crop), try half-resolution JPEG decode
+    first (``IMREAD_REDUCED_COLOR_2``), then ``cv2.resize`` to target. This avoids
     bilinear interpolate on full 1280x720 float tensors (dual-cam n_obs hot path).
+
+    With ``pre_crop_size`` (e.g. 720 on 1280×720), always decode full-res so the
+    square crop is exact, then resize to ``resize_size``.
     """
     path_str = str(path)
     bgr = None
-    if resize_size is not None:
+    # Half-res decode only when we are not center-cropping first (half of 720 < 720).
+    if resize_size is not None and pre_crop_size is None:
         half = cv2.imread(path_str, cv2.IMREAD_REDUCED_COLOR_2)
         if half is not None and min(half.shape[:2]) >= resize_size:
             bgr = half
@@ -173,6 +193,8 @@ def _load_image_rgb(path: Path, resize_size: int | None = None) -> np.ndarray:
         bgr = cv2.imread(path_str, cv2.IMREAD_COLOR)
     if bgr is None:
         raise FileNotFoundError(f"Failed to read image: {path}")
+    if pre_crop_size is not None:
+        bgr = _center_crop_hwc(bgr, pre_crop_size)
     if resize_size is not None:
         h, w = bgr.shape[:2]
         if h != resize_size or w != resize_size:
@@ -268,6 +290,7 @@ class LeRobotImageSequenceDataset(Dataset):
         stats: dict[str, np.ndarray] | None = None,
         normalize: bool = True,
         norm_mode: str = "gaussian",
+        pre_crop_size: int | None = None,
         resize_size: int | None = None,
         crop_size: int | None = 84,
         random_crop: bool = True,
@@ -304,6 +327,7 @@ class LeRobotImageSequenceDataset(Dataset):
                     "delete stats.json and recompute, or call ensure_stats(..., "
                     f"{self.norm_mode!r})"
                 )
+        self.pre_crop_size = pre_crop_size
         self.resize_size = resize_size
         self.crop_size = crop_size
         self.random_crop = random_crop
@@ -380,6 +404,7 @@ class LeRobotImageSequenceDataset(Dataset):
             cache_path = resolve_cache_dir(
                 self.run_dir,
                 resize_size=self.resize_size,
+                pre_crop_size=self.pre_crop_size,
                 cache_dir=uint8_cache_dir,
             )
             if not (cache_path / "meta.json").is_file():
@@ -387,6 +412,11 @@ class LeRobotImageSequenceDataset(Dataset):
                     f"uint8_cache enabled but missing {cache_path / 'meta.json'}. "
                     "Build it with: python scripts/build_uint8_image_cache.py "
                     f"--run-dir {self.run_dir} --resize-size {self.resize_size}"
+                    + (
+                        f" --pre-crop-size {self.pre_crop_size}"
+                        if self.pre_crop_size is not None
+                        else ""
+                    )
                 )
             self._image_cache = Uint8ImageCache(cache_path)
             if self._image_cache.cameras != list(self.meta.camera_names):
@@ -409,6 +439,14 @@ class LeRobotImageSequenceDataset(Dataset):
                     f"cache HxW={self._image_cache.height}x{self._image_cache.width} "
                     f"!= resize_size={self.resize_size}"
                 )
+            cached_pre = self._image_cache.meta.get("pre_crop_size")
+            if cached_pre != self.pre_crop_size and (
+                cached_pre is not None or self.pre_crop_size is not None
+            ):
+                raise ValueError(
+                    f"cache pre_crop_size={cached_pre} != "
+                    f"dataset pre_crop_size={self.pre_crop_size}; rebuild cache"
+                )
 
     def __len__(self) -> int:
         return len(self.index)
@@ -430,7 +468,13 @@ class LeRobotImageSequenceDataset(Dataset):
         frames = []
         for fi in frame_indices:
             img_path = self.run_dir / paths[fi]
-            frames.append(_load_image_rgb(img_path, resize_size=self.resize_size))
+            frames.append(
+                _load_image_rgb(
+                    img_path,
+                    resize_size=self.resize_size,
+                    pre_crop_size=self.pre_crop_size,
+                )
+            )
         return np.stack(frames, axis=0)
 
     def __getitem__(self, idx: int) -> dict[str, torch.Tensor]:

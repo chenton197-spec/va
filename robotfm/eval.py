@@ -26,7 +26,7 @@ import torch
 
 from robotfm.config import RobotFMConfig, _normalize_rtc_config, resolve_path
 from robotfm.collect.loop import get_run_dir
-from robotfm.data.dataset import crop_images, resize_images
+from robotfm.data.dataset import spatial_preprocess_images
 from robotfm.data.stats import denormalize, ensure_stats, normalize
 from robotfm.envs.registry import make_env
 from robotfm.policies.rtc import ActionQueue
@@ -91,10 +91,13 @@ def _build_obs_batch(
     ]
 
     obs_images = torch.stack(camera_histories, dim=0)
-    obs_images = resize_images(obs_images, cfg.dataset.resize_size)
-    crop_size = cfg.dataset.crop_size
-    if crop_size is not None and cfg.dataset.eval_fixed_crop:
-        obs_images = crop_images(obs_images, crop_size, random=False)
+    obs_images = spatial_preprocess_images(
+        obs_images,
+        pre_crop_size=cfg.dataset.pre_crop_size,
+        resize_size=cfg.dataset.resize_size,
+        crop_size=cfg.dataset.crop_size if cfg.dataset.eval_fixed_crop else None,
+        random_crop=False,
+    )
 
     obs_images = obs_images.unsqueeze(0).to(device)
     obs_state = torch.stack(states, dim=0).unsqueeze(0).to(device)

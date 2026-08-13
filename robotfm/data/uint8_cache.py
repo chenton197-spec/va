@@ -1,8 +1,9 @@
 """Disk-backed uint8 RGB image cache for LeRobot image-sequence datasets.
 
-Layout under ``{run_dir}/cache/uint8_rgb_{H}x{W}/``::
+Layout under ``{run_dir}/cache/uint8_rgb_{H}x{W}/``
+(or ``..._pc{pre_crop}/`` when pre-crop is used)::
 
-    meta.json          cameras, episode offsets, shape
+    meta.json          cameras, episode offsets, shape, pre_crop_size
     {camera}.dat       memmap (total_frames, H, W, 3) uint8 RGB
 
 Build once with ``scripts/build_uint8_image_cache.py``, then train with
@@ -24,17 +25,27 @@ CACHE_VERSION = 1
 CACHE_DIR_PREFIX = "uint8_rgb_"
 
 
-def cache_dir_for(run_dir: Path, height: int, width: int) -> Path:
-    return Path(run_dir) / "cache" / f"{CACHE_DIR_PREFIX}{height}x{width}"
+def cache_dir_for(
+    run_dir: Path,
+    height: int,
+    width: int,
+    *,
+    pre_crop_size: int | None = None,
+) -> Path:
+    name = f"{CACHE_DIR_PREFIX}{height}x{width}"
+    if pre_crop_size is not None:
+        name = f"{name}_pc{int(pre_crop_size)}"
+    return Path(run_dir) / "cache" / name
 
 
 def resolve_cache_dir(
     run_dir: Path,
     *,
     resize_size: int | None,
+    pre_crop_size: int | None = None,
     cache_dir: str | Path | None = None,
 ) -> Path:
-    """Resolve cache directory; prefer explicit path, else ``cache/uint8_rgb_{H}x{W}``."""
+    """Resolve cache directory; prefer explicit path, else ``cache/uint8_rgb_{H}x{W}[_pcN]``."""
     if cache_dir is not None:
         return Path(cache_dir)
     if resize_size is None:
@@ -42,13 +53,30 @@ def resolve_cache_dir(
             "uint8 cache requires resize_size (or an explicit cache_dir) "
             "so the on-disk resolution is known"
         )
-    return cache_dir_for(run_dir, resize_size, resize_size)
+    return cache_dir_for(
+        run_dir, resize_size, resize_size, pre_crop_size=pre_crop_size
+    )
 
 
-def _load_image_rgb(path: Path, resize_size: int | None) -> np.ndarray:
+def _center_crop_hwc(img: np.ndarray, crop_size: int) -> np.ndarray:
+    h, w = img.shape[:2]
+    if h == crop_size and w == crop_size:
+        return img
+    if h < crop_size or w < crop_size:
+        raise ValueError(f"Cannot crop {h}x{w} to {crop_size}")
+    top = (h - crop_size) // 2
+    left = (w - crop_size) // 2
+    return img[top : top + crop_size, left : left + crop_size]
+
+
+def _load_image_rgb(
+    path: Path,
+    resize_size: int | None,
+    pre_crop_size: int | None = None,
+) -> np.ndarray:
     path_str = str(path)
     bgr = None
-    if resize_size is not None:
+    if resize_size is not None and pre_crop_size is None:
         half = cv2.imread(path_str, cv2.IMREAD_REDUCED_COLOR_2)
         if half is not None and min(half.shape[:2]) >= resize_size:
             bgr = half
@@ -56,6 +84,8 @@ def _load_image_rgb(path: Path, resize_size: int | None) -> np.ndarray:
         bgr = cv2.imread(path_str, cv2.IMREAD_COLOR)
     if bgr is None:
         raise FileNotFoundError(f"Failed to read image: {path}")
+    if pre_crop_size is not None:
+        bgr = _center_crop_hwc(bgr, pre_crop_size)
     if resize_size is not None:
         h, w = bgr.shape[:2]
         if h != resize_size or w != resize_size:
@@ -66,11 +96,11 @@ def _load_image_rgb(path: Path, resize_size: int | None) -> np.ndarray:
 
 
 def _decode_job(
-    args: tuple[str, str, int, int],
+    args: tuple[str, str, int, int, int | None],
 ) -> tuple[str, int, np.ndarray]:
-    """Worker: (cam, path, flat_index, resize) → (cam, flat_index, RGB)."""
-    cam, path_str, flat_index, resize_size = args
-    rgb = _load_image_rgb(Path(path_str), resize_size)
+    """Worker: (cam, path, flat_index, resize, pre_crop) → (cam, flat_index, RGB)."""
+    cam, path_str, flat_index, resize_size, pre_crop_size = args
+    rgb = _load_image_rgb(Path(path_str), resize_size, pre_crop_size=pre_crop_size)
     if rgb.shape[0] != resize_size or rgb.shape[1] != resize_size:
         raise ValueError(
             f"decoded shape {rgb.shape} != ({resize_size},{resize_size},3) for {path_str}"
@@ -141,6 +171,7 @@ def build_uint8_image_cache(
     run_dir: Path,
     *,
     resize_size: int,
+    pre_crop_size: int | None = None,
     output_dir: Path | None = None,
     num_workers: int = 8,
     overwrite: bool = False,
@@ -173,7 +204,9 @@ def build_uint8_image_cache(
     out_dir = (
         Path(output_dir)
         if output_dir is not None
-        else cache_dir_for(run_dir, resize_size, resize_size)
+        else cache_dir_for(
+            run_dir, resize_size, resize_size, pre_crop_size=pre_crop_size
+        )
     )
     out_dir.mkdir(parents=True, exist_ok=True)
     meta_path = out_dir / "meta.json"
@@ -188,7 +221,7 @@ def build_uint8_image_cache(
     episode_ids = list_episode_indices(run_dir, info)
     episode_offsets: list[int] = []
     episode_lengths: list[int] = []
-    decode_args: list[tuple[str, str, int, int]] = []
+    decode_args: list[tuple[str, str, int, int, int | None]] = []
     cursor = 0
 
     print(f"indexing episodes under {run_dir} ...")
@@ -204,7 +237,7 @@ def build_uint8_image_cache(
             for cam in cameras:
                 rel = payload["image_paths"][cam][t]
                 decode_args.append(
-                    (cam, str(run_dir / rel), flat, resize_size)
+                    (cam, str(run_dir / rel), flat, resize_size, pre_crop_size)
                 )
         cursor += length
 
@@ -212,7 +245,7 @@ def build_uint8_image_cache(
     gib = total_frames * resize_size * resize_size * 3 * len(cameras) / (1024**3)
     print(
         f"building cache: episodes={len(episode_ids)} frames={total_frames} "
-        f"cams={len(cameras)} → {gib:.2f} GiB at {out_dir}"
+        f"cams={len(cameras)} pre_crop={pre_crop_size} → {gib:.2f} GiB at {out_dir}"
     )
 
     maps: dict[str, np.memmap] = {}
@@ -255,6 +288,7 @@ def build_uint8_image_cache(
         "dtype": "uint8",
         "layout": "NHWC",
         "resize_size": resize_size,
+        "pre_crop_size": pre_crop_size,
         "source_run_dir": str(run_dir.resolve()),
         "episode_ids": episode_ids,
         "episode_offsets": episode_offsets,

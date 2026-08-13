@@ -8,6 +8,13 @@ Example::
         --run-dir /home/casbot/ct/data/shine_shoes_fr3_s256_prefix_speedup \\
         --resize-size 256 \\
         --num-workers 8
+
+    # 1280×720 → center 720² → 512²
+    python scripts/build_uint8_image_cache.py \\
+        --run-dir data/openarm_hcx_dual_arm \\
+        --pre-crop-size 720 \\
+        --resize-size 512 \\
+        --num-workers 8
 """
 
 from __future__ import annotations
@@ -33,10 +40,16 @@ def main() -> None:
     )
     p.add_argument("--resize-size", type=int, default=256)
     p.add_argument(
+        "--pre-crop-size",
+        type=int,
+        default=None,
+        help="Center-crop to this square size before resize (e.g. 720 for 1280x720)",
+    )
+    p.add_argument(
         "--output-dir",
         type=Path,
         default=None,
-        help="Default: {run_dir}/cache/uint8_rgb_{H}x{W}",
+        help="Default: {run_dir}/cache/uint8_rgb_{H}x{W}[_pcN]",
     )
     p.add_argument("--num-workers", type=int, default=8)
     p.add_argument("--overwrite", action="store_true")
@@ -45,6 +58,7 @@ def main() -> None:
     out = build_uint8_image_cache(
         args.run_dir,
         resize_size=args.resize_size,
+        pre_crop_size=args.pre_crop_size,
         output_dir=args.output_dir,
         num_workers=args.num_workers,
         overwrite=args.overwrite,

@@ -57,6 +57,27 @@ def resize_images(images: torch.Tensor, size: int | None) -> torch.Tensor:
     return flat.reshape(*lead, c, size, size)
 
 
+def spatial_preprocess_images(
+    images: torch.Tensor,
+    *,
+    pre_crop_size: int | None = None,
+    resize_size: int | None = None,
+    crop_size: int | None = None,
+    random_crop: bool = False,
+) -> torch.Tensor:
+    """统一空间预处理：中心 pre_crop → resize → 可选 crop。
+
+    ``pre_crop_size`` 始终中心裁（保比例方裁，如 1280×720 → 720×720）。
+    ``crop_size`` 在 resize 之后；``random_crop=True`` 时随机裁，否则中心裁。
+    """
+    if pre_crop_size is not None:
+        images = crop_images(images, pre_crop_size, random=False)
+    images = resize_images(images, resize_size)
+    if crop_size is not None:
+        images = crop_images(images, crop_size, random=random_crop)
+    return images
+
+
 def crop_images(images: torch.Tensor, crop_size: int | None, random: bool) -> torch.Tensor:
     """对 CHW 图像张量做空间裁剪。
 
@@ -323,6 +344,7 @@ class EpisodeDataset(Dataset):
         stats: dict[str, np.ndarray] | None = None,
         normalize: bool = True,
         norm_mode: str = "gaussian",
+        pre_crop_size: int | None = None,
         resize_size: int | None = None,
         crop_size: int | None = 84,
         random_crop: bool = True,
@@ -353,6 +375,7 @@ class EpisodeDataset(Dataset):
                     "delete stats.json and recompute, or call ensure_stats(..., "
                     f"{self.norm_mode!r})"
                 )
+        self.pre_crop_size = pre_crop_size
         self.resize_size = resize_size
         self.crop_size = crop_size
         self.random_crop = random_crop
@@ -443,11 +466,23 @@ class EpisodeDataset(Dataset):
             images.append(torch.from_numpy(cam_frames))
 
         obs_images = torch.stack(images, dim=0)  # (Cams, T_obs, 3, H, W)
-        # 可选：先放大再裁（SlowFast 常用 resize→crop）
-        obs_images = resize_images(obs_images, self.resize_size)
-        if not self.defer_augment:
-            # 训练时 random_crop=True：随机裁到 crop_size×crop_size
-            obs_images = crop_images(obs_images, self.crop_size, random=self.random_crop)
+        # pre_crop（中心）→ resize；post-crop / color_jitter 可 defer 到 GPU
+        if self.defer_augment:
+            obs_images = spatial_preprocess_images(
+                obs_images,
+                pre_crop_size=self.pre_crop_size,
+                resize_size=self.resize_size,
+                crop_size=None,
+                random_crop=False,
+            )
+        else:
+            obs_images = spatial_preprocess_images(
+                obs_images,
+                pre_crop_size=self.pre_crop_size,
+                resize_size=self.resize_size,
+                crop_size=self.crop_size,
+                random_crop=self.random_crop,
+            )
             if self.random_crop:
                 obs_images = color_jitter_images(
                     obs_images,

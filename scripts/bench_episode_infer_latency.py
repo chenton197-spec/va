@@ -27,7 +27,7 @@ import torch
 
 from robotfm.collect.loop import get_run_dir
 from robotfm.config import load_config
-from robotfm.data.dataset import crop_images, resize_images
+from robotfm.data.dataset import spatial_preprocess_images
 from robotfm.data.lerobot_dataset import (
     _load_image_rgb,
     _short_camera_name,
@@ -84,6 +84,7 @@ def _build_obs_batch(
     cameras: list[str],
     t: int,
     n_obs_steps: int,
+    pre_crop_size: int | None,
     resize_size: int | None,
     crop_size: int | None,
     stats: dict,
@@ -105,9 +106,13 @@ def _build_obs_batch(
         camera_histories.append(torch.stack(frames, dim=0))
 
     obs_images = torch.stack(camera_histories, dim=0)
-    obs_images = resize_images(obs_images, resize_size)
-    if crop_size is not None:
-        obs_images = crop_images(obs_images, crop_size, random=False)
+    obs_images = spatial_preprocess_images(
+        obs_images,
+        pre_crop_size=pre_crop_size,
+        resize_size=resize_size,
+        crop_size=crop_size,
+        random_crop=False,
+    )
 
     state = normalize(states[obs_indices].astype(np.float32), stats, prefix="state", mode=norm_mode)
     return {
@@ -349,6 +354,7 @@ def main() -> None:
                 cameras=cameras,
                 t=t,
                 n_obs_steps=n_obs,
+                pre_crop_size=cfg.dataset.pre_crop_size,
                 resize_size=cfg.dataset.resize_size,
                 crop_size=cfg.dataset.crop_size,
                 stats=stats,

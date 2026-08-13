@@ -52,8 +52,11 @@ class DatasetConfig:
     n_obs_steps: int = 2    # 策略输入的历史观测帧数
     horizon: int = 16       # 每次预测的未来动作步数（action chunk 长度）
     run_name: str = "pusht_demos"  # 数据子目录名，完整路径 = data_root / run_name
-    resize_size: int | None = None  # 裁剪前先双线性缩放到该边长；None 表示不缩放
-    crop_size: int | None = 84  # 图像裁剪边长；None 表示不裁剪
+    # 空间预处理顺序：可选 pre_crop（中心方裁）→ resize → 可选 crop（训练 random / 评估中心）
+    # 例 1280×720：pre_crop_size=720, resize_size=512 → 先中心 720² 再缩到 512²（保比例）
+    pre_crop_size: int | None = None  # 缩放前中心裁成该边长；None 表示不预裁
+    resize_size: int | None = None  # 双线性缩放到该边长；None 表示不缩放
+    crop_size: int | None = 84  # resize 后再裁边长；None 表示不裁剪
     eval_fixed_crop: bool = True  # 评估时用中心裁剪（训练用 random crop）
     # 训练光度增强（评估不加）。0 表示关闭该项。同一条样本对所有相机/历史帧共用一组随机因子。
     color_jitter_brightness: float = 0.0

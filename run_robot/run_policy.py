@@ -54,7 +54,7 @@ if str(VA_ROOT) not in sys.path:
     sys.path.insert(0, str(VA_ROOT))
 
 from robotfm.config import load_config  # noqa: E402
-from robotfm.data.dataset import crop_images, resize_images  # noqa: E402
+from robotfm.data.dataset import spatial_preprocess_images  # noqa: E402
 from robotfm.data.stats import denormalize, normalize  # noqa: E402
 from robotfm.train import build_policy  # noqa: E402
 from robotfm.types import Observation  # noqa: E402
@@ -247,13 +247,14 @@ def _pace_step(step_start: float, fps: int) -> None:
 def _preprocess_images(
     images: dict[str, np.ndarray],
     *,
+    pre_crop_size: int | None,
     resize_size: int | None,
     crop_size: int | None,
     eval_fixed_crop: bool,
 ) -> dict[str, np.ndarray]:
-    """相机原图 HWC uint8 → 策略分辨率 HWC float32 [0,1]（resize + 可选中心 crop）。
+    """相机原图 HWC uint8 → 策略分辨率 HWC float32 [0,1]。
 
-    入队时做一次，避免每次推理对整段历史重复预处理。
+    顺序：中心 pre_crop → resize → 可选中心 crop。入队时做一次。
     """
     out: dict[str, np.ndarray] = {}
     for name, rgb in images.items():
@@ -261,9 +262,13 @@ def _preprocess_images(
         if arr.dtype != np.uint8:
             arr = np.clip(arr, 0, 255).astype(np.uint8)
         t = torch.from_numpy(arr.astype(np.float32) / 255.0).permute(2, 0, 1).unsqueeze(0)
-        t = resize_images(t, resize_size)
-        if crop_size is not None and eval_fixed_crop:
-            t = crop_images(t, crop_size, random=False)
+        t = spatial_preprocess_images(
+            t,
+            pre_crop_size=pre_crop_size,
+            resize_size=resize_size,
+            crop_size=crop_size if eval_fixed_crop else None,
+            random_crop=False,
+        )
         out[name] = t.squeeze(0).permute(1, 2, 0).contiguous().numpy()
     return out
 
@@ -271,14 +276,16 @@ def _preprocess_images(
 def _prepare_observation(
     obs: Observation,
     *,
+    pre_crop_size: int | None,
     resize_size: int | None,
     crop_size: int | None,
     eval_fixed_crop: bool,
 ) -> Observation:
-    """替换图像为入队即用的 resize/crop 结果；state 原样保留。"""
+    """替换图像为入队即用的 pre_crop/resize/crop 结果；state 原样保留。"""
     return Observation(
         images=_preprocess_images(
             obs.images,
+            pre_crop_size=pre_crop_size,
             resize_size=resize_size,
             crop_size=crop_size,
             eval_fixed_crop=eval_fixed_crop,
@@ -759,8 +766,8 @@ def main() -> None:
         f"n_action_steps={n_action_steps} num_inference_steps={cfg.policy.num_inference_steps}"
     )
     print(
-        f"[INFO] resize={cfg.dataset.resize_size} crop={cfg.dataset.crop_size} "
-        f"eval_fixed_crop={cfg.dataset.eval_fixed_crop} fps={fps}"
+        f"[INFO] pre_crop={cfg.dataset.pre_crop_size} resize={cfg.dataset.resize_size} "
+        f"crop={cfg.dataset.crop_size} eval_fixed_crop={cfg.dataset.eval_fixed_crop} fps={fps}"
     )
     print(f"[INFO] action_names={list(cfg.action_names)}")
 
@@ -800,19 +807,22 @@ def main() -> None:
 
         obs = _read_observation(hw, cameras, last_state=None)
         obs.validate(cameras, int(cfg.state_dim))
+        pre_crop_size = cfg.dataset.pre_crop_size
         resize_size = cfg.dataset.resize_size
         crop_size = cfg.dataset.crop_size
         eval_fixed_crop = bool(cfg.dataset.eval_fixed_crop)
         obs = _prepare_observation(
             obs,
+            pre_crop_size=pre_crop_size,
             resize_size=resize_size,
             crop_size=crop_size,
             eval_fixed_crop=eval_fixed_crop,
         )
         obs_history: list[Observation] = [obs]
         print(
-            f"[INFO] 观测入队即 resize/crop "
-            f"(resize={resize_size} crop={crop_size} fixed={eval_fixed_crop})"
+            f"[INFO] 观测入队即 pre_crop/resize/crop "
+            f"(pre_crop={pre_crop_size} resize={resize_size} crop={crop_size} "
+            f"fixed={eval_fixed_crop})"
         )
 
         # action chunking：执行 n_action_steps 步后再 replan（与 eval.py 一致）
@@ -850,6 +860,7 @@ def main() -> None:
 
             obs = _prepare_observation(
                 _read_observation(hw, cameras, last_state=obs.state),
+                pre_crop_size=pre_crop_size,
                 resize_size=resize_size,
                 crop_size=crop_size,
                 eval_fixed_crop=eval_fixed_crop,

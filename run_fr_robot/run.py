@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """FR3 + Gloria-M + Orbbec 上的策略闭环部署。
 
-训练相关配置优先来自训练 YAML（``deploy.yaml`` 的 ``config`` 或
-``--config``），否则回退到 checkpoint 内嵌 config（相机、维度、
-norm_mode、resize/crop、n_obs_steps、n_action_steps、fps 等）。
+训练相关配置优先来自训练 YAML（``deploy.yaml`` 的 ``config``），
+否则回退到 checkpoint 内嵌 config（相机、维度、norm_mode、
+resize/crop、n_obs_steps、n_action_steps、fps 等）。
 权重与 stats 仍从 checkpoint 加载。机械臂走与
 ``ct/scripts/move_to_start_pose.py`` 相同的 FAIRINO SDK：
 
@@ -21,19 +21,11 @@ norm_mode、resize/crop、n_obs_steps、n_action_steps、fps 等）。
 
 用法（在 ``ct/va`` 下，conda 环境 ``lerobot``）::
 
-    # 部署 + 训练配置见同目录 deploy.yaml
-    PYTHONPATH=. python run_robot/run_policy.py
+    # 默认读取同目录 deploy.yaml
+    PYTHONPATH=. python run_fr_robot/run.py
 
-    # CLI 覆盖训练配置 / checkpoint
-    PYTHONPATH=. python run_robot/run_policy.py \\
-        --config configs/shine_shoes_a2a_noise_limits.yaml \\
-        --checkpoint model/a2a_noise_shine_shoes_limits_260730175409/checkpoint_090000.pt
-
-    # 启用 RTC（也可在训练 YAML policy.rtc.enabled / deploy.yaml rtc 段开启）
-    PYTHONPATH=. python run_fr_robot/run.py --rtc --inference-delay 2 --execution-horizon 4
-
-    # 可选：torch.compile encoder + denoiser（也可在 deploy.yaml 设 compile: true）
-    PYTHONPATH=. python run_fr_robot/run.py --compile
+    # 指定部署 YAML（checkpoint / config / RTC / compile 等均在 YAML 内配置）
+    PYTHONPATH=. python run_fr_robot/run.py --deploy run_fr_robot/a2a_noise_gaussian_2std_080518.yaml
 """
 
 from __future__ import annotations
@@ -67,7 +59,7 @@ if str(VA_ROOT) not in sys.path:
     sys.path.insert(0, str(VA_ROOT))
 
 from robotfm.config import _normalize_rtc_config, load_config  # noqa: E402
-from robotfm.data.dataset import crop_images, resize_images  # noqa: E402
+from robotfm.data.dataset import spatial_preprocess_images  # noqa: E402
 from robotfm.data.stats import denormalize, normalize  # noqa: E402
 from robotfm.policies.rtc import ActionQueue, RTCConfig  # noqa: E402
 from robotfm.train import build_policy  # noqa: E402
@@ -197,8 +189,8 @@ def _load_deploy_config(path: Path) -> dict[str, Any]:
     }
 
 
-def _apply_rtc_overrides(cfg: Any, deploy_rtc: dict[str, Any], args: argparse.Namespace) -> None:
-    """按 CLI > deploy.yaml rtc > 训练 YAML 优先级覆盖 policy.rtc。"""
+def _apply_rtc_overrides(cfg: Any, deploy_rtc: dict[str, Any]) -> None:
+    """按 deploy.yaml rtc > 训练 YAML 优先级覆盖 policy.rtc。"""
     rtc = _normalize_rtc_config(cfg.policy.rtc)
     enabled = rtc.enabled
     guidance_enabled = rtc.guidance_enabled
@@ -214,21 +206,8 @@ def _apply_rtc_overrides(cfg: Any, deploy_rtc: dict[str, Any], args: argparse.Na
     if "execution_horizon" in deploy_rtc:
         execution_horizon = int(deploy_rtc["execution_horizon"])
 
-    if args.rtc:
-        enabled = True
-    if getattr(args, "no_guidance", False):
-        guidance_enabled = False
-    if args.inference_delay is not None:
-        inference_delay = int(args.inference_delay)
-    if args.execution_horizon is not None:
-        execution_horizon = int(args.execution_horizon)
-
     need_rebuild = (
-        args.rtc
-        or getattr(args, "no_guidance", False)
-        or args.inference_delay is not None
-        or args.execution_horizon is not None
-        or bool(deploy_rtc)
+        bool(deploy_rtc)
         or enabled != rtc.enabled
         or guidance_enabled != rtc.guidance_enabled
         or inference_delay != rtc.inference_delay
@@ -250,10 +229,8 @@ def _apply_rtc_overrides(cfg: Any, deploy_rtc: dict[str, Any], args: argparse.Na
     cfg.policy.rtc = _normalize_rtc_config(cfg.policy.rtc)
 
 
-def _resolve_compile_enabled(deploy: dict[str, Any], args: argparse.Namespace) -> bool:
-    """CLI --compile overrides deploy.yaml ``compile`` (default False)."""
-    if args.compile:
-        return True
+def _resolve_compile_enabled(deploy: dict[str, Any]) -> bool:
+    """Read ``compile`` from deploy.yaml (default False)."""
     return bool(deploy.get("compile", False))
 
 
@@ -306,46 +283,7 @@ def _parse_args() -> argparse.Namespace:
         "--deploy",
         type=str,
         default=str(DEPLOY_YAML),
-        help="部署 YAML（默认 run_robot/deploy.yaml）",
-    )
-    parser.add_argument(
-        "--config",
-        type=str,
-        default=None,
-        help="训练配置 YAML（覆盖 deploy.yaml 的 config；相对路径相对于 ct/va）",
-    )
-    parser.add_argument(
-        "--checkpoint",
-        type=str,
-        default=None,
-        help="checkpoint 路径（覆盖 deploy.yaml；相对路径相对于 ct/va）",
-    )
-    parser.add_argument(
-        "--rtc",
-        action="store_true",
-        help="启用 RTC（覆盖训练 YAML / deploy.yaml；对齐 eval_flow_matching.py）",
-    )
-    parser.add_argument(
-        "--no-guidance",
-        action="store_true",
-        help="RTC 调度保留（ahead+discard），关闭采样前缀引导（naive async）",
-    )
-    parser.add_argument(
-        "--inference-delay",
-        type=int,
-        default=None,
-        help="RTC 模拟推理延迟（动作步数）",
-    )
-    parser.add_argument(
-        "--execution-horizon",
-        type=int,
-        default=None,
-        help="RTC execution_horizon",
-    )
-    parser.add_argument(
-        "--compile",
-        action="store_true",
-        help="torch.compile encoder + unet/flow_net（覆盖 deploy.yaml compile）",
+        help="部署 YAML（默认 run_fr_robot/deploy.yaml）",
     )
     return parser.parse_args()
 
@@ -425,13 +363,14 @@ def _pace_step(step_start: float, fps: int) -> None:
 def _preprocess_images(
     images: dict[str, np.ndarray],
     *,
+    pre_crop_size: int | None,
     resize_size: int | None,
     crop_size: int | None,
     eval_fixed_crop: bool,
 ) -> dict[str, np.ndarray]:
-    """相机原图 HWC uint8 → 策略分辨率 HWC float32 [0,1]（resize + 可选中心 crop）。
+    """相机原图 HWC uint8 → 策略分辨率 HWC float32 [0,1]。
 
-    入队时做一次，避免每次推理对整段历史重复预处理。
+    顺序：中心 pre_crop → resize → 可选中心 crop。入队时做一次。
     """
     out: dict[str, np.ndarray] = {}
     for name, rgb in images.items():
@@ -439,9 +378,13 @@ def _preprocess_images(
         if arr.dtype != np.uint8:
             arr = np.clip(arr, 0, 255).astype(np.uint8)
         t = torch.from_numpy(arr.astype(np.float32) / 255.0).permute(2, 0, 1).unsqueeze(0)
-        t = resize_images(t, resize_size)
-        if crop_size is not None and eval_fixed_crop:
-            t = crop_images(t, crop_size, random=False)
+        t = spatial_preprocess_images(
+            t,
+            pre_crop_size=pre_crop_size,
+            resize_size=resize_size,
+            crop_size=crop_size if eval_fixed_crop else None,
+            random_crop=False,
+        )
         out[name] = t.squeeze(0).permute(1, 2, 0).contiguous().numpy()
     return out
 
@@ -449,14 +392,16 @@ def _preprocess_images(
 def _prepare_observation(
     obs: Observation,
     *,
+    pre_crop_size: int | None,
     resize_size: int | None,
     crop_size: int | None,
     eval_fixed_crop: bool,
 ) -> Observation:
-    """替换图像为入队即用的 resize/crop 结果；state 原样保留。"""
+    """替换图像为入队即用的 pre_crop/resize/crop 结果；state 原样保留。"""
     return Observation(
         images=_preprocess_images(
             obs.images,
+            pre_crop_size=pre_crop_size,
             resize_size=resize_size,
             crop_size=crop_size,
             eval_fixed_crop=eval_fixed_crop,
@@ -1186,16 +1131,8 @@ def main() -> None:
         deploy_path = _resolve_path(deploy_path, base=VA_ROOT)
     deploy = _load_deploy_config(deploy_path)
 
-    ckpt_path = (
-        _resolve_path(args.checkpoint, base=VA_ROOT)
-        if args.checkpoint
-        else deploy["checkpoint"]
-    )
-    train_cfg_path = (
-        _resolve_path(args.config, base=VA_ROOT)
-        if args.config
-        else deploy["config"]
-    )
+    ckpt_path = deploy["checkpoint"]
+    train_cfg_path = deploy["config"]
     teleop_yaml = deploy["teleop_yaml"]
     if not ckpt_path.is_file():
         raise FileNotFoundError(f"找不到 checkpoint: {ckpt_path}")
@@ -1214,7 +1151,7 @@ def main() -> None:
         cfg = ckpt["config"]
         print("[INFO] 训练配置: checkpoint 内嵌 config")
 
-    _apply_rtc_overrides(cfg, deploy.get("rtc") or {}, args)
+    _apply_rtc_overrides(cfg, deploy.get("rtc") or {})
     rtc_cfg = _normalize_rtc_config(cfg.policy.rtc)
     rtc_enabled = bool(rtc_cfg.enabled)
 
@@ -1243,8 +1180,8 @@ def main() -> None:
         f"n_action_steps={n_action_steps} num_inference_steps={cfg.policy.num_inference_steps}"
     )
     print(
-        f"[INFO] resize={cfg.dataset.resize_size} crop={cfg.dataset.crop_size} "
-        f"eval_fixed_crop={cfg.dataset.eval_fixed_crop} fps={fps}"
+        f"[INFO] pre_crop={cfg.dataset.pre_crop_size} resize={cfg.dataset.resize_size} "
+        f"crop={cfg.dataset.crop_size} eval_fixed_crop={cfg.dataset.eval_fixed_crop} fps={fps}"
     )
     print(f"[INFO] action_names={list(cfg.action_names)}")
     print(
@@ -1266,7 +1203,7 @@ def main() -> None:
     policy.to(device)
     policy.eval()
 
-    compile_enabled = _resolve_compile_enabled(deploy, args)
+    compile_enabled = _resolve_compile_enabled(deploy)
     if compile_enabled:
         compiled = _compile_policy_submodules(policy)
         if compiled:
@@ -1279,9 +1216,9 @@ def main() -> None:
             warm_ms = (time.perf_counter() - t_warm) * 1000.0
             print(f"[INFO] compile warmup done ({warm_ms:.0f}ms)")
         else:
-            print("[WARN] --compile set but no encoder/unet/flow_net found; skipped")
+            print("[WARN] compile enabled but no encoder/unet/flow_net found; skipped")
     else:
-        print("[INFO] torch.compile disabled (deploy.compile / --compile)")
+        print("[INFO] torch.compile disabled (deploy.compile)")
 
     print(f"[INFO] 策略已就绪，设备={device} cudnn.benchmark={device.type == 'cuda'}")
 
@@ -1328,19 +1265,22 @@ def main() -> None:
 
         obs = _read_observation(hw, cameras, last_state=None)
         obs.validate(cameras, int(cfg.state_dim))
+        pre_crop_size = cfg.dataset.pre_crop_size
         resize_size = cfg.dataset.resize_size
         crop_size = cfg.dataset.crop_size
         eval_fixed_crop = bool(cfg.dataset.eval_fixed_crop)
         obs = _prepare_observation(
             obs,
+            pre_crop_size=pre_crop_size,
             resize_size=resize_size,
             crop_size=crop_size,
             eval_fixed_crop=eval_fixed_crop,
         )
         obs_history: list[Observation] = [obs]
         print(
-            f"[INFO] 观测入队即 resize/crop "
-            f"(resize={resize_size} crop={crop_size} fixed={eval_fixed_crop})"
+            f"[INFO] 观测入队即 pre_crop/resize/crop "
+            f"(pre_crop={pre_crop_size} resize={resize_size} crop={crop_size} "
+            f"fixed={eval_fixed_crop})"
         )
 
         print(f"[INFO] 开始闭环，最多 {max_steps} 步" + (" (RTC)" if rtc_enabled else ""))
@@ -1564,6 +1504,7 @@ def main() -> None:
                     last_logged_exec = step_i
                 obs = _prepare_observation(
                     _read_observation(hw, cameras, last_state=obs.state),
+                    pre_crop_size=pre_crop_size,
                     resize_size=resize_size,
                     crop_size=crop_size,
                     eval_fixed_crop=eval_fixed_crop,
@@ -1621,6 +1562,7 @@ def main() -> None:
                     last_logged_exec = step_i
                 obs = _prepare_observation(
                     _read_observation(hw, cameras, last_state=obs.state),
+                    pre_crop_size=pre_crop_size,
                     resize_size=resize_size,
                     crop_size=crop_size,
                     eval_fixed_crop=eval_fixed_crop,
