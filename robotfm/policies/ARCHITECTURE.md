@@ -4,8 +4,9 @@
 
 ## 目录结构
 
-- `encoders.py`：多相机图像（ImageNet 预训练 ResNet18 + 帧差）与状态 → `cond`
+- `encoders.py`：多相机图像（ImageNet 预训练 ResNet18 + 帧差）与状态 → `cond`；`build_multi_camera_encoder` 工厂
 - `video_encoders.py`：SlowFast-R50 视频编码（与 ResNet **分文件**）→ `cond`
+- `vit_encoders.py`：ViT-B/16（torchvision ImageNet-1k；CLS → 投影）→ `cond`
 - `unet1d.py`：ConditionalUnet1D + FiLM 动作骨干
 - `dit.py`：旧版 DiT（消融对照）
 - `flow_matching.py`：OT-CFM 训练与 Euler 采样（可选 RTC 钩子）
@@ -25,8 +26,10 @@ flowchart LR
   imgs[RGB_obs] --> backbone{vision_backbone}
   backbone -->|resnet18| resnet[ResNet18_frame_diff]
   backbone -->|slowfast_r50| sf[SlowFast_R50]
+  backbone -->|vit_b_16| vit[ViT_B16_CLS]
   resnet --> cond[global_cond]
   sf --> cond
+  vit --> cond
   state[agent_pos] --> cond
   noise[x_t] --> unet[ConditionalUnet1D]
   cond --> unet
@@ -99,6 +102,21 @@ actions <- action_decoder(x)
 
 - 与 `MultiCameraEncoder` 同形输出 `cond`
 - **不**写入 `encoders.py`；日后 VideoMAE 等同接口新文件即可替换
+
+## `vit_encoders.py`（ViT）
+
+### `ViTEncoder`
+
+- torchvision `vit_b_16`，ImageNet-1k 预训练（`pretrained_encoder`）；去掉分类头，取 **CLS**
+- ImageNet mean/std；可选 frame diff 通道堆叠（扩展 `conv_proj`）
+- 输入双线性缩放到 **224**（匹配预训练 pos embed）→ CLS → MLP → `out_dim`
+- 输入：`(B, T, 3, H, W)`
+
+### `MultiCameraViTEncoder`
+
+- 与 `MultiCameraEncoder` 同形输出 `cond`
+- A2A / FlowMatching / VITA 经 `build_multi_camera_encoder(..., vision_backbone=vit_b_16)` 选用
+- 示例配置：`configs/openarm_hcx_dual_arm_a2a_noise_vit.yaml`
 
 ## `unet1d.py`
 

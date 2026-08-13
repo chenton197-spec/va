@@ -275,3 +275,66 @@ class MultiCameraEncoder(nn.Module):
 
         fused = torch.cat([img_feat, state_feat], dim=-1)
         return self.proj(fused)
+
+
+def build_multi_camera_encoder(
+    vision_backbone: str,
+    *,
+    num_cameras: int,
+    state_dim: int,
+    n_obs_steps: int,
+    image_out_dim: int = 128,
+    state_out_dim: int = 128,
+    cond_dim: int = 256,
+    pretrained_encoder: bool = True,
+    use_frame_diff: bool = True,
+    share_image_encoder: bool = True,
+) -> nn.Module:
+    """按 ``vision_backbone`` 构造多相机观测编码器（输出 ``cond``）。
+
+    支持：``resnet18`` / ``slowfast_r50`` / ``vit_b_16``。
+    """
+    backbone = vision_backbone.lower()
+    if backbone in {"resnet18", "resnet"}:
+        return MultiCameraEncoder(
+            num_cameras=num_cameras,
+            state_dim=state_dim,
+            n_obs_steps=n_obs_steps,
+            image_out_dim=image_out_dim,
+            state_out_dim=state_out_dim,
+            cond_dim=cond_dim,
+            pretrained_encoder=pretrained_encoder,
+            use_frame_diff=use_frame_diff,
+            share_image_encoder=share_image_encoder,
+        )
+    if backbone in {"slowfast_r50", "slowfast"}:
+        from robotfm.policies.video_encoders import MultiCameraSlowFastEncoder
+
+        return MultiCameraSlowFastEncoder(
+            num_cameras=num_cameras,
+            state_dim=state_dim,
+            n_obs_steps=n_obs_steps,
+            image_out_dim=image_out_dim,
+            state_out_dim=state_out_dim,
+            cond_dim=cond_dim,
+            pretrained_encoder=pretrained_encoder,
+            share_image_encoder=share_image_encoder,
+        )
+    if backbone in {"vit_b_16", "vit"}:
+        from robotfm.policies.vit_encoders import MultiCameraViTEncoder
+
+        return MultiCameraViTEncoder(
+            num_cameras=num_cameras,
+            state_dim=state_dim,
+            n_obs_steps=n_obs_steps,
+            image_out_dim=image_out_dim,
+            state_out_dim=state_out_dim,
+            cond_dim=cond_dim,
+            pretrained_encoder=pretrained_encoder,
+            use_frame_diff=use_frame_diff,
+            share_image_encoder=share_image_encoder,
+        )
+    raise ValueError(
+        f"Unknown vision_backbone={vision_backbone!r}; "
+        "expected 'resnet18', 'slowfast_r50', or 'vit_b_16'"
+    )

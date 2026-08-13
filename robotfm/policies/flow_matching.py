@@ -7,10 +7,9 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.distributions import Beta
 
-from robotfm.policies.encoders import MultiCameraEncoder
+from robotfm.policies.encoders import build_multi_camera_encoder
 from robotfm.policies.rtc import RTCConfig, RTCProcessor
 from robotfm.policies.unet1d import ConditionalUnet1D
-from robotfm.policies.video_encoders import MultiCameraSlowFastEncoder
 
 
 @dataclass
@@ -22,7 +21,7 @@ class FlowMatchingConfig:
     - `horizon` / `n_obs_steps` 决定动作 chunk 和观测历史长度；
     - `hidden_dim` 同时作为条件向量维度；
     - `down_dims` 控制 ConditionalUnet1D 容量；
-    - `vision_backbone`: ``resnet18``（帧差）或 ``slowfast_r50``（视频）；
+    - `vision_backbone`: ``resnet18`` / ``slowfast_r50`` / ``vit_b_16``；
     - `num_inference_steps` 决定推理时 Euler 积分步数；
     - `beta_alpha` / `beta_beta` / `noise_s` 控制训练时采样的时间分布；
     - `rtc` 为可选 RTC 推理配置（训练不受影响）。
@@ -57,7 +56,7 @@ class FlowMatchingPolicy(nn.Module):
     架构拆分为两部分：
     1. `encoder`:
        把多相机图像 + 历史状态编码成条件向量 `cond`
-       （ResNet18 或 SlowFast-R50，由 ``vision_backbone`` 选择）
+       （ResNet18 / SlowFast-R50 / ViT-B/16，由 ``vision_backbone`` 选择）
     2. `unet`:
        在给定 `cond` 和时间 `t` 的前提下，对 noised action chunk
        预测速度场 `v_theta`（ConditionalUnet1D + FiLM）
@@ -81,31 +80,16 @@ class FlowMatchingPolicy(nn.Module):
         super().__init__()
         self.cfg = cfg
 
-        backbone = cfg.vision_backbone.lower()
-        if backbone in {"resnet18", "resnet"}:
-            self.encoder = MultiCameraEncoder(
-                num_cameras=cfg.num_cameras,
-                state_dim=cfg.state_dim,
-                n_obs_steps=cfg.n_obs_steps,
-                cond_dim=cfg.hidden_dim,
-                pretrained_encoder=cfg.pretrained_encoder,
-                use_frame_diff=cfg.use_frame_diff,
-                share_image_encoder=cfg.share_image_encoder,
-            )
-        elif backbone in {"slowfast_r50", "slowfast"}:
-            self.encoder = MultiCameraSlowFastEncoder(
-                num_cameras=cfg.num_cameras,
-                state_dim=cfg.state_dim,
-                n_obs_steps=cfg.n_obs_steps,
-                cond_dim=cfg.hidden_dim,
-                pretrained_encoder=cfg.pretrained_encoder,
-                share_image_encoder=cfg.share_image_encoder,
-            )
-        else:
-            raise ValueError(
-                f"Unknown vision_backbone={cfg.vision_backbone!r}; "
-                "expected 'resnet18' or 'slowfast_r50'"
-            )
+        self.encoder = build_multi_camera_encoder(
+            cfg.vision_backbone,
+            num_cameras=cfg.num_cameras,
+            state_dim=cfg.state_dim,
+            n_obs_steps=cfg.n_obs_steps,
+            cond_dim=cfg.hidden_dim,
+            pretrained_encoder=cfg.pretrained_encoder,
+            use_frame_diff=cfg.use_frame_diff,
+            share_image_encoder=cfg.share_image_encoder,
+        )
 
         self.unet = ConditionalUnet1D(
             input_dim=cfg.action_dim,

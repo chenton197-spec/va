@@ -24,7 +24,7 @@ from robotfm.policies.a2a.flow_matchers import (
     TorchFlowMatcher,
 )
 from robotfm.policies.a2a.flow_net import SimpleFlowNet
-from robotfm.policies.encoders import MultiCameraEncoder
+from robotfm.policies.encoders import build_multi_camera_encoder
 from robotfm.policies.rtc import RTCConfig, RTCProcessor
 
 
@@ -60,6 +60,7 @@ class A2AConfig:
     pretrained_encoder: bool = True
     use_frame_diff: bool = True
     share_image_encoder: bool = True
+    vision_backbone: str = "resnet18"  # resnet18 | slowfast_r50 | vit_b_16
     rtc: RTCConfig | None = None
 
 
@@ -79,7 +80,8 @@ class A2APolicy(nn.Module):
                 f"(got n_action_steps={cfg.n_action_steps}, horizon={cfg.horizon})"
             )
 
-        self.encoder = MultiCameraEncoder(
+        self.encoder = build_multi_camera_encoder(
+            cfg.vision_backbone,
             num_cameras=cfg.num_cameras,
             state_dim=cfg.state_dim,
             n_obs_steps=cfg.n_obs_steps,

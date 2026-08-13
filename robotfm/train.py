@@ -164,6 +164,7 @@ def _build_a2a_policy(cfg: RobotFMConfig) -> torch.nn.Module:
         pretrained_encoder=cfg.policy.pretrained_encoder,
         use_frame_diff=cfg.policy.use_frame_diff,
         share_image_encoder=cfg.policy.share_image_encoder,
+        vision_backbone=cfg.policy.vision_backbone,
         rtc=rtc if rtc.enabled else None,
     )
     return A2APolicy(a2a_cfg)
@@ -199,6 +200,7 @@ def _build_vita_policy(cfg: RobotFMConfig) -> VITAPolicy:
         pretrained_encoder=cfg.policy.pretrained_encoder,
         use_frame_diff=cfg.policy.use_frame_diff,
         share_image_encoder=cfg.policy.share_image_encoder,
+        vision_backbone=cfg.policy.vision_backbone,
     )
     return VITAPolicy(vita_cfg)
 

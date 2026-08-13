@@ -82,7 +82,7 @@ class PolicyConfig:
     """策略结构与采样超参数（flow_matching / a2a / n_a2a / vita / act）。"""
 
     type: str = "flow_matching"  # flow_matching | a2a | n_a2a | vita | act
-    vision_backbone: str = "resnet18"  # resnet18 | slowfast_r50
+    vision_backbone: str = "resnet18"  # resnet18 | slowfast_r50 | vit_b_16
     hidden_dim: int = 256           # 条件向量 / 全局 cond 维度
     num_layers: int = 4               # 旧 DiT 字段，保留兼容
     num_heads: int = 4                # 旧 DiT 字段，保留兼容；ACT 用 n_heads
@@ -96,7 +96,7 @@ class PolicyConfig:
     kernel_size: int = 5
     n_groups: int = 8
     pretrained_encoder: bool = True  # ImageNet / Kinetics 预训练（微调）
-    use_frame_diff: bool = True  # ResNet 路径：[I0, I1-I0, ...] 通道堆叠
+    use_frame_diff: bool = True  # ResNet/ViT：[I0, I1-I0, ...] 通道堆叠
     share_image_encoder: bool = True  # False: 每相机独立视觉权重（≈×Cams 参数）
     # A2A / N-A2A / VITA（flow_matching 忽略）
     latent_dim: int = 512

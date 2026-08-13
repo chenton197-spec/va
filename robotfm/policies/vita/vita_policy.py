@@ -25,7 +25,7 @@ from robotfm.policies.a2a.flow_matchers import (
     TorchFlowMatcher,
 )
 from robotfm.policies.a2a.flow_net import SimpleFlowNet
-from robotfm.policies.encoders import MultiCameraEncoder
+from robotfm.policies.encoders import build_multi_camera_encoder
 
 
 @dataclass
@@ -59,6 +59,7 @@ class VITAConfig:
     pretrained_encoder: bool = True
     use_frame_diff: bool = True
     share_image_encoder: bool = True
+    vision_backbone: str = "resnet18"  # resnet18 | slowfast_r50 | vit_b_16
 
 
 class VITAPolicy(nn.Module):
@@ -72,7 +73,8 @@ class VITAPolicy(nn.Module):
                 f"n_action_steps ({cfg.n_action_steps}) must be <= horizon ({cfg.horizon})"
             )
 
-        self.encoder = MultiCameraEncoder(
+        self.encoder = build_multi_camera_encoder(
+            cfg.vision_backbone,
             num_cameras=cfg.num_cameras,
             state_dim=cfg.state_dim,
             n_obs_steps=cfg.n_obs_steps,

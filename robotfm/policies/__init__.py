@@ -1,8 +1,9 @@
 """策略模块总入口。
 
 当前包含：
-- `encoders.py`: 多相机图像（预训练 ResNet18）与状态编码
+- `encoders.py`: 多相机图像（预训练 ResNet18）与状态编码；`build_multi_camera_encoder`
 - `video_encoders.py`: SlowFast-R50 视频编码（与 ResNet 分文件）
+- `vit_encoders.py`: ViT-B/16（torchvision ImageNet-1k CLS）
 - `unet1d.py`: ConditionalUnet1D + FiLM 动作骨干
 - `dit.py`: 旧版 DiT（保留作消融对照）
 - `flow_matching.py`: OT-CFM 训练损失与 Euler 采样（可选 RTC）
@@ -16,7 +17,7 @@
 1. `ARCHITECTURE.md`
 2. `flow_matching.py` / `a2a/` / `vita/` / `act/`
 3. `rtc/`
-4. `encoders.py` / `video_encoders.py`
+4. `encoders.py` / `video_encoders.py` / `vit_encoders.py`
 5. `unet1d.py`
 """
 
