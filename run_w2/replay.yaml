@@ -1,0 +1,38 @@
+# run_w2/replay.py：回放 openarm_hcx_dual_arm_record.py 采集的轨迹
+
+# 数据集根目录（相对路径相对于 ct/va/）
+dataset_root: datasets/to_init
+
+# episode 编号；也可在命令行用 --episode 覆盖
+episode_index: 0
+
+# 与采集相同的 teleop 部署 YAML（HCX / Gloria-M）
+teleop_yaml: /home/casbot/ct/teleop_project/teleop.yaml
+
+# 轨迹字段：action=当时下发的目标角；observation.state=当时反馈角
+joint_column: action
+
+# 仅在 pace_by_timestamp=true 时生效；move_joints 默认按点到位，不追时间轴
+playback_speed: 1.0
+pace_by_timestamp: false
+
+# 播放结束后是否循环
+loop: false
+
+# 是否弹出三路录制图像窗口（空格暂停，q/Esc 退出）
+display_cameras: false
+
+# true 时只加载并打印轨迹，不连接硬件
+dry_run: false
+
+# false 时只回放双臂，不连接 Gloria-M 夹爪
+connect_grippers: false
+
+# HCX move_joints 规划参数（与 run_w2/deploy.yaml 同语义）
+move_joints:
+  speed_ratio: 0.1
+  acceleration_seconds: 0.5
+  deceleration_seconds: 0.5
+  feedback_confirm_timeout_s: 30.0
+  feedback_confirm_poll_interval_s: 0.05
+  angle_tolerance_deg: 0.5

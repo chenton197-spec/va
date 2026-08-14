@@ -8,7 +8,8 @@
 5. 将训练日志写入 ``output_dir/train.log``
 
 Checkpoint 含 ``step`` / ``policy_state_dict`` / ``optimizer_state_dict`` /
-``config`` / ``stats``，可用 ``--resume`` 续训（``train.steps`` 为全局总步数）。
+``config`` / ``stats``（``train.amp`` 开启时另含 ``scaler_state_dict``），
+可用 ``--resume`` 续训（``train.steps`` 为全局总步数）。
 """
 
 from __future__ import annotations
@@ -68,15 +69,19 @@ def _checkpoint_payload(
     optim: torch.optim.Optimizer,
     cfg: RobotFMConfig,
     stats: dict,
+    scaler: torch.amp.GradScaler | None = None,
 ) -> dict:
-    """统一 checkpoint 字段，支持续训（含 optimizer / step）。"""
-    return {
+    """统一 checkpoint 字段，支持续训（含 optimizer / step / AMP scaler）。"""
+    payload = {
         "step": step,
         "policy_state_dict": policy.state_dict(),
         "optimizer_state_dict": optim.state_dict(),
         "config": cfg,
         "stats": stats,
     }
+    if scaler is not None and scaler.is_enabled():
+        payload["scaler_state_dict"] = scaler.state_dict()
+    return payload
 
 
 def _load_resume_checkpoint(
@@ -86,8 +91,9 @@ def _load_resume_checkpoint(
     logger: _TrainLogger,
     *,
     load_optimizer: bool = True,
+    scaler: torch.amp.GradScaler | None = None,
 ) -> tuple[int, dict | None]:
-    """从 checkpoint 恢复权重 / optimizer / step。
+    """从 checkpoint 恢复权重 / optimizer / step（及可选 AMP scaler）。
 
     返回 ``(start_step, stats_or_none)``；stats 优先用 ckpt 内的，保证归一化一致。
     """
@@ -116,6 +122,15 @@ def _load_resume_checkpoint(
         )
     else:
         logger.log("resume: skip optimizer_state_dict (fresh optimizer)")
+    if scaler is not None and scaler.is_enabled():
+        if "scaler_state_dict" in ckpt and ckpt["scaler_state_dict"] is not None:
+            scaler.load_state_dict(ckpt["scaler_state_dict"])
+            logger.log(f"resume: loaded scaler_state_dict from {resume_path}")
+        else:
+            logger.log(
+                "resume: WARNING no scaler_state_dict in checkpoint; "
+                "GradScaler starts fresh"
+            )
     logger.log(f"resume: start_step={start_step} from {resume_path}")
     stats = ckpt.get("stats")
     return start_step, stats if stats is not None else None
@@ -464,6 +479,9 @@ def train_flow_matching(
 
         device = torch.device(cfg.train.device if torch.cuda.is_available() else "cpu")
         logger.log(f"device: {device}")
+        use_amp = bool(getattr(cfg.train, "amp", False)) and device.type == "cuda"
+        scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
+        logger.log(f"train.amp: {use_amp}")
         policy = build_policy(cfg, stats).to(device)
         optim = _build_optimizer(policy, cfg)
 
@@ -475,6 +493,7 @@ def train_flow_matching(
                 optim,
                 logger,
                 load_optimizer=not reset_step,
+                scaler=scaler if use_amp else None,
             )
             # 把 Adam 状态迁到训练 device
             for state in optim.state.values():
@@ -526,18 +545,21 @@ def train_flow_matching(
                     )
                 if cfg.train.cosine_lr:
                     _set_cosine_lr(optim, step, cfg)
-                loss = policy.compute_loss(batch)
+                with torch.amp.autocast("cuda", enabled=use_amp):
+                    loss = policy.compute_loss(batch)
                 optim.zero_grad(set_to_none=True)
-                loss.backward()
+                scaler.scale(loss).backward()
                 # clip_grad_norm_ 返回值为 clip 前的总梯度范数
                 grad_norm_v = float("nan")
                 if cfg.train.max_grad_norm > 0:
+                    scaler.unscale_(optim)
                     grad_norm_v = float(
                         torch.nn.utils.clip_grad_norm_(
                             policy.parameters(), cfg.train.max_grad_norm
                         )
                     )
-                optim.step()
+                scaler.step(optim)
+                scaler.update()
 
                 lr = float(optim.param_groups[-1]["lr"])
                 loss_v = float(loss.item())
@@ -571,7 +593,12 @@ def train_flow_matching(
                     ckpt = output_dir / f"checkpoint_{step:06d}.pt"
                     torch.save(
                         _checkpoint_payload(
-                            step=step, policy=policy, optim=optim, cfg=cfg, stats=stats
+                            step=step,
+                            policy=policy,
+                            optim=optim,
+                            cfg=cfg,
+                            stats=stats,
+                            scaler=scaler if use_amp else None,
                         ),
                         ckpt,
                     )
@@ -584,7 +611,12 @@ def train_flow_matching(
         final_ckpt = output_dir / "checkpoint_final.pt"
         torch.save(
             _checkpoint_payload(
-                step=step, policy=policy, optim=optim, cfg=cfg, stats=stats
+                step=step,
+                policy=policy,
+                optim=optim,
+                cfg=cfg,
+                stats=stats,
+                scaler=scaler if use_amp else None,
             ),
             final_ckpt,
         )

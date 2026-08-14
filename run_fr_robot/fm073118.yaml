@@ -1,11 +1,11 @@
 # run_policy.py 部署配置（与脚本同目录）
 
 # 策略 checkpoint；相对路径相对于 ct/va/
-checkpoint: model/a2a_noise_shine_shoes_limits_260730175409/checkpoint_090000.pt
+checkpoint: model/fm_shine_shoes_limits_260731181324/checkpoint_final.pt
 
 # 训练配置 YAML（与训练一致）；相对路径相对于 ct/va/
 # 不设或 null 时回退到 checkpoint 内嵌 config
-config: configs/shine_shoes_a2a_noise_limits.yaml
+config: null
 
 # teleop 部署 YAML：FR3 IP、Orbbec、Gloria-M
 teleop_yaml: /home/casbot/teleop_project/teleop.yaml
@@ -21,7 +21,7 @@ tool: null
 user: null
 
 # 闭环最大步数
-max_steps: 500
+max_steps: 1600
 
 # 启动时 MoveJ 目标（关节角单位：度）
 start_pose:
@@ -48,8 +48,8 @@ gripper_rate_hz: 125
 # 关节角最大速度（度/秒）；chunk 衔接与样条限速共用
 max_joint_vel_deg_s: 150
 
-# 相邻稀疏路点单轴最大跳变（度）；超过则丢弃该点（仍推进 ActionQueue）
-# 默认 15 ≈ 150deg/s × 0.1s；设 null 则用 vel×(1/fps)
+# 相邻稀疏路点单轴最大跳变（度）；超过则按比例截断 Δq
+# 默认约 vel×0.1s；设 null 则用 vel×(1/fps)
 max_joint_step_deg: 15
 
 # torch.compile encoder + unet/flow_net；默认关闭（RTC grad 路径需台上验证）
@@ -58,6 +58,5 @@ compile: false
 # RTC 覆盖（可选）；字段为 null 或不写则沿用训练 YAML 的 policy.rtc
 rtc:
   enabled: true
-  guidance_enabled: true
   inference_delay: 2
   execution_horizon: 4

@@ -12,6 +12,7 @@ venv/
 # Large non-core artifacts (repo root only)
 /data/
 /data_*/
+/datasets/
 /outputs/
 *.pt
 *.pth

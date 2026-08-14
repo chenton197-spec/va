@@ -51,11 +51,10 @@ max_joint_vel_deg_s: 150
 # 相邻稀疏路点单轴最大跳变（度）；超过则丢弃该点
 max_joint_step_deg: 15
 
-# torch.compile encoder + unet/flow_net；默认关闭；CLI --compile 可强制开启
+# torch.compile encoder + unet/flow_net；默认关闭（RTC grad 路径需台上验证）
 compile: false
 
 # RTC 覆盖（可选）；字段为 null 或不写则沿用训练 YAML 的 policy.rtc
-# CLI --rtc / --no-guidance / --inference-delay / --execution-horizon 优先级更高
 rtc:
   enabled: true
   guidance_enabled: true

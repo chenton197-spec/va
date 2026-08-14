@@ -150,6 +150,8 @@ class TrainConfig:
     warmup_steps: int = 500
     encoder_lr_scale: float = 0.1  # 视觉 backbone lr = lr * scale
     max_grad_norm: float = 1.0
+    # CUDA 自动混合精度（fp16 + GradScaler）；CPU 上自动忽略
+    amp: bool = False
 
 
 @dataclass

@@ -262,19 +262,38 @@ def load_episode_arrays_from_parquet(
 
 
 def list_episode_indices(run_dir: Path, info: dict[str, Any]) -> list[int]:
-    """Episode indices present on disk (prefer episodes.jsonl, else 0..N-1)."""
-    episodes_path = Path(run_dir) / "meta" / "episodes.jsonl"
+    """Episode indices present on disk (prefer episodes.jsonl, else 0..N-1).
+
+    Skips entries whose parquet is missing so partial datasets still load.
+    """
+    run_dir = Path(run_dir)
+    chunks_size = int(info["chunks_size"])
+    data_path_tmpl = info["data_path"]
+    episodes_path = run_dir / "meta" / "episodes.jsonl"
     if episodes_path.is_file():
-        indices: list[int] = []
+        candidates: list[int] = []
         with episodes_path.open() as f:
             for line in f:
                 line = line.strip()
                 if not line:
                     continue
-                indices.append(int(json.loads(line)["episode_index"]))
-        return indices
-    total = int(info.get("total_episodes", 0))
-    return list(range(total))
+                candidates.append(int(json.loads(line)["episode_index"]))
+    else:
+        candidates = list(range(int(info.get("total_episodes", 0))))
+
+    indices: list[int] = []
+    missing = 0
+    for ep_id in candidates:
+        parquet_path = run_dir / _format_data_path(data_path_tmpl, ep_id, chunks_size)
+        if parquet_path.is_file():
+            indices.append(ep_id)
+        else:
+            missing += 1
+    if missing:
+        print(
+            f"warning: skipped {missing} episode(s) with missing parquet under {run_dir}"
+        )
+    return indices
 
 
 class LeRobotImageSequenceDataset(Dataset):

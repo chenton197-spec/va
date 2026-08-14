@@ -1,27 +1,22 @@
 # 离线 BC：A2A+noise + gaussian_2std（(x-mean)/(2*std)），无 OT
-# 数据：openarm_hcx_dual_arm（双臂 14 关节 + L/R gripper → 16-D；三相机）
-# N=32497（drop_n_last_frames=0，与 horizon 无关）
-# → floor(N/16)=2031 steps/epoch → 40 epoch = 81240
-# crop 关闭；resize→256；horizon=32（A2A 要求 n_action_steps == horizon；兼容 CNN L//8）
-# 加速：uint8 盘缓存跳过 JPEG + GPU color_jitter（先 build_uint8_image_cache.py）
-# 三相机 + horizon=32 → bs=16；workers=1 保 RAM
-cameras: [head, left_hand, right_hand]
-state_dim: 16
-action_dim: 16
-state_names:
-  [L0, L1, L2, L3, L4, L5, L6, R0, R1, R2, R3, R4, R5, R6, left_gripper, right_gripper]
-action_names:
-  [L0, L1, L2, L3, L4, L5, L6, R0, R1, R2, R3, R4, R5, R6, left_gripper, right_gripper]
-fps: 15
-data_root: data
-output_dir: outputs/a2a_noise_openarm_hcx_dual_arm_gaussian_2std
+# 硬件（本机）：RTX 5060 8GB（桌面约占 ~0.5GB）+ i5-13500 (14C/20T) + 31GB RAM
+# 数据：/home/casbot/ct/data/shine_shoes_fr3_s256_prefix_speedup（JPEG 已预缩到 256×256，训练时再 crop 到 224）
+# N=105232（drop_n_last_frames=0，与 horizon 无关）
+# → floor(N/16)=6577 steps/epoch → 40 epoch = 263080（从零训）
+# 加速：uint8 盘缓存跳过 JPEG + GPU 上 crop/color_jitter
+# 吞吐：8GB VRAM → bs=16；31GB RAM → workers=4
+cameras: [hand, head]
+state_dim: 7
+action_dim: 7
+data_root: ../data
+output_dir: outputs/a2a_noise_shine_shoes_gaussian_2std_s256_prefix_speedup
 
 dataset:
   n_obs_steps: 8
-  horizon: 32
-  run_name: openarm_hcx_dual_arm
+  horizon: 24
+  run_name: shine_shoes_fr3_s256_prefix_speedup
   resize_size: 256
-  crop_size: null
+  crop_size: 224
   color_jitter_brightness: 0.2
   color_jitter_contrast: 0.2
   color_jitter_saturation: 0.1
@@ -35,7 +30,7 @@ policy:
   type: a2a
   hidden_dim: 256
   num_inference_steps: 6
-  n_action_steps: 32
+  n_action_steps: 24
   pretrained_encoder: true
   use_frame_diff: true
   latent_dim: 512
@@ -59,14 +54,15 @@ policy:
     debug: false
 
 train:
+  # 8GB VRAM → bs=16；31GB RAM → workers=4；每 2 epoch 存盘
   batch_size: 16
-  steps: 81240
+  steps: 263080
   lr: 0.0005
   weight_decay: 0.000001
   log_freq: 50
-  save_freq: 4062
+  save_freq: 13154
   device: cuda
-  num_workers: 1
+  num_workers: 4
   cosine_lr: true
   warmup_steps: 500
   encoder_lr_scale: 0.1

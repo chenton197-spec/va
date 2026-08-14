@@ -2,21 +2,16 @@
 # 硬件（本机实测）：RTX 5060 Ti 16GB（16311 MiB；桌面约占 ~0.4GB）
 #   + i5-13500 (14C/20T) + 31GB RAM
 # 数据：openarm_hcx_dual_arm（双臂 14 关节 + L/R gripper → 16-D；三相机）
-# N=82948（左臂静止前缀已裁 + 每 ep 末尾 -30；缺 5 ep）
-# → floor(N/20)=4147 steps/epoch → 40 epoch = 165880
+# N=98737（drop_n_last_frames=0；缺 5 ep 后实测）
+# → floor(N/16)=6171 steps/epoch → 40 epoch = 246840
 # 图像：1280×720 中心裁 720×720 → resize 512×512（保比例）；horizon=16
 # 加速：uint8 盘缓存跳过 JPEG + GPU color_jitter（先 build_uint8_image_cache.py
-#   --pre-crop-size 720 --resize-size 512）；缓存约 183GB，不可整库进 31GB RAM
+#   --pre-crop-size 720 --resize-size 512）
 # 三相机独立 ResNet 权重（share_image_encoder=false）
-# 短训 A/B（监控 RAM/VRAM，2026-08-13，workers=2，N=82948）：
-#   fp32 bs16 → 1.52 s/it，10.6 samp/s，~2.18 h/epoch，VRAM 9.0GB
-#   amp  bs16 → 1.37 s/it，11.6 samp/s，~1.98 h/epoch，VRAM 8.0GB
-#   amp  bs20 → 1.69 s/it，11.8 samp/s，~1.95 h/epoch，VRAM 9.1GB  ← 采用
-#   amp  bs24 → 2.01 s/it，11.9 samp/s，~1.93 h/epoch，VRAM 9.0GB（略快可忽略）
-#   workers=4 不更快且更吃内存；workers=6 打满 swap 会崩
-#   → 40ep + uint8_cache + amp=true + bs=20 + workers=3
-#   注意：从 fp32 ckpt resume 再开 amp 易 nan，续训请保持 amp 与 ckpt 一致
-# 每 2 epoch 存盘：save_freq = 2 * 4147 = 8294
+# 吞吐：16GB 上 512+sepenc → bs=16（8GB 时 bs=16 会 OOM；bs=8≈6.3GB）
+#   三相机串行 ResNet 下再加大 bs 对 samp/s 帮助有限，但能减半 steps
+#   → workers=2（31GB RAM 够用；workers=4 易抢 217G 缓存页缓存）
+# 每 4 epoch 存盘：save_freq = 4 * 6171 = 24684
 cameras: [head, left_hand, right_hand]
 state_dim: 16
 action_dim: 16
@@ -74,17 +69,16 @@ policy:
     debug: false
 
 train:
-  # 40ep；bs=20 + workers=3（A/B 略优；勿 workers≥6）
-  batch_size: 20
-  steps: 165880
+  # 16GB VRAM + 512/sepenc → bs=16；workers=2；每 4 epoch 存盘（24684）
+  batch_size: 32
+  steps: 246840
   lr: 0.0005
   weight_decay: 0.000001
-  log_freq: 100
-  save_freq: 8294
+  log_freq: 10
+  save_freq: 24684
   device: cuda
-  num_workers: 3
+  num_workers: 2
   cosine_lr: true
   warmup_steps: 500
   encoder_lr_scale: 0.1
   max_grad_norm: 1.0
-  amp: true
