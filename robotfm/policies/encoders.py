@@ -292,7 +292,7 @@ def build_multi_camera_encoder(
 ) -> nn.Module:
     """按 ``vision_backbone`` 构造多相机观测编码器（输出 ``cond``）。
 
-    支持：``resnet18`` / ``slowfast_r50`` / ``vit_b_16``。
+    支持：``resnet18`` / ``slowfast_r50`` / ``vit_b_16`` / ``pa2``。
     """
     backbone = vision_backbone.lower()
     if backbone in {"resnet18", "resnet"}:
@@ -334,7 +334,21 @@ def build_multi_camera_encoder(
             use_frame_diff=use_frame_diff,
             share_image_encoder=share_image_encoder,
         )
+    if backbone in {"pa2", "casbot_pa2", "casbotpa2"}:
+        from robotfm.policies.pa2_encoders import MultiCameraPA2Encoder
+
+        return MultiCameraPA2Encoder(
+            num_cameras=num_cameras,
+            state_dim=state_dim,
+            n_obs_steps=n_obs_steps,
+            image_out_dim=image_out_dim,
+            state_out_dim=state_out_dim,
+            cond_dim=cond_dim,
+            pretrained_encoder=pretrained_encoder,
+            use_frame_diff=use_frame_diff,
+            share_image_encoder=share_image_encoder,
+        )
     raise ValueError(
         f"Unknown vision_backbone={vision_backbone!r}; "
-        "expected 'resnet18', 'slowfast_r50', or 'vit_b_16'"
+        "expected 'resnet18', 'slowfast_r50', 'vit_b_16', or 'pa2'"
     )

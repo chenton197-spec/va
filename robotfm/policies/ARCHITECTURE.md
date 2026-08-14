@@ -7,6 +7,7 @@
 - `encoders.py`：多相机图像（ImageNet 预训练 ResNet18 + 帧差）与状态 → `cond`；`build_multi_camera_encoder` 工厂
 - `video_encoders.py`：SlowFast-R50 视频编码（与 ResNet **分文件**）→ `cond`
 - `vit_encoders.py`：ViT-B/16（torchvision ImageNet-1k；CLS → 投影）→ `cond`
+- `pa2_yolo.py` / `pa2_encoders.py`：PA2 YOLO（C3k2 / C2PSA / SPPF，仅图像）→ `cond`
 - `unet1d.py`：ConditionalUnet1D + FiLM 动作骨干
 - `dit.py`：旧版 DiT（消融对照）
 - `flow_matching.py`：OT-CFM 训练与 Euler 采样（可选 RTC 钩子）
@@ -27,9 +28,11 @@ flowchart LR
   backbone -->|resnet18| resnet[ResNet18_frame_diff]
   backbone -->|slowfast_r50| sf[SlowFast_R50]
   backbone -->|vit_b_16| vit[ViT_B16_CLS]
+  backbone -->|pa2| pa2[PA2_YOLO]
   resnet --> cond[global_cond]
   sf --> cond
   vit --> cond
+  pa2 --> cond
   state[agent_pos] --> cond
   noise[x_t] --> unet[ConditionalUnet1D]
   cond --> unet
@@ -117,6 +120,22 @@ actions <- action_decoder(x)
 - 与 `MultiCameraEncoder` 同形输出 `cond`
 - A2A / FlowMatching / VITA 经 `build_multi_camera_encoder(..., vision_backbone=vit_b_16)` 选用
 - 示例配置：`configs/openarm_hcx_dual_arm_a2a_noise_vit.yaml`
+
+## `pa2_encoders.py`（PA2 YOLO）
+
+### `PA2Encoder`
+
+- 对齐 PA2 `casbotPA2-backbone.yaml` 的图像部分：Conv → C3k2 → C2PSA / SPPF（原 SensorFusion 换成 1×1 Conv）
+- 输入保持 `[0, 1]`（与 PA2 一致，无 ImageNet mean/std）
+- 可选 frame diff 通道堆叠（stem 为 `3 * n_obs_steps`）
+- P5 GAP → MLP → `out_dim`
+- `pretrained_encoder` 目前忽略（va 内无 YOLO ImageNet 权重，从零训练）
+
+### `MultiCameraPA2Encoder`
+
+- 与 `MultiCameraEncoder` 同形输出 `cond`
+- A2A / FlowMatching / VITA 经 `build_multi_camera_encoder(..., vision_backbone=pa2)` 选用
+- 示例配置：`configs/openarm_hcx_dual_arm_a2a_noise_pa2.yaml`
 
 ## `unet1d.py`
 

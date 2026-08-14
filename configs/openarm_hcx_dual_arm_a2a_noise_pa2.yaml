@@ -1,0 +1,81 @@
+# 离线 BC：A2A+noise + gaussian_2std + PA2 YOLO 相机编码器
+# 硬件：RTX 5060 8GB + i5-12400F (6C/12T) + 15GB RAM
+# 数据：openarm_hcx_dual_arm 后 200 ep（130–329；双臂 14 关节 + L/R gripper → 16-D；三相机）
+# N=58247（drop_n_last_frames=0，与 horizon 无关）
+# → floor(N/12)=4853 steps/epoch → 400 epoch = 1941200
+# 图像：1280×720 中心裁 720×720 → resize 360×360（复用 uint8 缓存）
+# 视觉：PA2 casbotPA2-backbone 图像部分（C3k2 / C2PSA / SPPF，scale n），从零训练
+#   三相机独立权重（share_image_encoder=false）；状态仍走 StateEncoder
+# 加速：uint8 盘缓存 + GPU color_jitter（hue=0）；workers=1（勿 ≥2，15GB RAM）
+# 吞吐实测 2026-08-14（PA2 sepenc + 360，cudnn.benchmark+tf32）：
+#   params=52.0M（vision 29.5M）；bs=12 最快 48.8 samp/s，VRAM 6.47G
+#   bs=10 46.6 samp/s；bs=8 44.4；bs=13/14/16 OOM
+#   → bs=12 + workers=1；encoder_lr_scale=1.0（无预训练，不用 0.1）
+cameras: [head, left_hand, right_hand]
+state_dim: 16
+action_dim: 16
+state_names:
+  [L0, L1, L2, L3, L4, L5, L6, R0, R1, R2, R3, R4, R5, R6, left_gripper, right_gripper]
+action_names:
+  [L0, L1, L2, L3, L4, L5, L6, R0, R1, R2, R3, R4, R5, R6, left_gripper, right_gripper]
+fps: 15
+data_root: data
+output_dir: outputs/a2a_noise_openarm_hcx_dual_arm_pa2_gaussian_2std
+
+dataset:
+  n_obs_steps: 8
+  horizon: 32
+  run_name: openarm_hcx_dual_arm
+  pre_crop_size: 720
+  resize_size: 360
+  crop_size: null
+  color_jitter_brightness: 0.2
+  color_jitter_contrast: 0.2
+  color_jitter_saturation: 0.1
+  color_jitter_hue: 0.0
+  norm_mode: gaussian_2std
+  uint8_cache: true
+  gpu_augment: true
+
+policy:
+  type: a2a
+  vision_backbone: pa2
+  hidden_dim: 256
+  num_inference_steps: 6
+  n_action_steps: 32
+  pretrained_encoder: false
+  use_frame_diff: true
+  share_image_encoder: false
+  latent_dim: 512
+  consistency_weight: 1.0
+  enc_recon_weight: 0.5
+  flow_recon_weight: 0.5
+  history_noise_std: 0.15
+  flow_hidden_dim: 512
+  flow_num_layers: 4
+  flow_mlp_ratio: 4.0
+  ae_enc_hidden_dim: 512
+  ae_dec_hidden_dim: 512
+  ae_num_layers: 4
+  rtc:
+    enabled: false
+    execution_horizon: 8
+    max_guidance_weight: 10.0
+    prefix_attention_schedule: exp
+    inference_delay: 2
+    debug: false
+
+train:
+  # 实测最快且刚能塞进 8GB：bs=12 + workers=1；每 10 epoch 存盘（10*4853=48530）
+  batch_size: 12
+  steps: 1941200
+  lr: 0.0005
+  weight_decay: 0.000001
+  log_freq: 50
+  save_freq: 48530
+  device: cuda
+  num_workers: 1
+  cosine_lr: true
+  warmup_steps: 500
+  encoder_lr_scale: 1.0
+  max_grad_norm: 1.0

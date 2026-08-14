@@ -60,7 +60,7 @@ class A2AConfig:
     pretrained_encoder: bool = True
     use_frame_diff: bool = True
     share_image_encoder: bool = True
-    vision_backbone: str = "resnet18"  # resnet18 | slowfast_r50 | vit_b_16
+    vision_backbone: str = "resnet18"  # resnet18 | slowfast_r50 | vit_b_16 | pa2
     rtc: RTCConfig | None = None
 
 

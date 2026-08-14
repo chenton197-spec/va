@@ -21,7 +21,7 @@ class FlowMatchingConfig:
     - `horizon` / `n_obs_steps` 决定动作 chunk 和观测历史长度；
     - `hidden_dim` 同时作为条件向量维度；
     - `down_dims` 控制 ConditionalUnet1D 容量；
-    - `vision_backbone`: ``resnet18`` / ``slowfast_r50`` / ``vit_b_16``；
+    - `vision_backbone`: ``resnet18`` / ``slowfast_r50`` / ``vit_b_16`` / ``pa2``；
     - `num_inference_steps` 决定推理时 Euler 积分步数；
     - `beta_alpha` / `beta_beta` / `noise_s` 控制训练时采样的时间分布；
     - `rtc` 为可选 RTC 推理配置（训练不受影响）。
@@ -56,7 +56,7 @@ class FlowMatchingPolicy(nn.Module):
     架构拆分为两部分：
     1. `encoder`:
        把多相机图像 + 历史状态编码成条件向量 `cond`
-       （ResNet18 / SlowFast-R50 / ViT-B/16，由 ``vision_backbone`` 选择）
+       （ResNet18 / SlowFast-R50 / ViT-B/16 / PA2 YOLO，由 ``vision_backbone`` 选择）
     2. `unet`:
        在给定 `cond` 和时间 `t` 的前提下，对 noised action chunk
        预测速度场 `v_theta`（ConditionalUnet1D + FiLM）

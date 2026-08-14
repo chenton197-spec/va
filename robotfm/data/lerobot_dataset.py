@@ -510,7 +510,12 @@ class LeRobotImageSequenceDataset(Dataset):
         images = []
         for cam in self.meta.camera_names:
             cam_frames = self._load_cam_frames(ep_local, cam, obs_indices)
-            cam_frames = np.transpose(cam_frames, (0, 3, 1, 2)).astype(np.float32) / 255.0
+            cam_frames = np.transpose(cam_frames, (0, 3, 1, 2))
+            if self.defer_augment:
+                # Keep uint8; train loop does /255 on GPU after H2D.
+                cam_frames = np.ascontiguousarray(cam_frames)
+            else:
+                cam_frames = cam_frames.astype(np.float32) / 255.0
             images.append(torch.from_numpy(cam_frames))
 
         obs_images = torch.stack(images, dim=0)

@@ -34,6 +34,7 @@ from robotfm.data.dataset import (
     apply_image_augments_batch,
     build_episode_dataset,
     camera_dropout_prob,
+    images_to_float01,
 )
 from robotfm.data.stats import ensure_stats, is_limits_mode, resolve_image_stats
 from robotfm.policies.act import ACTConfig, ACTPolicy
@@ -462,7 +463,8 @@ def train_flow_matching(
             logger.log(f"dataset.uint8_cache: enabled path={cache_dir}")
         if gpu_augment:
             logger.log(
-                "dataset.gpu_augment: crop/color_jitter deferred to GPU batch path"
+                "dataset.gpu_augment: crop/color_jitter deferred to GPU batch path; "
+                "obs_images stay uint8 until GPU /255"
             )
         loader_kwargs: dict = {
             "batch_size": cfg.train.batch_size,
@@ -479,6 +481,12 @@ def train_flow_matching(
 
         device = torch.device(cfg.train.device if torch.cuda.is_available() else "cpu")
         logger.log(f"device: {device}")
+        if device.type == "cuda":
+            torch.backends.cudnn.benchmark = True
+            torch.backends.cuda.matmul.allow_tf32 = True
+            torch.backends.cudnn.allow_tf32 = True
+            torch.set_float32_matmul_precision("high")
+            logger.log("cuda: cudnn.benchmark=True tf32=True matmul_precision=high")
         use_amp = bool(getattr(cfg.train, "amp", False)) and device.type == "cuda"
         scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
         logger.log(f"train.amp: {use_amp}")
@@ -514,7 +522,8 @@ def train_flow_matching(
         pbar = tqdm(total=cfg.train.steps, initial=step, desc="train")
         while step < cfg.train.steps:
             for batch in loader:
-                batch = {k: v.to(device) for k, v in batch.items()}
+                batch = {k: v.to(device, non_blocking=True) for k, v in batch.items()}
+                batch["obs_images"] = images_to_float01(batch["obs_images"])
                 if gpu_augment:
                     batch["obs_images"] = apply_image_augments_batch(
                         batch["obs_images"],

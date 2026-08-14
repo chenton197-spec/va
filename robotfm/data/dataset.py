@@ -184,6 +184,73 @@ def crop_images_batch(
     return out
 
 
+_LUMA_WEIGHTS = (0.2989, 0.5870, 0.1140)
+
+
+def _jitter_factor(images: torch.Tensor, low: float, high: float) -> torch.Tensor:
+    """Per-sample factor shaped ``(B,1,1,1,1,1)``; no CPU sync."""
+    b = images.shape[0]
+    return torch.empty(
+        b, 1, 1, 1, 1, 1, device=images.device, dtype=images.dtype
+    ).uniform_(low, high)
+
+
+def _blend_broadcast(img: torch.Tensor, other: torch.Tensor, ratio: torch.Tensor) -> torch.Tensor:
+    """``ratio * img + (1 - ratio) * other``, matching torchvision ``_blend``."""
+    return (ratio * img + (1.0 - ratio) * other).clamp(0.0, 1.0)
+
+
+def _luma(images: torch.Tensor) -> torch.Tensor:
+    """Rec. 601 luma; ``images`` is ``(..., 3, H, W)`` → ``(..., H, W)``."""
+    r, g, b = images.unbind(dim=-3)
+    return _LUMA_WEIGHTS[0] * r + _LUMA_WEIGHTS[1] * g + _LUMA_WEIGHTS[2] * b
+
+
+def _rgb_to_hsv(img: torch.Tensor) -> torch.Tensor:
+    """Vectorized RGB→HSV; channel dim is -3 (torchvision-compatible)."""
+    r, g, b = img.unbind(dim=-3)
+    maxc = torch.max(img, dim=-3).values
+    minc = torch.min(img, dim=-3).values
+    eqc = maxc == minc
+    cr = maxc - minc
+    ones = torch.ones_like(maxc)
+    s = cr / torch.where(eqc, ones, maxc)
+    cr_safe = torch.where(eqc, ones, cr)
+    rc = (maxc - r) / cr_safe
+    gc = (maxc - g) / cr_safe
+    bc = (maxc - b) / cr_safe
+    hr = (bc - gc).div(6).add(1).remainder(1)
+    hg = rc.sub(bc).div(6).add(2.0 / 6)
+    hb = gc.sub(rc).div(6).add(4.0 / 6)
+    h = torch.where((maxc == r) & ~eqc, hr, ones)
+    h = torch.where((maxc == g) & ~eqc, hg, h)
+    h = torch.where((maxc == b) & ~eqc, hb, h)
+    return torch.stack((h, s, maxc), dim=-3)
+
+
+def _hsv_to_rgb(img: torch.Tensor) -> torch.Tensor:
+    """Vectorized HSV→RGB without the 6-sector stack (keeps 8GB GPUs alive at 512)."""
+    h, s, v = img.unbind(dim=-3)
+    h6 = h * 6.0
+    i = torch.remainder(torch.floor(h6), 6.0).to(dtype=torch.int64)
+    f = h6 - torch.floor(h6)
+    p = v * (1.0 - s)
+    q = v * (1.0 - s * f)
+    t = v * (1.0 - s * (1.0 - f))
+    r, g, b = v, t, p  # i == 0
+    m = i == 1
+    r, g, b = torch.where(m, q, r), torch.where(m, v, g), torch.where(m, p, b)
+    m = i == 2
+    r, g, b = torch.where(m, p, r), torch.where(m, v, g), torch.where(m, t, b)
+    m = i == 3
+    r, g, b = torch.where(m, p, r), torch.where(m, q, g), torch.where(m, v, b)
+    m = i == 4
+    r, g, b = torch.where(m, t, r), torch.where(m, p, g), torch.where(m, v, b)
+    m = i == 5
+    r, g, b = torch.where(m, v, r), torch.where(m, p, g), torch.where(m, q, b)
+    return torch.stack((r, g, b), dim=-3)
+
+
 def color_jitter_images_batch(
     images: torch.Tensor,
     brightness: float = 0.0,
@@ -194,48 +261,51 @@ def color_jitter_images_batch(
     """Batched photometric jitter for ``(B, Cams, T, 3, H, W)`` on any device.
 
     Each batch item samples one factor set shared across its cams/T.
+    Factors stay on-device (no ``float(gpu_tensor)`` sync / Python loop).
     """
     if brightness <= 0 and contrast <= 0 and saturation <= 0 and hue <= 0:
         return images
     if images.ndim != 6:
         raise ValueError(f"Expected (B,Cams,T,3,H,W), got shape {tuple(images.shape)}")
+    if images.shape[-3] != 3:
+        raise ValueError(f"Expected 3-channel RGB, got C={images.shape[-3]}")
 
-    from torchvision.transforms import functional as TF
-
-    b, cams, t, c, h, w = images.shape
     out = images
-    # Apply per-sample so factors match CPU EpisodeDataset semantics.
-    pieces: list[torch.Tensor] = []
-    for i in range(b):
-        flat = out[i].reshape(-1, c, h, w)
-        if brightness > 0:
-            factor = float(
-                torch.empty(1, device=images.device).uniform_(
-                    max(0.0, 1.0 - brightness), 1.0 + brightness
-                )
-            )
-            flat = TF.adjust_brightness(flat, factor)
-        if contrast > 0:
-            factor = float(
-                torch.empty(1, device=images.device).uniform_(
-                    max(0.0, 1.0 - contrast), 1.0 + contrast
-                )
-            )
-            flat = TF.adjust_contrast(flat, factor)
-        if saturation > 0:
-            factor = float(
-                torch.empty(1, device=images.device).uniform_(
-                    max(0.0, 1.0 - saturation), 1.0 + saturation
-                )
-            )
-            flat = TF.adjust_saturation(flat, factor)
-        if hue > 0:
-            factor = float(
-                torch.empty(1, device=images.device).uniform_(-hue, hue)
-            )
-            flat = TF.adjust_hue(flat, max(-0.5, min(0.5, factor)))
-        pieces.append(flat.clamp(0.0, 1.0).reshape(cams, t, c, h, w))
-    return torch.stack(pieces, dim=0)
+    if brightness > 0:
+        factor = _jitter_factor(out, max(0.0, 1.0 - brightness), 1.0 + brightness)
+        out = (out * factor).clamp(0.0, 1.0)
+    if contrast > 0:
+        mean = _luma(out).mean(dim=(-2, -1), keepdim=True).unsqueeze(-3)
+        factor = _jitter_factor(out, max(0.0, 1.0 - contrast), 1.0 + contrast)
+        out = _blend_broadcast(out, mean, factor)
+    if saturation > 0:
+        gray = _luma(out).unsqueeze(-3).expand_as(out)
+        factor = _jitter_factor(out, max(0.0, 1.0 - saturation), 1.0 + saturation)
+        out = _blend_broadcast(out, gray, factor)
+    if hue > 0:
+        hue_delta = _jitter_factor(out, -hue, hue).clamp(-0.5, 0.5)
+        # Per-camera to cap HSV intermediates on 8GB (512×3cams×8T).
+        bsz = out.shape[0]
+        delta = hue_delta.view(bsz, 1, 1, 1)
+        cam_out = []
+        for cam_i in range(out.shape[1]):
+            hsv = _rgb_to_hsv(out[:, cam_i])
+            h_ch, s_ch, v_ch = hsv.unbind(dim=-3)
+            h_ch = (h_ch + delta) % 1.0
+            cam_out.append(_hsv_to_rgb(torch.stack((h_ch, s_ch, v_ch), dim=-3)))
+        out = torch.stack(cam_out, dim=1).clamp(0.0, 1.0)
+    return out
+
+
+def images_to_float01(images: torch.Tensor) -> torch.Tensor:
+    """Convert uint8 ``obs_images`` to float32 in ``[0, 1]``.
+
+    Float tensors are returned unchanged. Call after H2D so the DataLoader can
+    keep uint8 (4× less host RAM / PCIe) when ``defer_augment`` is set.
+    """
+    if images.dtype == torch.uint8:
+        return images.float().div_(255.0)
+    return images
 
 
 def apply_image_augments_batch(

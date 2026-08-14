@@ -82,7 +82,7 @@ class PolicyConfig:
     """策略结构与采样超参数（flow_matching / a2a / n_a2a / vita / act）。"""
 
     type: str = "flow_matching"  # flow_matching | a2a | n_a2a | vita | act
-    vision_backbone: str = "resnet18"  # resnet18 | slowfast_r50 | vit_b_16
+    vision_backbone: str = "resnet18"  # resnet18 | slowfast_r50 | vit_b_16 | pa2
     hidden_dim: int = 256           # 条件向量 / 全局 cond 维度
     num_layers: int = 4               # 旧 DiT 字段，保留兼容
     num_heads: int = 4                # 旧 DiT 字段，保留兼容；ACT 用 n_heads

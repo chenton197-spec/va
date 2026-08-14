@@ -52,6 +52,12 @@ python scripts/train_flow_matching.py --config configs/pusht_a2a.yaml
 python scripts/train_flow_matching.py --config configs/pusht_n_a2a.yaml
 ```
 
+PA2 YOLO 视觉骨干（C3k2 / C2PSA / SPPF，`vision_backbone: pa2`）：
+
+```bash
+python scripts/train_flow_matching.py --config configs/openarm_hcx_dual_arm_a2a_noise_pa2.yaml
+```
+
 VITA（Vision-to-Action flow matching；视觉潜变量为起点，默认 OT-CFM）：
 
 ```bash
