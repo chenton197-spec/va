@@ -72,7 +72,9 @@ train:
   lr: 0.0005
   weight_decay: 0.000001
   log_freq: 50
-  save_freq: 48530
+  save_freq: 48530          # 编号 ckpt：每 10 epoch
+  latest_save_freq: 4853    # latest：每 1 epoch 覆盖写入，方便续训
+  keep_last_ckpts: 10
   device: cuda
   num_workers: 1
   cosine_lr: true

@@ -10,6 +10,9 @@
 Checkpoint 含 ``step`` / ``policy_state_dict`` / ``optimizer_state_dict`` /
 ``config`` / ``stats``（``train.amp`` 开启时另含 ``scaler_state_dict``），
 可用 ``--resume`` 续训（``train.steps`` 为全局总步数）。
+``train.latest_save_freq`` 控制覆盖写入 ``checkpoint_latest.pt``（便于续训；
+0 表示与 ``save_freq`` 相同）。编号 ckpt 仍按 ``save_freq``，并由
+``train.keep_last_ckpts`` 清理（0 = 不清理；``checkpoint_final.pt`` 始终保留）。
 """
 
 from __future__ import annotations
@@ -83,6 +86,56 @@ def _checkpoint_payload(
     if scaler is not None and scaler.is_enabled():
         payload["scaler_state_dict"] = scaler.state_dict()
     return payload
+
+
+def _list_step_checkpoints(output_dir: Path) -> list[tuple[int, Path]]:
+    """列出 ``checkpoint_XXXXXX.pt``（按 step 升序；不含 final / latest）。"""
+    found: list[tuple[int, Path]] = []
+    for path in output_dir.glob("checkpoint_*.pt"):
+        stem = path.stem  # checkpoint_012345
+        if not stem.startswith("checkpoint_"):
+            continue
+        suffix = stem[len("checkpoint_") :]
+        if not suffix.isdigit():
+            continue
+        found.append((int(suffix), path))
+    found.sort(key=lambda x: x[0])
+    return found
+
+
+def _save_latest_checkpoint(output_dir: Path, payload: dict) -> Path:
+    """覆盖写入 ``checkpoint_latest.pt``（原子替换，避免写一半时 resume 读到坏文件）。"""
+    latest = output_dir / "checkpoint_latest.pt"
+    tmp = output_dir / "checkpoint_latest.pt.tmp"
+    if latest.is_symlink() or latest.exists():
+        try:
+            latest.unlink()
+        except OSError:
+            pass
+    torch.save(payload, tmp)
+    tmp.replace(latest)
+    return latest
+
+
+def _prune_old_checkpoints(
+    output_dir: Path,
+    keep_last: int,
+    logger: _TrainLogger | None = None,
+) -> None:
+    """只保留最近 ``keep_last`` 个 step checkpoint；``keep_last<=0`` 表示不清理。"""
+    if keep_last <= 0:
+        return
+    numbered = _list_step_checkpoints(output_dir)
+    if len(numbered) <= keep_last:
+        return
+    for _, path in numbered[:-keep_last]:
+        try:
+            path.unlink()
+            if logger is not None:
+                logger.log(f"pruned: {path}", also_print=False)
+        except OSError as exc:
+            if logger is not None:
+                logger.log(f"prune failed: {path} ({exc})", also_print=False)
 
 
 def _load_resume_checkpoint(
@@ -598,37 +651,48 @@ def train_flow_matching(
                         f"clipped={int(clipped)}{drop_msg}",
                         also_print=False,
                     )
-                if step > 0 and step % cfg.train.save_freq == 0:
-                    ckpt = output_dir / f"checkpoint_{step:06d}.pt"
-                    torch.save(
-                        _checkpoint_payload(
-                            step=step,
-                            policy=policy,
-                            optim=optim,
-                            cfg=cfg,
-                            stats=stats,
-                            scaler=scaler if use_amp else None,
-                        ),
-                        ckpt,
+                latest_freq = int(getattr(cfg.train, "latest_save_freq", 0) or 0)
+                if latest_freq <= 0:
+                    latest_freq = int(cfg.train.save_freq)
+                save_numbered = step > 0 and step % cfg.train.save_freq == 0
+                save_latest = step > 0 and latest_freq > 0 and step % latest_freq == 0
+                if save_numbered or save_latest:
+                    payload = _checkpoint_payload(
+                        step=step,
+                        policy=policy,
+                        optim=optim,
+                        cfg=cfg,
+                        stats=stats,
+                        scaler=scaler if use_amp else None,
                     )
-                    logger.log(f"saved: {ckpt}", also_print=False)
+                    if save_numbered:
+                        ckpt = output_dir / f"checkpoint_{step:06d}.pt"
+                        torch.save(payload, ckpt)
+                        logger.log(f"saved: {ckpt}", also_print=False)
+                        _prune_old_checkpoints(
+                            output_dir,
+                            int(getattr(cfg.train, "keep_last_ckpts", 0) or 0),
+                            logger,
+                        )
+                    if save_latest:
+                        latest = _save_latest_checkpoint(output_dir, payload)
+                        logger.log(f"saved: {latest}", also_print=False)
                 step += 1
                 pbar.update(1)
                 if step >= cfg.train.steps:
                     break
 
-        final_ckpt = output_dir / "checkpoint_final.pt"
-        torch.save(
-            _checkpoint_payload(
-                step=step,
-                policy=policy,
-                optim=optim,
-                cfg=cfg,
-                stats=stats,
-                scaler=scaler if use_amp else None,
-            ),
-            final_ckpt,
+        final_payload = _checkpoint_payload(
+            step=step,
+            policy=policy,
+            optim=optim,
+            cfg=cfg,
+            stats=stats,
+            scaler=scaler if use_amp else None,
         )
+        final_ckpt = output_dir / "checkpoint_final.pt"
+        torch.save(final_payload, final_ckpt)
+        _save_latest_checkpoint(output_dir, final_payload)
         pbar.close()
         logger.log(f"saved: {final_ckpt}")
         logger.log(f"end_time: {datetime.now().isoformat(timespec='seconds')}")

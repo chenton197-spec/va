@@ -143,7 +143,11 @@ class TrainConfig:
     lr: float = 1e-4
     weight_decay: float = 1e-6
     log_freq: int = 100       # 每隔多少步打印 loss
-    save_freq: int = 5_000    # 每隔多少步保存 checkpoint
+    save_freq: int = 5_000    # 每隔多少步保存编号 checkpoint_XXXXXX.pt
+    # 覆盖写入 checkpoint_latest.pt 的频率；0 = 与 save_freq 相同
+    latest_save_freq: int = 0
+    # 只保留最近 N 个 ``checkpoint_XXXXXX.pt``（不含 final/latest）；0 = 全部保留
+    keep_last_ckpts: int = 10
     device: str = "cuda"
     num_workers: int = 2      # DataLoader 工作进程数
     cosine_lr: bool = True    # cosine 衰减（含短 warmup）
