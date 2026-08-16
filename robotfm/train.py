@@ -13,6 +13,8 @@ Checkpoint 含 ``step`` / ``policy_state_dict`` / ``optimizer_state_dict`` /
 ``train.latest_save_freq`` 控制覆盖写入 ``checkpoint_latest.pt``（便于续训；
 0 表示与 ``save_freq`` 相同）。编号 ckpt 仍按 ``save_freq``，并由
 ``train.keep_last_ckpts`` 清理（0 = 不清理；``checkpoint_final.pt`` 始终保留）。
+``train.compile`` 在 CUDA 上对整策略 ``torch.compile``（mode=default）；
+checkpoint 存未包装权重，可与非 compile 推理/续训互通。
 """
 
 from __future__ import annotations
@@ -66,6 +68,30 @@ class _TrainLogger:
         self._fh.close()
 
 
+def _unwrap_compiled(module: torch.nn.Module) -> torch.nn.Module:
+    """去掉 ``torch.compile`` 包装，保证 checkpoint 键名与未 compile 一致。"""
+    return getattr(module, "_orig_mod", module)
+
+
+def _maybe_compile_policy(
+    policy: PolicyModule,
+    *,
+    enabled: bool,
+    logger: _TrainLogger,
+) -> PolicyModule:
+    """CUDA 上 ``torch.compile`` 整策略；``mode=default``（与 deploy 一致）。
+
+    ``reduce-overhead`` 的 CUDA Graphs 会与 SpatialSoftmax grid buffer 冲突，故不用。
+    须在 resume ``load_state_dict`` 与构建 optimizer **之后**调用（参数对象共享）。
+    """
+    if not enabled:
+        logger.log("train.compile: False")
+        return policy
+    compiled = torch.compile(policy, mode="default")
+    logger.log("train.compile: True (mode=default)")
+    return compiled  # type: ignore[return-value]
+
+
 def _checkpoint_payload(
     *,
     step: int,
@@ -78,7 +104,7 @@ def _checkpoint_payload(
     """统一 checkpoint 字段，支持续训（含 optimizer / step / AMP scaler）。"""
     payload = {
         "step": step,
-        "policy_state_dict": policy.state_dict(),
+        "policy_state_dict": _unwrap_compiled(policy).state_dict(),
         "optimizer_state_dict": optim.state_dict(),
         "config": cfg,
         "stats": stats,
@@ -543,6 +569,14 @@ def train_flow_matching(
         use_amp = bool(getattr(cfg.train, "amp", False)) and device.type == "cuda"
         scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
         logger.log(f"train.amp: {use_amp}")
+        if use_amp:
+            logger.log(
+                "WARNING: train.amp has a known bug — training can hit loss=nan; "
+                "keep train.amp=false unless debugging AMP."
+            )
+        use_compile = (
+            bool(getattr(cfg.train, "compile", False)) and device.type == "cuda"
+        )
         policy = build_policy(cfg, stats).to(device)
         optim = _build_optimizer(policy, cfg)
 
@@ -564,6 +598,9 @@ def train_flow_matching(
             if reset_step:
                 logger.log(f"resume: reset_step enabled (was {step} -> 0)")
                 step = 0
+
+        # compile 放在 load_state_dict / optimizer 之后，ckpt 仍存未包装权重
+        policy = _maybe_compile_policy(policy, enabled=use_compile, logger=logger)
 
         if step >= cfg.train.steps:
             raise ValueError(

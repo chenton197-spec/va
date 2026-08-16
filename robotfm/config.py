@@ -154,8 +154,10 @@ class TrainConfig:
     warmup_steps: int = 500
     encoder_lr_scale: float = 0.1  # 视觉 backbone lr = lr * scale
     max_grad_norm: float = 1.0
-    # CUDA 自动混合精度（fp16 + GradScaler）；CPU 上自动忽略
+    # CUDA AMP（fp16 + GradScaler）；默认 False。已知 bug：训练中途易 loss=nan，勿开。
     amp: bool = False
+    # torch.compile 整策略（mode=default）；CPU 上自动忽略。首步会编译变慢。
+    compile: bool = False
 
 
 @dataclass

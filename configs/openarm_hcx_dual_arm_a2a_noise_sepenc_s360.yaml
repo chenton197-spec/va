@@ -1,0 +1,84 @@
+# 离线 BC：A2A+noise + gaussian_2std；sepenc + resize 360
+# 硬件：RTX 5060 Ti 16GB + i5-13500 (14C/20T) + 31GB RAM（swap 常满，workers≤3）
+# 数据：datasets/openarm_hcx_dual_arm N=72172（318 ep）
+# 吞吐实测 2026-08-15（amp + uint8_cache 360）：
+#   bs20 nw4 53.4 samp/s；bs20 nw3 53.2；bs40 nw2 53.4（VRAM 翻倍无收益）
+#   → 同速大 batch：bs=40 + workers=2（53.4 samp/s，与 bs20 持平；VRAM~8.6G）
+#   动作 lr=3e-4，ResNet scale=1.67（≈5e-4）
+# 300 epoch：floor(N/40)=1804 steps/epoch → steps=541200
+# 每 4 epoch 编号 ckpt；每 1 epoch 覆盖 latest
+cameras: [head, left_hand, right_hand]
+state_dim: 16
+action_dim: 16
+state_names:
+  [L0, L1, L2, L3, L4, L5, L6, R0, R1, R2, R3, R4, R5, R6, left_gripper, right_gripper]
+action_names:
+  [L0, L1, L2, L3, L4, L5, L6, R0, R1, R2, R3, R4, R5, R6, left_gripper, right_gripper]
+fps: 15
+data_root: datasets
+output_dir: outputs/a2a_noise_openarm_hcx_dual_arm_sepenc_s360_bs40_lr3e4_enc1p67_gaussian_2std
+
+dataset:
+  n_obs_steps: 8
+  horizon: 16
+  run_name: openarm_hcx_dual_arm
+  pre_crop_size: 720
+  resize_size: 360
+  crop_size: null
+  color_jitter_brightness: 0.2
+  color_jitter_contrast: 0.2
+  color_jitter_saturation: 0.1
+  color_jitter_hue: 0.02
+  # gaussian | gaussian_2std | limits([-1,1]) | limits_01([0,1])
+  norm_mode: gaussian_2std
+  uint8_cache: true
+  gpu_augment: true
+
+policy:
+  type: a2a
+  hidden_dim: 256
+  num_inference_steps: 6
+  n_action_steps: 16
+  pretrained_encoder: true
+  use_frame_diff: true
+  # false: head / left_hand / right_hand 各一套 ResNet 权重（约 3× 视觉参数）
+  share_image_encoder: false
+  latent_dim: 512
+  consistency_weight: 1.0
+  enc_recon_weight: 0.5
+  flow_recon_weight: 0.5
+  history_noise_std: 0.15
+  flow_hidden_dim: 512
+  flow_num_layers: 4
+  flow_mlp_ratio: 4.0
+  ae_enc_hidden_dim: 512
+  ae_dec_hidden_dim: 512
+  ae_num_layers: 4
+  rtc:
+    enabled: false
+    execution_horizon: 8
+    max_guidance_weight: 10.0
+    prefix_attention_schedule: exp
+    inference_delay: 2
+    debug: false
+
+train:
+  batch_size: 40
+  steps: 541200
+  lr: 0.0003
+  weight_decay: 0.000001
+  log_freq: 100
+  save_freq: 7216           # 编号 ckpt：每 4 epoch
+  latest_save_freq: 1804    # latest：每 1 epoch 覆盖
+  keep_last_ckpts: 5
+  device: cuda
+  num_workers: 2
+  cosine_lr: true
+  warmup_steps: 500
+  # ResNet lr = 0.0003 * 1.67 ≈ 5e-4（对齐短训 probe 最优绝对 lr）
+  encoder_lr_scale: 1.67
+  max_grad_norm: 1.0
+  # 已知 bug：amp 训练易 nan（本机 s360 跑到 ~70k 后持续 nan）
+  amp: false
+  # torch.compile 整策略（mode=default）；首步 Inductor 编译较慢
+  compile: true

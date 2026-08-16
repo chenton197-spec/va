@@ -28,6 +28,13 @@ def main() -> None:
     p.add_argument("--config", type=str, required=True)
     p.add_argument("--warmup", type=int, default=5)
     p.add_argument("--steps", type=int, default=30)
+    p.add_argument("--horizon", type=int, default=None, help="覆盖 dataset.horizon")
+    p.add_argument(
+        "--n-action-steps",
+        type=int,
+        default=None,
+        help="覆盖 policy.n_action_steps（默认与 --horizon 相同）",
+    )
     args = p.parse_args()
 
     base_dir = Path(__file__).resolve().parents[1]
@@ -35,6 +42,12 @@ def main() -> None:
     if not config_path.is_absolute():
         config_path = base_dir / config_path
     cfg = load_config(config_path)
+    if args.horizon is not None:
+        cfg.dataset.horizon = int(args.horizon)
+        if args.n_action_steps is None:
+            cfg.policy.n_action_steps = int(args.horizon)
+    if args.n_action_steps is not None:
+        cfg.policy.n_action_steps = int(args.n_action_steps)
 
     run_dir = get_run_dir(cfg, base_dir)
     require_image = (
@@ -86,13 +99,18 @@ def main() -> None:
         raise RuntimeError("CUDA not available; cannot bench GPU train speed")
     device = torch.device("cuda")
     use_amp = bool(getattr(cfg.train, "amp", False))
+    use_compile = bool(getattr(cfg.train, "compile", False))
     scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
     policy = build_policy(cfg, stats).to(device)
     optim = _build_optimizer(policy, cfg)
+    if use_compile:
+        # 与 train.py 一致：mode=default（勿用 reduce-overhead）
+        policy = torch.compile(policy, mode="default")
 
     print(
         f"bench: bs={cfg.train.batch_size} workers={cfg.train.num_workers} "
-        f"amp={use_amp} resize={cfg.dataset.resize_size} "
+        f"amp={use_amp} compile={use_compile} resize={cfg.dataset.resize_size} "
+        f"horizon={cfg.dataset.horizon} n_action_steps={cfg.policy.n_action_steps} "
         f"N={len(dataset)} warmup={args.warmup} steps={args.steps}"
     )
     cache = getattr(dataset, "_image_cache", None)
@@ -160,6 +178,12 @@ def main() -> None:
     steps_ep = len(dataset) // cfg.train.batch_size
     h_ep = steps_ep * s_per_it / 3600.0
     mem = torch.cuda.max_memory_allocated() / (1024**3)
+    try:
+        import resource
+
+        maxrss_gb = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / (1024**2)
+    except Exception:
+        maxrss_gb = float("nan")
 
     print("---")
     print(f"steady: {args.steps} steps in {elapsed:.1f}s")
@@ -167,6 +191,7 @@ def main() -> None:
     print(f"samp/s: {samp_s:.2f}")
     print(f"est h/epoch: {h_ep:.2f} (steps/epoch={steps_ep})")
     print(f"peak VRAM: {mem:.2f} GB")
+    print(f"peak RSS: {maxrss_gb:.2f} GB")
     print(f"last_loss: {last_loss:.4f}")
 
 
