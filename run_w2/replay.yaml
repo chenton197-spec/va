@@ -7,7 +7,7 @@ dataset_root: datasets/to_init
 episode_index: 0
 
 # 与采集相同的 teleop 部署 YAML（HCX / Gloria-M）
-teleop_yaml: /home/casbot/ct/teleop_project/teleop.yaml
+teleop_yaml: /home/a/Code/teleop_project/teleop.yaml
 
 # 轨迹字段：action=当时下发的目标角；observation.state=当时反馈角
 joint_column: action

@@ -23,8 +23,8 @@ import yaml
 VA_ROOT = Path(__file__).resolve().parents[1]
 SCRIPT_DIR = Path(__file__).resolve().parent
 DEFAULT_REPLAY_YAML = SCRIPT_DIR / "replay.yaml"
-DEFAULT_TELEOP_ROOT = Path("/home/casbot/ct/teleop_project")
-FALLBACK_TELEOP_ROOT = Path("/home/casbot/teleop_project")
+DEFAULT_TELEOP_ROOT = Path("/home/a/Code/teleop_project")
+FALLBACK_TELEOP_ROOT = Path("/home/a/Code/teleop_project")
 
 CAMERA_COLUMNS = (
     "observation.images.head",

@@ -12,12 +12,13 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+import cv2
 import numpy as np
 import torch
 import yaml
 
 VA_ROOT = Path(__file__).resolve().parents[1]
-TELEOP_ROOT = Path("/home/casbot/teleop_project")
+TELEOP_ROOT = Path("/home/a/Code/teleop_project")
 SCRIPT_DIR = Path(__file__).resolve().parent
 DEPLOY_YAML = SCRIPT_DIR / "deploy.yaml"
 
@@ -27,9 +28,10 @@ if str(VA_ROOT) not in sys.path:
     sys.path.insert(0, str(VA_ROOT))
 
 from hcx_sdk import RobotClient  # noqa: E402
-from robotfm.config import load_config  # noqa: E402
-from robotfm.data.dataset import spatial_preprocess_images  # noqa: E402
+from robotfm.config import _normalize_rtc_config, load_config  # noqa: E402
+from robotfm.data.dataset import crop_images, resize_images  # noqa: E402
 from robotfm.data.stats import denormalize, normalize  # noqa: E402
+from robotfm.policies.rtc import ActionQueue, RTCConfig  # noqa: E402
 from robotfm.train import build_policy  # noqa: E402
 from robotfm.types import Observation  # noqa: E402
 from teleop_sdk.adapters.gloria_m import GloriaMGripperFollower  # noqa: E402
@@ -43,11 +45,52 @@ def _resolve_path(value: str | Path, *, base: Path) -> Path:
     return path
 
 
+def _parse_optional_gripper(value: Any, *, field: str) -> float | None:
+    if value is None:
+        return None
+    opening = float(value)
+    if not math.isfinite(opening) or opening < 0.0 or opening > 1.0:
+        raise ValueError(f"{field} 必须是 [0, 1] 内的有限数")
+    return opening
+
+
+JOINT_LIMITS_MIN_DEG = (-169.0, -100.0, -169.0, -139.0, -169.0, -54.0, -59.0)
+JOINT_LIMITS_MAX_DEG = (169.0, 100.0, 169.0, 54.0, 169.0, 54.0, 59.0)
+
+
+def _parse_joint_limits_deg(
+    raw: Any, source: Path
+) -> tuple[np.ndarray, np.ndarray]:
+    lo = np.asarray(JOINT_LIMITS_MIN_DEG, dtype=np.float64)
+    hi = np.asarray(JOINT_LIMITS_MAX_DEG, dtype=np.float64)
+    if raw is None:
+        return lo, hi
+    if not isinstance(raw, dict):
+        raise ValueError(f"joint_limits_deg 必须是映射: {source}")
+    if raw.get("min") is not None:
+        lo = np.asarray([float(v) for v in raw["min"]], dtype=np.float64)
+    if raw.get("max") is not None:
+        hi = np.asarray([float(v) for v in raw["max"]], dtype=np.float64)
+    if lo.shape != (7,) or hi.shape != (7,):
+        raise ValueError("joint_limits_deg.min / max 必须是 7 维")
+    if not np.all(np.isfinite(lo)) or not np.all(np.isfinite(hi)):
+        raise ValueError("joint_limits_deg 必须是有限数")
+    if np.any(lo >= hi):
+        raise ValueError("joint_limits_deg 每轴必须 min < max")
+    return lo, hi
+
+
 def _parse_start_pose(
     start: Any, source: Path
-) -> tuple[list[float] | None, list[float] | None]:
+) -> tuple[
+    list[float] | None,
+    list[float] | None,
+    float | None,
+    float | None,
+    float,
+]:
     if start is None:
-        return None, None
+        return None, None, None, None, 1.0
     if not isinstance(start, dict):
         raise ValueError(f"start_pose 必须是映射: {source}")
     left = start.get("left_joints_deg")
@@ -58,7 +101,17 @@ def _parse_start_pose(
         raise ValueError("start_pose.left_joints_deg 必须是 7 维")
     if right_j is not None and len(right_j) != 7:
         raise ValueError("start_pose.right_joints_deg 必须是 7 维")
-    return left_j, right_j
+    left_g = _parse_optional_gripper(
+        start.get("left_gripper"), field="start_pose.left_gripper"
+    )
+    right_g = _parse_optional_gripper(
+        start.get("right_gripper"), field="start_pose.right_gripper"
+    )
+    ramp_raw = start.get("gripper_ramp_s", 1.0)
+    ramp_s = 1.0 if ramp_raw in (None, "") else float(ramp_raw)
+    if not math.isfinite(ramp_s) or ramp_s <= 0.0:
+        raise ValueError("start_pose.gripper_ramp_s 必须是正的有限秒数")
+    return left_j, right_j, left_g, right_g, ramp_s
 
 
 def _load_deploy_config(path: Path) -> dict[str, Any]:
@@ -69,23 +122,68 @@ def _load_deploy_config(path: Path) -> dict[str, Any]:
     if not isinstance(data, dict):
         raise ValueError(f"部署配置根节点必须是映射: {path}")
 
-    required = ("checkpoint", "config", "teleop_yaml", "max_steps")
+    required = ("checkpoint", "teleop_yaml", "max_steps")
     missing = [k for k in required if k not in data or data[k] in (None, "")]
     if missing:
         raise ValueError(f"deploy.yaml 缺少字段: {missing}")
 
-    left_start, right_start = _parse_start_pose(data.get("start_pose"), path)
+    left_start, right_start, left_g, right_g, gripper_ramp_s = _parse_start_pose(
+        data.get("start_pose"), path
+    )
+    joint_lo, joint_hi = _parse_joint_limits_deg(data.get("joint_limits_deg"), path)
+    if left_start is not None:
+        left_start = _clamp_joints_by_limits(
+            left_start, joint_lo, joint_hi, side="start_pose.left"
+        )
+    if right_start is not None:
+        right_start = _clamp_joints_by_limits(
+            right_start, joint_lo, joint_hi, side="start_pose.right"
+        )
     move = data.get("move_joints", {}) or {}
     if not isinstance(move, dict):
         raise ValueError("deploy.yaml 的 move_joints 必须是映射")
 
+    train_cfg = data.get("config")
+    train_cfg_path = (
+        _resolve_path(train_cfg, base=VA_ROOT) if train_cfg else None
+    )
+
+    exec_raw = data.get("exec_action_steps", None)
+    if exec_raw in (None, ""):
+        exec_action_steps = None
+    else:
+        exec_action_steps = int(exec_raw)
+        if exec_action_steps <= 0:
+            raise ValueError("deploy.yaml 的 exec_action_steps 必须 > 0")
+
+    rtc_raw = data.get("rtc")
+    rtc_override: dict[str, Any] = {}
+    if rtc_raw is not None:
+        if not isinstance(rtc_raw, dict):
+            raise ValueError(f"deploy.yaml 的 rtc 必须是映射: {path}")
+        if "enabled" in rtc_raw and rtc_raw["enabled"] is not None:
+            rtc_override["enabled"] = bool(rtc_raw["enabled"])
+        if "guidance_enabled" in rtc_raw and rtc_raw["guidance_enabled"] is not None:
+            rtc_override["guidance_enabled"] = bool(rtc_raw["guidance_enabled"])
+        if "inference_delay" in rtc_raw and rtc_raw["inference_delay"] is not None:
+            rtc_override["inference_delay"] = int(rtc_raw["inference_delay"])
+        if "execution_horizon" in rtc_raw and rtc_raw["execution_horizon"] is not None:
+            rtc_override["execution_horizon"] = int(rtc_raw["execution_horizon"])
+
     return {
         "checkpoint": _resolve_path(data["checkpoint"], base=VA_ROOT),
-        "config": _resolve_path(data["config"], base=VA_ROOT),
+        "config": train_cfg_path,
         "teleop_yaml": _resolve_path(data["teleop_yaml"], base=SCRIPT_DIR),
         "max_steps": int(data["max_steps"]),
+        "exec_action_steps": exec_action_steps,
+        "rtc": rtc_override,
         "left_start_joints_deg": left_start,
         "right_start_joints_deg": right_start,
+        "left_start_gripper": left_g,
+        "right_start_gripper": right_g,
+        "start_gripper_ramp_s": gripper_ramp_s,
+        "joint_limits_min_deg": joint_lo,
+        "joint_limits_max_deg": joint_hi,
         "move_speed_ratio": (
             None if move.get("speed_ratio", 0.1) is None else float(move.get("speed_ratio", 0.1))
         ),
@@ -106,7 +204,48 @@ def _load_deploy_config(path: Path) -> dict[str, Any]:
             move.get("feedback_confirm_poll_interval_s", 0.05)
         ),
         "move_angle_tolerance_deg": float(move.get("angle_tolerance_deg", 0.01)),
+        "move_max_delta_deg": float(move.get("max_delta_deg", 3.0)),
     }
+
+
+def _apply_rtc_overrides(cfg: Any, deploy_rtc: dict[str, Any]) -> None:
+    """按 deploy.yaml rtc > 训练 YAML 优先级覆盖 policy.rtc。"""
+    rtc = _normalize_rtc_config(cfg.policy.rtc)
+    enabled = rtc.enabled
+    guidance_enabled = rtc.guidance_enabled
+    inference_delay = rtc.inference_delay
+    execution_horizon = rtc.execution_horizon
+
+    if "enabled" in deploy_rtc:
+        enabled = bool(deploy_rtc["enabled"])
+    if "guidance_enabled" in deploy_rtc:
+        guidance_enabled = bool(deploy_rtc["guidance_enabled"])
+    if "inference_delay" in deploy_rtc:
+        inference_delay = int(deploy_rtc["inference_delay"])
+    if "execution_horizon" in deploy_rtc:
+        execution_horizon = int(deploy_rtc["execution_horizon"])
+
+    need_rebuild = (
+        bool(deploy_rtc)
+        or enabled != rtc.enabled
+        or guidance_enabled != rtc.guidance_enabled
+        or inference_delay != rtc.inference_delay
+        or execution_horizon != rtc.execution_horizon
+    )
+    if need_rebuild:
+        cfg.policy.rtc = RTCConfig(
+            enabled=enabled,
+            guidance_enabled=guidance_enabled,
+            prefix_attention_schedule=rtc.prefix_attention_schedule,
+            max_guidance_weight=rtc.max_guidance_weight,
+            execution_horizon=execution_horizon,
+            inference_delay=inference_delay,
+            debug=rtc.debug,
+            debug_maxlen=rtc.debug_maxlen,
+        )
+    else:
+        cfg.policy.rtc = rtc
+    cfg.policy.rtc = _normalize_rtc_config(cfg.policy.rtc)
 
 
 def _parse_args() -> argparse.Namespace:
@@ -126,7 +265,6 @@ def _pace_step(step_start: float, fps: int) -> None:
 def _preprocess_images(
     images: dict[str, np.ndarray],
     *,
-    pre_crop_size: int | None,
     resize_size: int | None,
     crop_size: int | None,
     eval_fixed_crop: bool,
@@ -137,13 +275,9 @@ def _preprocess_images(
         if arr.dtype != np.uint8:
             arr = np.clip(arr, 0, 255).astype(np.uint8)
         t = torch.from_numpy(arr.astype(np.float32) / 255.0).permute(2, 0, 1).unsqueeze(0)
-        t = spatial_preprocess_images(
-            t,
-            pre_crop_size=pre_crop_size,
-            resize_size=resize_size,
-            crop_size=crop_size if eval_fixed_crop else None,
-            random_crop=False,
-        )
+        t = resize_images(t, resize_size)
+        if crop_size is not None and eval_fixed_crop:
+            t = crop_images(t, crop_size, random=False)
         out[name] = t.squeeze(0).permute(1, 2, 0).contiguous().numpy()
     return out
 
@@ -151,7 +285,6 @@ def _preprocess_images(
 def _prepare_observation(
     obs: Observation,
     *,
-    pre_crop_size: int | None,
     resize_size: int | None,
     crop_size: int | None,
     eval_fixed_crop: bool,
@@ -159,7 +292,6 @@ def _prepare_observation(
     return Observation(
         images=_preprocess_images(
             obs.images,
-            pre_crop_size=pre_crop_size,
             resize_size=resize_size,
             crop_size=crop_size,
             eval_fixed_crop=eval_fixed_crop,
@@ -218,6 +350,7 @@ class HardwareBundle:
     left_gripper_loop: "BackgroundGripperLoop | None" = None
     right_gripper_loop: "BackgroundGripperLoop | None" = None
     camera_manager: Any | None = None
+    camera_preview: "CameraPreviewLoop | None" = None
     left_start_joints_deg: list[float] | None = None
     right_start_joints_deg: list[float] | None = None
 
@@ -269,14 +402,142 @@ class BackgroundGripperLoop:
                 next_t = time.perf_counter()
 
 
+PREVIEW_WINDOW_NAME = "W2 cameras"
+PREVIEW_FPS = 15.0
+PREVIEW_TILE_HEIGHT = 360
+
+
+def _bgr_preview_tile(rgb: np.ndarray | None, name: str, height: int) -> np.ndarray:
+    if rgb is None:
+        tile = np.zeros((height, int(round(height * 16 / 9)), 3), dtype=np.uint8)
+        label = f"{name}: no frame"
+    else:
+        bgr = np.ascontiguousarray(rgb[..., ::-1])
+        src_h, src_w = bgr.shape[:2]
+        new_w = max(1, int(round(src_w * height / max(src_h, 1))))
+        tile = cv2.resize(bgr, (new_w, height), interpolation=cv2.INTER_AREA)
+        label = name
+    cv2.putText(
+        tile,
+        label,
+        (12, 28),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.8,
+        (0, 255, 0),
+        2,
+        cv2.LINE_AA,
+    )
+    return tile
+
+
+def _compose_camera_preview(
+    camera_manager: Any,
+    camera_names: list[str],
+    *,
+    tile_height: int,
+) -> np.ndarray:
+    tiles: list[np.ndarray] = []
+    for name in camera_names:
+        rgb: np.ndarray | None = None
+        try:
+            frame = camera_manager.camera(name).get_frame()
+            if frame is not None and frame.rgb is not None:
+                rgb = np.asarray(frame.rgb)
+                if rgb.dtype != np.uint8:
+                    rgb = np.clip(rgb, 0, 255).astype(np.uint8)
+        except Exception:
+            rgb = None
+        tiles.append(_bgr_preview_tile(rgb, name, tile_height))
+    height = max(tile.shape[0] for tile in tiles)
+    gap = np.zeros((height, 4, 3), dtype=np.uint8)
+    parts: list[np.ndarray] = []
+    for i, tile in enumerate(tiles):
+        if i:
+            parts.append(gap)
+        parts.append(tile)
+    return np.concatenate(parts, axis=1)
+
+
+class CameraPreviewLoop:
+    """后台以固定帧率拼接三路相机，在单个 OpenCV 窗口显示。"""
+
+    def __init__(
+        self,
+        camera_manager: Any,
+        camera_names: list[str],
+        *,
+        fps: float = PREVIEW_FPS,
+        tile_height: int = PREVIEW_TILE_HEIGHT,
+        window_name: str = PREVIEW_WINDOW_NAME,
+    ) -> None:
+        if fps <= 0.0:
+            raise ValueError("preview fps 必须 > 0")
+        self._camera_manager = camera_manager
+        self._camera_names = list(camera_names)
+        self._period_s = 1.0 / float(fps)
+        self._tile_height = int(tile_height)
+        self._window_name = window_name
+        self._stop = threading.Event()
+        self._thread: threading.Thread | None = None
+
+    def start(self) -> None:
+        if self._thread is not None:
+            raise RuntimeError("相机预览已在运行")
+        self._thread = threading.Thread(
+            target=self._run, name="camera-preview", daemon=True
+        )
+        self._thread.start()
+
+    def stop(self, *, join_timeout_s: float = 2.0) -> None:
+        self._stop.set()
+        if self._thread is not None and self._thread.is_alive():
+            self._thread.join(timeout=join_timeout_s)
+        self._thread = None
+
+    def _run(self) -> None:
+        try:
+            cv2.namedWindow(self._window_name, cv2.WINDOW_NORMAL)
+        except Exception as exc:
+            print(f"[WARN] 无法创建相机预览窗口: {exc}")
+            return
+        next_t = time.perf_counter()
+        try:
+            while not self._stop.is_set():
+                mosaic = _compose_camera_preview(
+                    self._camera_manager,
+                    self._camera_names,
+                    tile_height=self._tile_height,
+                )
+                cv2.imshow(self._window_name, mosaic)
+                next_t += self._period_s
+                remain_ms = int(round((next_t - time.perf_counter()) * 1000.0))
+                if remain_ms < 1:
+                    remain_ms = 1
+                    next_t = time.perf_counter()
+                cv2.waitKey(remain_ms)
+        except Exception as exc:
+            print(f"[WARN] 相机预览线程退出: {exc}")
+        finally:
+            try:
+                cv2.destroyWindow(self._window_name)
+                cv2.waitKey(1)
+            except Exception:
+                pass
+
+
 def _connect_cameras(teleop_yaml: Path, required: list[str]) -> Any:
     from orbbec_sdk import OrbbecManager, load_orbbec_camera_configs
 
-    all_configs = load_orbbec_camera_configs(teleop_yaml)
+    # 与 openarm_hcx_dual_arm 采集一致：读 hcx_orbbec（head/left_hand/right_hand），
+    # 不要用默认 orbbec 段（hand/head），否则相机名对不上训练配置。
+    all_configs = load_orbbec_camera_configs(teleop_yaml, section_name="hcx_orbbec")
     by_name = {c.name: c for c in all_configs}
     missing = [n for n in required if n not in by_name]
     if missing:
-        raise ValueError(f"teleop.yaml 缺少训练所需相机: {missing}")
+        raise ValueError(
+            f"teleop.yaml 的 hcx_orbbec 缺少训练所需相机: {missing} "
+            f"(已声明: {sorted(by_name)})"
+        )
     configs = tuple(by_name[n] for n in required)
     manager = OrbbecManager(configs)
     manager.start()
@@ -407,6 +668,83 @@ def _read_gripper(gripper, fallback: float = 1.0) -> float:
     return float(np.clip(opening, 0.0, 1.0))
 
 
+def _ramp_start_grippers(
+    hw: HardwareBundle,
+    *,
+    left_target: float | None,
+    right_target: float | None,
+    duration_s: float,
+    rate_hz: float,
+) -> None:
+    """启动时从当前开口线性插值到 start_pose 夹爪目标。"""
+    if left_target is None and right_target is None:
+        return
+    if not math.isfinite(duration_s) or duration_s <= 0.0:
+        raise ValueError("start_pose.gripper_ramp_s 必须是正的有限秒数")
+    if not math.isfinite(rate_hz) or rate_hz <= 0.0:
+        raise ValueError("gripper rate_hz 必须 > 0")
+
+    left_from = (
+        _read_gripper(hw.left_gripper, fallback=1.0)
+        if left_target is not None
+        else None
+    )
+    right_from = (
+        _read_gripper(hw.right_gripper, fallback=1.0)
+        if right_target is not None
+        else None
+    )
+    n_steps = max(1, int(math.ceil(duration_s * rate_hz)))
+    period_s = duration_s / float(n_steps)
+    print(
+        f"[INFO] 启动夹爪渐变 steps={n_steps} duration_s={duration_s:.3f} "
+        f"left={left_from}->{left_target} right={right_from}->{right_target}"
+    )
+    for step in range(1, n_steps + 1):
+        alpha = float(step) / float(n_steps)
+        if left_target is not None and left_from is not None:
+            opening = float(left_from + alpha * (left_target - left_from))
+            if hw.left_gripper_loop is not None:
+                hw.left_gripper_loop.set_opening(opening)
+            elif hw.left_gripper is not None:
+                _ = hw.left_gripper.send_normalized(opening)
+        if right_target is not None and right_from is not None:
+            opening = float(right_from + alpha * (right_target - right_from))
+            if hw.right_gripper_loop is not None:
+                hw.right_gripper_loop.set_opening(opening)
+            elif hw.right_gripper is not None:
+                _ = hw.right_gripper.send_normalized(opening)
+        time.sleep(period_s)
+
+
+def _camera_status_label(camera: Any) -> str:
+    status = getattr(camera, "status", None)
+    if status is None:
+        return "unknown"
+    value = getattr(status, "value", status)
+    return str(value)
+
+
+def _describe_camera_frame(camera_manager: Any, name: str) -> str:
+    cam = camera_manager.camera(name)
+    status = _camera_status_label(cam)
+    last_error = getattr(cam, "last_error", None)
+    last_ns = getattr(cam, "latest_capture_monotonic_ns", None)
+    frame = cam.get_frame()
+    if frame is None:
+        detail = "get_frame=None"
+    elif getattr(frame, "rgb", None) is None:
+        detail = "rgb=None"
+    else:
+        rgb = np.asarray(frame.rgb)
+        detail = f"rgb={tuple(int(v) for v in rgb.shape)}"
+    age = "n/a"
+    if last_ns is not None:
+        age = f"{max(0.0, time.perf_counter() - last_ns / 1e9):.2f}s"
+    error = f" error={last_error}" if last_error else ""
+    return f"{name}: status={status} {detail} last_frame_age={age}{error}"
+
+
 def _read_images(
     camera_manager,
     camera_names: list[str],
@@ -416,25 +754,38 @@ def _read_images(
     if camera_manager is None:
         raise RuntimeError("相机未连接，无法读取图像")
     deadline = time.perf_counter() + timeout_s
+    missing: list[str] = list(camera_names)
     while time.perf_counter() < deadline:
         images: dict[str, np.ndarray] = {}
-        ready = True
+        missing = []
         for name in camera_names:
             cam = camera_manager.camera(name)
             frame = cam.get_frame()
             if frame is None or frame.rgb is None:
-                ready = False
-                break
+                missing.append(name)
+                continue
             rgb = np.asarray(frame.rgb)
             if rgb.dtype != np.uint8:
                 rgb = np.clip(rgb, 0, 255).astype(np.uint8)
             if rgb.ndim != 3 or rgb.shape[-1] != 3:
                 raise RuntimeError(f"相机 {name} RGB 形状异常: {rgb.shape}")
             images[name] = np.ascontiguousarray(rgb)
-        if ready and len(images) == len(camera_names):
+        if not missing:
             return images
         time.sleep(0.01)
-    raise TimeoutError(f"等待相机帧超时 ({timeout_s}s): {camera_names}")
+    details = [
+        _describe_camera_frame(camera_manager, name) for name in camera_names
+    ]
+    print(
+        f"[ERROR] 等待相机帧超时 ({timeout_s}s) 掉线={missing or list(camera_names)}",
+        flush=True,
+    )
+    for line in details:
+        print(f"[ERROR]   {line}", flush=True)
+    raise TimeoutError(
+        f"等待相机帧超时 ({timeout_s}s): 掉线={missing or list(camera_names)}; "
+        + "; ".join(details)
+    )
 
 
 def _read_observation(hw: HardwareBundle, cameras: list[str], *, last_state: np.ndarray | None) -> Observation:
@@ -459,6 +810,65 @@ def _read_observation(hw: HardwareBundle, cameras: list[str], *, last_state: np.
     return Observation(images=images, state=state, timestamp=time.time())
 
 
+def _clamp_joints_by_limits(
+    joints: list[float] | np.ndarray,
+    lo: np.ndarray,
+    hi: np.ndarray,
+    *,
+    side: str,
+) -> list[float]:
+    """将 7 轴目标角截断到配置限位内。"""
+    arr = np.asarray(joints, dtype=np.float64)
+    if arr.shape != (7,):
+        raise ValueError(f"{side} 关节必须是 7 维，实际为 {arr.shape}")
+    clipped = np.clip(arr, lo, hi)
+    over = (arr < lo - 1e-6) | (arr > hi + 1e-6)
+    if np.any(over):
+        axes = [int(i) for i, flag in enumerate(over) if flag]
+        details = ", ".join(
+            f"J{i} {float(arr[i]):+.3f}→{float(clipped[i]):+.3f}deg"
+            for i in axes
+        )
+        print(f"[WARN] {side} 关节限位截断 轴={axes} {details}", flush=True)
+    return clipped.astype(float).tolist()
+
+
+def _clamp_joints_by_max_delta(
+    target: np.ndarray,
+    current: np.ndarray,
+    max_delta_deg: float,
+) -> tuple[list[float], np.ndarray]:
+    """将目标关节角相对当前反馈限制在 ±max_delta_deg 内。"""
+    target_np = np.asarray(target, dtype=np.float64)
+    current_np = np.asarray(current, dtype=np.float64)
+    if target_np.shape != current_np.shape:
+        raise ValueError(
+            f"关节维数不一致: target={target_np.shape} current={current_np.shape}"
+        )
+    raw_delta = target_np - current_np
+    delta = np.clip(raw_delta, -max_delta_deg, max_delta_deg)
+    return (current_np + delta).astype(float).tolist(), raw_delta
+
+
+def _log_max_delta_clip(
+    side: str,
+    raw_delta: np.ndarray,
+    *,
+    max_delta_deg: float,
+) -> None:
+    clipped = np.abs(raw_delta) > (max_delta_deg + 1e-6)
+    if not np.any(clipped):
+        return
+    axes = [int(i) for i, flag in enumerate(clipped) if flag]
+    details = ", ".join(
+        f"J{i} delta={float(raw_delta[i]):+.3f}deg" for i in axes
+    )
+    print(
+        f"[WARN] {side} max_delta_deg={max_delta_deg:g} 裁剪轴={axes} {details}",
+        flush=True,
+    )
+
+
 def _send_action(
     hw: HardwareBundle,
     action: np.ndarray,
@@ -469,9 +879,31 @@ def _send_action(
     feedback_confirm_timeout_s: float,
     feedback_confirm_poll_interval_s: float,
     angle_tolerance_deg: float,
+    max_delta_deg: float,
+    joint_limits_min_deg: np.ndarray,
+    joint_limits_max_deg: np.ndarray,
 ) -> None:
-    left = action[:7].astype(float).tolist()
-    right = action[7:14].astype(float).tolist()
+    if hw.left_arm is None or hw.right_arm is None:
+        raise RuntimeError("HCX 双臂未连接")
+    if not math.isfinite(max_delta_deg) or max_delta_deg <= 0.0:
+        raise ValueError("move_joints.max_delta_deg 必须是正的有限数")
+
+    left_current = np.asarray(hw.left_arm.joint_angles(), dtype=np.float64)
+    right_current = np.asarray(hw.right_arm.joint_angles(), dtype=np.float64)
+    left, left_delta = _clamp_joints_by_max_delta(
+        action[:7], left_current, max_delta_deg
+    )
+    right, right_delta = _clamp_joints_by_max_delta(
+        action[7:14], right_current, max_delta_deg
+    )
+    _log_max_delta_clip("left", left_delta, max_delta_deg=max_delta_deg)
+    _log_max_delta_clip("right", right_delta, max_delta_deg=max_delta_deg)
+    left = _clamp_joints_by_limits(
+        left, joint_limits_min_deg, joint_limits_max_deg, side="left"
+    )
+    right = _clamp_joints_by_limits(
+        right, joint_limits_min_deg, joint_limits_max_deg, side="right"
+    )
     left_g = float(np.clip(action[14], 0.0, 1.0))
     right_g = float(np.clip(action[15], 0.0, 1.0))
     print(
@@ -479,8 +911,6 @@ def _send_action(
         f"left_gripper={left_g:.4f} right_gripper={right_g:.4f}",
         flush=True,
     )
-    if hw.left_arm is None or hw.right_arm is None:
-        raise RuntimeError("HCX 双臂未连接")
 
     if hw.left_gripper_loop is not None:
         hw.left_gripper_loop.set_opening(left_g)
@@ -558,6 +988,12 @@ def _confirm_targets_by_feedback(
 
 
 def _shutdown(hw: HardwareBundle) -> None:
+    if hw.camera_preview is not None:
+        try:
+            hw.camera_preview.stop()
+        except Exception as exc:
+            print(f"[WARN] 停止相机预览时出错: {exc}")
+        hw.camera_preview = None
     if hw.left_gripper_loop is not None:
         try:
             hw.left_gripper_loop.stop()
@@ -598,9 +1034,25 @@ def _shutdown(hw: HardwareBundle) -> None:
             print(f"[WARN] 关闭 HCX 客户端时出错: {exc}")
 
 
+def _resolve_train_config(ckpt_path: Path, config_arg: Path | None) -> Path | None:
+    """CLI config > checkpoint 旁 config_source.yaml/config.yaml > None（用内嵌）。"""
+    if config_arg is not None:
+        return config_arg
+    for name in ("config_source.yaml", "config.yaml"):
+        cand = ckpt_path.parent / name
+        if cand.is_file():
+            return cand
+    return None
+
+
 def _validate_runtime_contract(cfg: Any, cameras: list[str], stats: dict) -> None:
     if not cameras:
         raise ValueError("训练配置 cameras 为空")
+    expected_cams = ("head", "left_hand", "right_hand")
+    if tuple(cameras) != expected_cams:
+        raise ValueError(
+            f"当前 HCX 双臂脚本要求 cameras={list(expected_cams)}，实际为 {cameras}"
+        )
     if int(cfg.state_dim) != 16:
         raise ValueError(f"当前 HCX 双臂脚本要求 state_dim=16，实际为 {cfg.state_dim}")
     if int(cfg.action_dim) != 16:
@@ -609,8 +1061,24 @@ def _validate_runtime_contract(cfg: Any, cameras: list[str], stats: dict) -> Non
         raise ValueError("dataset.n_obs_steps 必须 > 0")
     if int(cfg.policy.n_action_steps) <= 0:
         raise ValueError("policy.n_action_steps 必须 > 0")
-    if "state" not in stats or "action" not in stats:
-        raise ValueError("checkpoint stats 缺少 state/action 归一化信息")
+    # stats 为扁平键：state_mean/std/min/max、action_mean/std/min/max（见 robotfm.data.stats）
+    required_stat_keys = (
+        "state_mean",
+        "state_std",
+        "state_min",
+        "state_max",
+        "action_mean",
+        "action_std",
+        "action_min",
+        "action_max",
+    )
+    missing = [k for k in required_stat_keys if k not in stats]
+    if missing:
+        raise ValueError(f"checkpoint stats 缺少归一化字段: {missing}")
+    for key in required_stat_keys:
+        shape = tuple(np.asarray(stats[key]).shape)
+        if shape != (16,):
+            raise ValueError(f"checkpoint stats[{key}] 形状应为 (16,)，实际为 {shape}")
 
 
 def main() -> None:
@@ -621,36 +1089,87 @@ def main() -> None:
     deploy = _load_deploy_config(deploy_path)
 
     ckpt_path = deploy["checkpoint"]
-    train_cfg_path = deploy["config"]
     teleop_yaml = deploy["teleop_yaml"]
     if not ckpt_path.is_file():
         raise FileNotFoundError(f"找不到 checkpoint: {ckpt_path}")
-    if not train_cfg_path.is_file():
-        raise FileNotFoundError(f"找不到训练配置: {train_cfg_path}")
     if not teleop_yaml.is_file():
         raise FileNotFoundError(f"找不到 teleop.yaml: {teleop_yaml}")
 
+    train_cfg_path = _resolve_train_config(ckpt_path, deploy["config"])
+    if train_cfg_path is not None and not train_cfg_path.is_file():
+        raise FileNotFoundError(f"找不到训练配置: {train_cfg_path}")
+
     print(f"[INFO] 部署配置: {deploy_path}")
+    print(
+        "[INFO] 关节限位 min="
+        f"{[round(float(v), 1) for v in deploy['joint_limits_min_deg']]} "
+        "max="
+        f"{[round(float(v), 1) for v in deploy['joint_limits_max_deg']]}"
+    )
     print(f"[INFO] 加载 checkpoint: {ckpt_path}")
-    print(f"[INFO] 训练配置: {train_cfg_path}")
 
     ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
-    cfg = load_config(train_cfg_path)
+    if train_cfg_path is not None:
+        cfg = load_config(train_cfg_path)
+        print(f"[INFO] 训练配置: {train_cfg_path}")
+    else:
+        cfg = ckpt["config"]
+        print("[INFO] 训练配置: checkpoint 内嵌 config")
     stats = ckpt["stats"]
     cameras = list(cfg.cameras)
     _validate_runtime_contract(cfg, cameras, stats)
 
+    _apply_rtc_overrides(cfg, deploy.get("rtc") or {})
+    rtc_cfg = _normalize_rtc_config(cfg.policy.rtc)
+    rtc_enabled = bool(rtc_cfg.enabled)
+
     norm_mode = cfg.dataset.norm_mode
     n_obs = int(cfg.dataset.n_obs_steps)
     n_action_steps = int(cfg.policy.n_action_steps)
+    horizon = int(cfg.dataset.horizon)
     fps = int(cfg.fps)
     max_steps = deploy["max_steps"]
+    exec_action_steps = deploy["exec_action_steps"]
+    if exec_action_steps is None:
+        exec_action_steps = n_action_steps
+    elif exec_action_steps > n_action_steps:
+        raise ValueError(
+            f"deploy.yaml exec_action_steps={exec_action_steps} 不能大于 "
+            f"policy.n_action_steps={n_action_steps}（后者决定模型输出长度，改大会导致权重 shape 不匹配）"
+        )
+    policy_type = str(cfg.policy.type).lower()
+    if rtc_enabled and policy_type in {"a2a", "n_a2a"} and n_action_steps != horizon:
+        raise ValueError(
+            "A2A RTC 要求 n_action_steps == horizon "
+            f"(got n_action_steps={n_action_steps}, horizon={horizon})"
+        )
+    if rtc_enabled and int(rtc_cfg.execution_horizon) >= n_action_steps:
+        raise ValueError(
+            "RTC execution_horizon 必须小于 n_action_steps，否则 leftover 为空、"
+            f"无法做 prefix 引导 (execution_horizon={rtc_cfg.execution_horizon}, "
+            f"n_action_steps={n_action_steps})"
+        )
 
     device = torch.device(cfg.train.device if torch.cuda.is_available() else "cpu")
     policy = build_policy(cfg, stats)
     policy.load_state_dict(ckpt["policy_state_dict"])
     policy.to(device)
     policy.eval()
+    print(
+        f"[INFO] 策略已就绪 device={device} cameras={cameras} "
+        f"norm={norm_mode} n_obs={n_obs} n_action_steps={n_action_steps} "
+        f"exec_action_steps={exec_action_steps} fps={fps}"
+    )
+    print(
+        f"[INFO] rtc.enabled={rtc_enabled} guidance={rtc_cfg.guidance_enabled} "
+        f"delay={rtc_cfg.inference_delay} exec_h={rtc_cfg.execution_horizon} "
+        f"schedule={rtc_cfg.prefix_attention_schedule}"
+    )
+    if rtc_enabled:
+        print(
+            "[INFO] RTC 闭环：执行 execution_horizon 步后 replan，"
+            "用未执行 leftover 做 prefix 引导；忽略 exec_action_steps"
+        )
 
     hw = HardwareBundle(
         left_start_joints_deg=deploy["left_start_joints_deg"],
@@ -674,6 +1193,15 @@ def main() -> None:
             )
             hw.right_gripper_loop.start(initial_opening=hold_right)
         hw.camera_manager = _connect_cameras(teleop_yaml, cameras)
+        # OpenCV 预览默认关闭；需要时取消注释即可
+        # hw.camera_preview = CameraPreviewLoop(
+        #     hw.camera_manager, cameras, fps=PREVIEW_FPS
+        # )
+        # hw.camera_preview.start()
+        # print(
+        #     f"[INFO] 相机预览窗口已启动 window={PREVIEW_WINDOW_NAME} "
+        #     f"fps={int(PREVIEW_FPS)} cameras={cameras}"
+        # )
 
         if deploy["left_start_joints_deg"] is not None:
             hw.left_arm.move_joints(
@@ -710,15 +1238,21 @@ def main() -> None:
                 angle_tolerance_deg=deploy["move_angle_tolerance_deg"],
             )
 
+        _ramp_start_grippers(
+            hw,
+            left_target=deploy["left_start_gripper"],
+            right_target=deploy["right_start_gripper"],
+            duration_s=deploy["start_gripper_ramp_s"],
+            rate_hz=gripper_rate_hz,
+        )
+
         obs = _read_observation(hw, cameras, last_state=None)
         obs.validate(cameras, int(cfg.state_dim))
-        pre_crop_size = cfg.dataset.pre_crop_size
         resize_size = cfg.dataset.resize_size
         crop_size = cfg.dataset.crop_size
         eval_fixed_crop = bool(cfg.dataset.eval_fixed_crop)
         obs = _prepare_observation(
             obs,
-            pre_crop_size=pre_crop_size,
             resize_size=resize_size,
             crop_size=crop_size,
             eval_fixed_crop=eval_fixed_crop,
@@ -727,32 +1261,82 @@ def main() -> None:
 
         chunk_actions: list[np.ndarray] = []
         chunk_idx = 0
-        print(f"[INFO] 开始闭环，最多 {max_steps} 步")
+        action_queue = ActionQueue(rtc_cfg) if rtc_enabled else None
+        rtc_replan_threshold = (
+            n_action_steps - int(rtc_cfg.execution_horizon) if rtc_enabled else 0
+        )
+        print(
+            f"[INFO] 开始闭环，最多 {max_steps} 步"
+            + (
+                f" (RTC qsize<={rtc_replan_threshold})"
+                if rtc_enabled
+                else ""
+            )
+        )
 
         for step_i in range(max_steps):
             t0 = time.perf_counter()
-            if chunk_idx >= len(chunk_actions):
-                batch = _build_obs_batch(
-                    obs_history,
-                    cameras=cameras,
-                    n_obs_steps=n_obs,
-                    stats=stats,
-                    norm_mode=norm_mode,
-                    device=device,
-                )
-                with torch.no_grad():
-                    pred = policy.sample_actions(batch)[0].cpu()
-                pred_phys = denormalize(
-                    pred, stats, prefix="action", mode=norm_mode
-                ).numpy()
-                chunk_actions = [
-                    np.asarray(a, dtype=np.float32) for a in pred_phys[:n_action_steps]
-                ]
-                chunk_idx = 0
-                print(f"[INFO] step={step_i} 重新规划 chunk={len(chunk_actions)}")
+            if rtc_enabled:
+                assert action_queue is not None
+                if action_queue.qsize() <= rtc_replan_threshold:
+                    leftover = action_queue.get_left_over()
+                    if leftover is not None and leftover.shape[0] == 0:
+                        leftover = None
+                    leftover_len = 0 if leftover is None else int(leftover.shape[0])
+                    if leftover is not None:
+                        leftover = leftover.to(device)
+                    batch = _build_obs_batch(
+                        obs_history,
+                        cameras=cameras,
+                        n_obs_steps=n_obs,
+                        stats=stats,
+                        norm_mode=norm_mode,
+                        device=device,
+                    )
+                    with torch.no_grad():
+                        pred = policy.sample_actions(
+                            batch,
+                            prev_chunk_left_over=leftover,
+                            inference_delay=rtc_cfg.inference_delay,
+                            execution_horizon=rtc_cfg.execution_horizon,
+                        )[0].cpu()
+                    processed = denormalize(
+                        pred, stats, prefix="action", mode=norm_mode
+                    )
+                    # 阻塞推理：merge delay=0，连续性靠 leftover prefix 引导，不靠执行旧点。
+                    action_queue.merge(pred, processed, real_delay=0)
+                    print(
+                        f"[INFO] step={step_i} RTC 重新规划 leftover={leftover_len} "
+                        f"chunk={action_queue.qsize()}"
+                    )
+                action_t = action_queue.get()
+                if action_t is None:
+                    raise RuntimeError("RTC ActionQueue 为空")
+                action = np.asarray(action_t.numpy(), dtype=np.float32)
+            else:
+                if chunk_idx >= len(chunk_actions):
+                    batch = _build_obs_batch(
+                        obs_history,
+                        cameras=cameras,
+                        n_obs_steps=n_obs,
+                        stats=stats,
+                        norm_mode=norm_mode,
+                        device=device,
+                    )
+                    with torch.no_grad():
+                        pred = policy.sample_actions(batch)[0].cpu()
+                    pred_phys = denormalize(
+                        pred, stats, prefix="action", mode=norm_mode
+                    ).numpy()
+                    chunk_actions = [
+                        np.asarray(a, dtype=np.float32)
+                        for a in pred_phys[:exec_action_steps]
+                    ]
+                    chunk_idx = 0
+                    print(f"[INFO] step={step_i} 重新规划 chunk={len(chunk_actions)}")
 
-            action = chunk_actions[chunk_idx]
-            chunk_idx += 1
+                action = chunk_actions[chunk_idx]
+                chunk_idx += 1
             print(f"[INFO] step={step_i}", end="")
             _send_action(
                 hw,
@@ -765,11 +1349,13 @@ def main() -> None:
                     "move_feedback_confirm_poll_interval_s"
                 ],
                 angle_tolerance_deg=deploy["move_angle_tolerance_deg"],
+                max_delta_deg=deploy["move_max_delta_deg"],
+                joint_limits_min_deg=deploy["joint_limits_min_deg"],
+                joint_limits_max_deg=deploy["joint_limits_max_deg"],
             )
 
             obs = _prepare_observation(
                 _read_observation(hw, cameras, last_state=obs.state),
-                pre_crop_size=pre_crop_size,
                 resize_size=resize_size,
                 crop_size=crop_size,
                 eval_fixed_crop=eval_fixed_crop,
