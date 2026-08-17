@@ -536,8 +536,20 @@ def train_flow_matching(
             defer_augment=gpu_augment,
             uint8_cache=bool(cfg.dataset.uint8_cache),
             uint8_cache_dir=cfg.dataset.uint8_cache_dir,
+            predict_joint_delta=bool(cfg.policy.predict_joint_delta),
         )
         logger.log(f"dataset: run_dir={run_dir} num_samples={len(dataset)}")
+        if cfg.policy.predict_joint_delta:
+            logger.log(
+                "policy.predict_joint_delta: joint targets are action-q_now; "
+                "grippers stay absolute; action mean/std recomputed on residuals"
+            )
+            rtc_on = bool(getattr(cfg.policy.rtc, "enabled", False))
+            if rtc_on:
+                logger.log(
+                    "WARNING: RTC leftover is in joint-delta space; "
+                    "prefer rtc.enabled=false with predict_joint_delta"
+                )
         if cfg.dataset.uint8_cache:
             cache = getattr(dataset, "_image_cache", None)
             cache_dir = getattr(cache, "cache_dir", None)

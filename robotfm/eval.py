@@ -26,8 +26,9 @@ import torch
 
 from robotfm.config import RobotFMConfig, _normalize_rtc_config, resolve_path
 from robotfm.collect.loop import get_run_dir
+from robotfm.data.action_delta import denormalize_predicted_action, joint_mask_from_names
 from robotfm.data.dataset import spatial_preprocess_images
-from robotfm.data.stats import denormalize, ensure_stats, normalize
+from robotfm.data.stats import ensure_stats, normalize
 from robotfm.envs.registry import make_env
 from robotfm.policies.rtc import ActionQueue
 from robotfm.train import build_policy
@@ -43,11 +44,39 @@ def _pace_step(step_start: float, fps: int) -> None:
         time.sleep(remain)
 
 
+def _denormalize_chunk(
+    pred: torch.Tensor,
+    stats: dict[str, np.ndarray],
+    cfg: RobotFMConfig,
+    q_now_phys: np.ndarray,
+) -> torch.Tensor:
+    """Denormalize a (T, A) action chunk tensor for env execution."""
+    return denormalize_predicted_action(
+        pred,
+        stats,
+        cfg.dataset.norm_mode,
+        q_now_phys=q_now_phys,
+        predict_joint_delta=bool(cfg.policy.predict_joint_delta),
+        joint_mask=joint_mask_from_names(cfg.action_names, cfg.action_dim),
+    )
+
+
 def _denormalize_action(
-    action: np.ndarray, stats: dict[str, np.ndarray], norm_mode: str
+    action: np.ndarray,
+    stats: dict[str, np.ndarray],
+    cfg: RobotFMConfig,
+    q_now_phys: np.ndarray,
 ) -> np.ndarray:
     """将归一化动作还原为环境物理量。"""
-    return denormalize(action, stats, prefix="action", mode=norm_mode)
+    out = denormalize_predicted_action(
+        action,
+        stats,
+        cfg.dataset.norm_mode,
+        q_now_phys=q_now_phys,
+        predict_joint_delta=bool(cfg.policy.predict_joint_delta),
+        joint_mask=joint_mask_from_names(cfg.action_names, cfg.action_dim),
+    )
+    return np.asarray(out, dtype=np.float32)
 
 
 def _normalize_state(
@@ -102,13 +131,6 @@ def _build_obs_batch(
     obs_images = obs_images.unsqueeze(0).to(device)
     obs_state = torch.stack(states, dim=0).unsqueeze(0).to(device)
     return {"obs_images": obs_images, "obs_state": obs_state}
-
-
-def _denormalize_chunk(
-    pred: torch.Tensor, stats: dict[str, np.ndarray], norm_mode: str
-) -> torch.Tensor:
-    """Denormalize a (T, A) action chunk tensor for env execution."""
-    return denormalize(pred, stats, prefix="action", mode=norm_mode)
 
 
 def evaluate_flow_matching(
@@ -232,7 +254,9 @@ def evaluate_flow_matching(
                     if done:
                         break
 
-                    processed = _denormalize_chunk(pred, stats, cfg.dataset.norm_mode)
+                    processed = _denormalize_chunk(
+                        pred, stats, cfg, obs_history[-1].state.astype(np.float32)
+                    )
                     action_queue.merge(pred.cpu(), processed.cpu(), real_delay=delay)
 
                 t0 = time.perf_counter()
@@ -253,7 +277,9 @@ def evaluate_flow_matching(
                 with torch.no_grad():
                     action_t = policy.select_action(batch)
                 action_np = action_t[0].detach().cpu().numpy()
-                action = _denormalize_action(action_np, stats, cfg.dataset.norm_mode)
+                action = _denormalize_action(
+                    action_np, stats, cfg, obs_history[-1].state.astype(np.float32)
+                )
 
                 t0 = time.perf_counter()
                 step = env.step(action)
@@ -273,7 +299,9 @@ def evaluate_flow_matching(
                     with torch.no_grad():
                         pred = policy.sample_actions(batch)[0].cpu().numpy()
                     chunk_actions = [
-                        _denormalize_action(a, stats, cfg.dataset.norm_mode)
+                        _denormalize_action(
+                            a, stats, cfg, obs_history[-1].state.astype(np.float32)
+                        )
                         for a in pred[: cfg.policy.n_action_steps]
                     ]
                     chunk_idx = 0

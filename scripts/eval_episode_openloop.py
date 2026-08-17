@@ -30,13 +30,14 @@ import torch
 from robotfm.collect.loop import get_run_dir
 from robotfm.config import load_config, resolve_path
 from robotfm.data.dataset import spatial_preprocess_images
+from robotfm.data.action_delta import denormalize_predicted_action, joint_mask_from_names
 from robotfm.data.lerobot_dataset import (
     _load_image_rgb,
     _short_camera_name,
     load_episode_arrays_from_parquet,
     load_lerobot_info,
 )
-from robotfm.data.stats import denormalize, normalize
+from robotfm.data.stats import normalize
 from robotfm.train import build_policy
 
 
@@ -144,6 +145,13 @@ def main() -> None:
         help="Override flow-matching Euler steps at inference "
         "(default: policy.num_inference_steps).",
     )
+    parser.add_argument(
+        "--history-noise-std",
+        type=float,
+        default=None,
+        help="Gaussian noise std added to obs_state (flow start) at inference. "
+        "Default: training policy.history_noise_std.",
+    )
     args = parser.parse_args()
 
     base_dir = Path(__file__).resolve().parents[1]
@@ -182,7 +190,14 @@ def main() -> None:
                 f"--num-inference-steps must be > 0, got {args.num_inference_steps}"
             )
         cfg.policy.num_inference_steps = int(args.num_inference_steps)
+    if args.history_noise_std is not None:
+        if float(args.history_noise_std) < 0:
+            raise ValueError(
+                f"--history-noise-std must be >= 0, got {args.history_noise_std}"
+            )
+        cfg.policy.history_noise_std = float(args.history_noise_std)
     num_inference_steps = int(cfg.policy.num_inference_steps)
+    history_noise_std = float(cfg.policy.history_noise_std)
     action_names = _action_names_from_cfg(cfg)
     cameras = list(cfg.cameras)
 
@@ -222,7 +237,9 @@ def main() -> None:
     print(
         f"norm_mode={norm_mode} n_obs={n_obs} horizon={horizon} "
         f"n_action_steps={n_action_steps} exec_steps={exec_steps} "
-        f"num_inference_steps={num_inference_steps}"
+        f"num_inference_steps={num_inference_steps} "
+        f"history_noise_std={history_noise_std} "
+        f"predict_joint_delta={bool(cfg.policy.predict_joint_delta)}"
     )
     print(
         f"pre_crop={cfg.dataset.pre_crop_size} resize={cfg.dataset.resize_size} "
@@ -251,7 +268,16 @@ def main() -> None:
         )
         with torch.no_grad():
             pred_norm = policy.sample_actions(batch)[0].cpu()
-        pred_phys = denormalize(pred_norm, stats, prefix="action", mode=norm_mode).numpy()
+        pred_phys = np.asarray(
+            denormalize_predicted_action(
+                pred_norm,
+                stats,
+                norm_mode,
+                q_now_phys=states[t].astype(np.float32),
+                predict_joint_delta=bool(cfg.policy.predict_joint_delta),
+                joint_mask=joint_mask_from_names(action_names, int(cfg.action_dim)),
+            )
+        )
 
         take = min(exec_steps, length - t, pred_phys.shape[0])
         pred_actions[t : t + take] = pred_phys[:take]
@@ -289,6 +315,8 @@ def main() -> None:
         "n_action_steps": n_action_steps,
         "exec_steps": exec_steps,
         "num_inference_steps": num_inference_steps,
+        "history_noise_std": history_noise_std,
+        "predict_joint_delta": bool(cfg.policy.predict_joint_delta),
         "pre_crop_size": cfg.dataset.pre_crop_size,
         "resize_size": cfg.dataset.resize_size,
         "crop_size": cfg.dataset.crop_size,

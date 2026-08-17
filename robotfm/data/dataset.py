@@ -19,6 +19,11 @@ import torch
 from torch.utils.data import Dataset
 
 from robotfm.data.schema import image_key, load_episode, load_meta
+from robotfm.data.action_delta import (
+    joint_mask_from_names,
+    overlay_joint_delta_action_stats,
+    subtract_joint_pose,
+)
 from robotfm.data.stats import is_limits_mode, normalize, validate_norm_mode
 
 
@@ -505,6 +510,7 @@ class EpisodeDataset(Dataset):
         defer_augment: bool = False,
         uint8_cache: bool = False,
         uint8_cache_dir: str | Path | None = None,
+        predict_joint_delta: bool = False,
     ) -> None:
         self.run_dir = Path(run_dir)
         self.meta = load_meta(self.run_dir)
@@ -534,6 +540,13 @@ class EpisodeDataset(Dataset):
         self.color_jitter_saturation = color_jitter_saturation
         self.color_jitter_hue = color_jitter_hue
         self.defer_augment = bool(defer_augment)
+        self.predict_joint_delta = bool(predict_joint_delta)
+        self._joint_mask = joint_mask_from_names(self.meta.action_names, self.meta.action_dim)
+        if self.predict_joint_delta and self.meta.state_dim != self.meta.action_dim:
+            raise ValueError(
+                "predict_joint_delta requires state_dim == action_dim "
+                f"(got {self.meta.state_dim} vs {self.meta.action_dim})"
+            )
         if uint8_cache:
             raise ValueError("uint8_cache is only supported for LeRobot image-sequence datasets")
         _ = uint8_cache_dir
@@ -569,6 +582,22 @@ class EpisodeDataset(Dataset):
             raise ValueError(
                 f"No usable frames after drop_n_last_frames={self.drop_n_last_frames}; "
                 "check episode lengths / n_action_steps."
+            )
+        if self.predict_joint_delta:
+            if self.stats is None:
+                raise ValueError("predict_joint_delta requires stats")
+            ep_states = []
+            ep_actions = []
+            for ep_file in self.episode_files:
+                arrays = load_episode(ep_file)["arrays"]
+                ep_states.append(arrays["state"])
+                ep_actions.append(arrays["action"])
+            overlay_joint_delta_action_stats(
+                self.stats,
+                ep_states,
+                ep_actions,
+                horizon=self.horizon,
+                joint_mask=self._joint_mask,
             )
 
     def __len__(self) -> int:
@@ -653,6 +682,9 @@ class EpisodeDataset(Dataset):
         action_end = min(t + self.horizon, length)
         valid_len = action_end - t  # 本样本里「真实动作」有几步
         actions = arrays["action"][t:action_end].astype(np.float32)
+        if self.predict_joint_delta:
+            q_now = arrays["state"][t].astype(np.float32)
+            actions = subtract_joint_pose(actions, q_now, self._joint_mask)
 
         # mask: 前 valid_len 步=1（参与 loss），后面 pad 步=0（不参与 loss）
         mask = np.zeros((self.horizon, 1), dtype=np.float32)

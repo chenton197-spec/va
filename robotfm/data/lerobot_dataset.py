@@ -23,6 +23,11 @@ import torch
 from torch.utils.data import Dataset
 
 from robotfm.data.dataset import color_jitter_images, crop_images
+from robotfm.data.action_delta import (
+    joint_mask_from_names,
+    overlay_joint_delta_action_stats,
+    subtract_joint_pose,
+)
 from robotfm.data.stats import is_limits_mode, normalize, validate_norm_mode
 from robotfm.data.uint8_cache import Uint8ImageCache, resolve_cache_dir
 from robotfm.types import EpisodeMeta
@@ -320,6 +325,7 @@ class LeRobotImageSequenceDataset(Dataset):
         defer_augment: bool = False,
         uint8_cache: bool = False,
         uint8_cache_dir: str | Path | None = None,
+        predict_joint_delta: bool = False,
     ) -> None:
         self.run_dir = Path(run_dir)
         self.info = load_lerobot_info(self.run_dir)
@@ -355,6 +361,13 @@ class LeRobotImageSequenceDataset(Dataset):
         self.color_jitter_saturation = color_jitter_saturation
         self.color_jitter_hue = color_jitter_hue
         self.defer_augment = bool(defer_augment)
+        self.predict_joint_delta = bool(predict_joint_delta)
+        self._joint_mask = joint_mask_from_names(self.meta.action_names, self.meta.action_dim)
+        if self.predict_joint_delta and self.meta.state_dim != self.meta.action_dim:
+            raise ValueError(
+                "predict_joint_delta requires state_dim == action_dim "
+                f"(got {self.meta.state_dim} vs {self.meta.action_dim})"
+            )
         self._image_cache: Uint8ImageCache | None = None
 
         if drop_n_last_frames is None:
@@ -418,6 +431,16 @@ class LeRobotImageSequenceDataset(Dataset):
                 "check episode lengths / n_action_steps."
             )
         self.meta.num_episodes = len(self._episode_ids)
+        if self.predict_joint_delta:
+            if self.stats is None:
+                raise ValueError("predict_joint_delta requires stats")
+            overlay_joint_delta_action_stats(
+                self.stats,
+                self._states,
+                self._actions,
+                horizon=self.horizon,
+                joint_mask=self._joint_mask,
+            )
 
         if uint8_cache:
             cache_path = resolve_cache_dir(
@@ -536,6 +559,9 @@ class LeRobotImageSequenceDataset(Dataset):
         action_end = min(t + self.horizon, length)
         valid_len = action_end - t
         actions = action_all[t:action_end].astype(np.float32)
+        if self.predict_joint_delta:
+            q_now = state_all[t].astype(np.float32)
+            actions = subtract_joint_pose(actions, q_now, self._joint_mask)
 
         mask = np.zeros((self.horizon, 1), dtype=np.float32)
         mask[:valid_len] = 1.0

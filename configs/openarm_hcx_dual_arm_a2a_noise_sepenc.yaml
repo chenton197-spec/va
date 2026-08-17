@@ -75,6 +75,8 @@ policy:
   # CLIP 式 InfoNCE：obs_latents（图+状态）↔ GT 动作 latent；5e-4 略高于 VITA 默认 1e-4
   enc_contrastive_weight: 0.0005
   history_noise_std: 0.15
+  # 关节预测增量：decode Δq 再加回当前关节；夹爪仍绝对。开了需重训。
+  predict_joint_delta: false
   flow_hidden_dim: 512
   flow_num_layers: 4
   flow_mlp_ratio: 4.0

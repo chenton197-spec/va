@@ -80,8 +80,9 @@ def main() -> None:
         color_jitter_hue=cfg.dataset.color_jitter_hue,
         defer_augment=gpu_augment,
         uint8_cache=bool(cfg.dataset.uint8_cache),
-        uint8_cache_dir=cfg.dataset.uint8_cache_dir,
-    )
+            uint8_cache_dir=cfg.dataset.uint8_cache_dir,
+            predict_joint_delta=bool(cfg.policy.predict_joint_delta),
+        )
 
     loader_kwargs: dict = {
         "batch_size": cfg.train.batch_size,

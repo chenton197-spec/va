@@ -29,8 +29,9 @@ if str(VA_ROOT) not in sys.path:
 
 from hcx_sdk import RobotClient  # noqa: E402
 from robotfm.config import _normalize_rtc_config, load_config  # noqa: E402
+from robotfm.data.action_delta import denormalize_predicted_action, joint_mask_from_names  # noqa: E402
 from robotfm.data.dataset import crop_images, resize_images  # noqa: E402
-from robotfm.data.stats import denormalize, normalize  # noqa: E402
+from robotfm.data.stats import normalize  # noqa: E402
 from robotfm.policies.rtc import ActionQueue, RTCConfig  # noqa: E402
 from robotfm.train import build_policy  # noqa: E402
 from robotfm.types import Observation  # noqa: E402
@@ -1300,8 +1301,13 @@ def main() -> None:
                             inference_delay=rtc_cfg.inference_delay,
                             execution_horizon=rtc_cfg.execution_horizon,
                         )[0].cpu()
-                    processed = denormalize(
-                        pred, stats, prefix="action", mode=norm_mode
+                    processed = denormalize_predicted_action(
+                        pred,
+                        stats,
+                        norm_mode,
+                        q_now_phys=np.asarray(obs_history[-1].state, dtype=np.float32),
+                        predict_joint_delta=bool(cfg.policy.predict_joint_delta),
+                        joint_mask=joint_mask_from_names(cfg.action_names, cfg.action_dim),
                     )
                     # 阻塞推理：merge delay=0，连续性靠 leftover prefix 引导，不靠执行旧点。
                     action_queue.merge(pred, processed, real_delay=0)
@@ -1325,9 +1331,16 @@ def main() -> None:
                     )
                     with torch.no_grad():
                         pred = policy.sample_actions(batch)[0].cpu()
-                    pred_phys = denormalize(
-                        pred, stats, prefix="action", mode=norm_mode
-                    ).numpy()
+                    pred_phys = np.asarray(
+                        denormalize_predicted_action(
+                            pred,
+                            stats,
+                            norm_mode,
+                            q_now_phys=np.asarray(obs_history[-1].state, dtype=np.float32),
+                            predict_joint_delta=bool(cfg.policy.predict_joint_delta),
+                            joint_mask=joint_mask_from_names(cfg.action_names, cfg.action_dim),
+                        )
+                    )
                     chunk_actions = [
                         np.asarray(a, dtype=np.float32)
                         for a in pred_phys[:exec_action_steps]

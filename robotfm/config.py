@@ -128,6 +128,9 @@ class PolicyConfig:
     enc_contrastive_weight: float = 0.0
     flow_contrastive_weight: float = 0.0
     history_noise_std: float = 0.0  # >0 启用 N-A2A 历史加噪
+    # True: 关节目标为 Δq = action − q_now（当前观测姿态），夹爪仍用绝对值。
+    # 训练会按增量重算 action mean/std；推理 denormalize 后再加回 q_now。需重训。
+    predict_joint_delta: bool = False
     use_ot_matcher: bool = False  # True: OT-CFM；VITA 默认在 builder 中开
     flow_hidden_dim: int = 512
     flow_num_layers: int = 4

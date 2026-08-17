@@ -59,8 +59,9 @@ if str(VA_ROOT) not in sys.path:
     sys.path.insert(0, str(VA_ROOT))
 
 from robotfm.config import _normalize_rtc_config, load_config  # noqa: E402
+from robotfm.data.action_delta import denormalize_predicted_action, joint_mask_from_names  # noqa: E402
 from robotfm.data.dataset import spatial_preprocess_images  # noqa: E402
-from robotfm.data.stats import denormalize, normalize  # noqa: E402
+from robotfm.data.stats import normalize  # noqa: E402
 from robotfm.policies.rtc import ActionQueue, RTCConfig  # noqa: E402
 from robotfm.train import build_policy  # noqa: E402
 from robotfm.types import Observation  # noqa: E402
@@ -1359,8 +1360,15 @@ def main() -> None:
                                 f"real_delay={real_delay} cfg_delay={cfg_delay} "
                                 f"leftover_at_start={infer_job.leftover_len}"
                             )
-                            processed = denormalize(
-                                pred, stats, prefix="action", mode=norm_mode
+                            processed = denormalize_predicted_action(
+                                pred,
+                                stats,
+                                norm_mode,
+                                q_now_phys=np.asarray(obs_history[-1].state, dtype=np.float32),
+                                predict_joint_delta=bool(cfg.policy.predict_joint_delta),
+                                joint_mask=joint_mask_from_names(
+                                    cfg.action_names, cfg.action_dim
+                                ),
                             )
                             action_queue.merge(
                                 pred.cpu(),
@@ -1393,8 +1401,15 @@ def main() -> None:
                     if device.type == "cuda":
                         torch.cuda.synchronize()
                     infer_ms = (time.perf_counter() - t_infer) * 1000.0
-                    processed = denormalize(
-                        pred, stats, prefix="action", mode=norm_mode
+                    processed = denormalize_predicted_action(
+                        pred,
+                        stats,
+                        norm_mode,
+                        q_now_phys=np.asarray(obs_history[-1].state, dtype=np.float32),
+                        predict_joint_delta=bool(cfg.policy.predict_joint_delta),
+                        joint_mask=joint_mask_from_names(
+                            cfg.action_names, cfg.action_dim
+                        ),
                     )
                     action_queue.merge(
                         pred.cpu(), processed.cpu(), real_delay=0
@@ -1533,8 +1548,15 @@ def main() -> None:
                     with torch.no_grad():
                         pred = policy.sample_actions(batch)[0].cpu()
                     infer_ms = (time.perf_counter() - t_infer) * 1000.0
-                    pred_phys = denormalize(
-                        pred, stats, prefix="action", mode=norm_mode
+                    pred_phys = denormalize_predicted_action(
+                        pred,
+                        stats,
+                        norm_mode,
+                        q_now_phys=np.asarray(obs_history[-1].state, dtype=np.float32),
+                        predict_joint_delta=bool(cfg.policy.predict_joint_delta),
+                        joint_mask=joint_mask_from_names(
+                            cfg.action_names, cfg.action_dim
+                        ),
                     )
                     chunk = pred_phys[:n_action_steps].cpu()
                     action_queue.merge(pred[:n_action_steps].cpu(), chunk, real_delay=0)
