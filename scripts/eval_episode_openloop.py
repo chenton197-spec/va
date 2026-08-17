@@ -340,6 +340,45 @@ def main() -> None:
     fig.savefig(plot_path, dpi=140)
     plt.close(fig)
 
+    # Left / right arm joint deviation: x=frame, y=pred-GT (physical units)
+    err_full = pred_actions - actions_gt
+    left_idx = [i for i, n in enumerate(action_names) if n.startswith("L") and n[1:].isdigit()]
+    right_idx = [i for i, n in enumerate(action_names) if n.startswith("R") and n[1:].isdigit()]
+    if left_idx or right_idx:
+        fig_lr, axes_lr = plt.subplots(1, 2, figsize=(14, 5), sharex=True)
+        arm_specs = [
+            (left_idx, "Left arm", axes_lr[0]),
+            (right_idx, "Right arm", axes_lr[1]),
+        ]
+        cmap = plt.cm.tab10
+        for joint_indices, title, ax in arm_specs:
+            if not joint_indices:
+                ax.set_visible(False)
+                continue
+            for j, dim_i in enumerate(joint_indices):
+                ax.plot(
+                    steps,
+                    err_full[:, dim_i],
+                    label=action_names[dim_i],
+                    color=cmap(j % 10),
+                    linewidth=1.0,
+                    alpha=0.9,
+                )
+            ax.axhline(0.0, color="black", linewidth=0.8, linestyle="--", alpha=0.5)
+            ax.set_title(title)
+            ax.set_xlabel("frame")
+            ax.set_ylabel("joint angle deviation (pred - GT)")
+            ax.grid(True, alpha=0.3)
+            ax.legend(loc="upper right", fontsize=8, ncol=2)
+        fig_lr.suptitle(
+            f"Episode {args.episode} joint deviation  |  {ckpt_path.name}",
+            fontsize=12,
+        )
+        fig_lr.tight_layout()
+        dev_plot_path = out_dir / "joint_deviation_lr.png"
+        fig_lr.savefig(dev_plot_path, dpi=140)
+        plt.close(fig_lr)
+
     print("\n===== MAE / RMSE (physical units) =====")
     for i, name in enumerate(action_names):
         print(f"  {name:8s}  MAE={mae[i]:.6f}  RMSE={rmse[i]:.6f}")
@@ -347,6 +386,8 @@ def main() -> None:
     print(f"  gripper  MAE={metrics['mae_gripper']:.6f}")
     print(f"  all      MAE={metrics['mae_all']:.6f}")
     print(f"\nsaved: {plot_path}")
+    if left_idx or right_idx:
+        print(f"saved: {dev_plot_path}")
     print(f"saved: {out_dir / 'metrics.json'}")
     print(f"saved: {out_dir / 'pred_vs_gt.npz'}")
 
