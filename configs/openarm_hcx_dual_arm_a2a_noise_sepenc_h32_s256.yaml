@@ -1,0 +1,105 @@
+# 基于 openarm_hcx_dual_arm_a2a_noise_sepenc.yaml
+# 差异：horizon/n_action_steps=32；resize=256；predict_joint_delta=false；
+#       enc_contrastive_weight=5e-4（视觉/状态 latent ↔ 动作 latent InfoNCE）
+# 离线 BC：A2A+noise + gaussian_2std（(x-mean)/(2*std)），无 OT
+# 硬件（本机实测）：RTX 5060 Ti 16GB（16311 MiB；桌面约占 ~0.4GB）
+#   + i5-13500 (14C/20T) + 31GB RAM
+# 数据：openarm_hcx_dual_arm（双臂 14 关节 + L/R gripper → 16-D；三相机）
+# N=82948（左臂静止前缀已裁 + 每 ep 末尾 -30；缺 5 ep）
+# → floor(N/20)=4147 steps/epoch → 40 epoch = 165880
+# 图像：1280×720 中心裁 720×720 → resize 256×256（保比例）；horizon=32
+# 加速：uint8 盘缓存跳过 JPEG + GPU color_jitter（先 build_uint8_image_cache.py
+#   --pre-crop-size 720 --resize-size 256）
+# 三相机独立 ResNet 权重（share_image_encoder=false）
+# 注意：train.amp 已知 bug，训练中途易 loss=nan，保持 amp=false
+# 每 2 epoch 存盘：save_freq = 2 * 4147 = 8294
+# 状态遮挡：关节组（L0–L6+R0–R6）与夹爪组（left/right_gripper）独立整组置零；
+#   与相机同一套 early/mid/late 日程；两组全灭时随机放回一组
+cameras: [head, left_hand, right_hand]
+state_dim: 16
+action_dim: 16
+state_names:
+  [L0, L1, L2, L3, L4, L5, L6, R0, R1, R2, R3, R4, R5, R6, left_gripper, right_gripper]
+action_names:
+  [L0, L1, L2, L3, L4, L5, L6, R0, R1, R2, R3, R4, R5, R6, left_gripper, right_gripper]
+fps: 15
+data_root: data
+output_dir: outputs/a2a_noise_openarm_hcx_dual_arm_sepenc_statedrop_h32_s256_gaussian_2std
+
+dataset:
+  n_obs_steps: 8
+  horizon: 32
+  run_name: openarm_hcx_dual_arm
+  pre_crop_size: 720
+  resize_size: 256
+  crop_size: null
+  color_jitter_brightness: 0.2
+  color_jitter_contrast: 0.2
+  color_jitter_saturation: 0.1
+  color_jitter_hue: 0.02
+  # gaussian | gaussian_2std | limits([-1,1]) | limits_01([0,1])
+  norm_mode: gaussian_2std
+  uint8_cache: true
+  gpu_augment: true
+  state_dropout:
+    enabled: true
+    keep_at_least_one: true
+    # 日程长度；续训把 train.steps 调大时保持此值，超出后固定 late_prob
+    schedule_steps: 165880
+    early_frac: 0.20
+    mid_frac: 0.40
+    joint_early_prob: 0.45
+    joint_mid_prob: 0.3
+    joint_late_prob: 0.12
+    gripper_early_prob: 0.45
+    gripper_mid_prob: 0.3
+    gripper_late_prob: 0.12
+
+policy:
+  type: a2a
+  hidden_dim: 256
+  num_inference_steps: 6
+  n_action_steps: 32
+  pretrained_encoder: true
+  use_frame_diff: true
+  # false: head / left_hand / right_hand 各一套 ResNet 权重（约 3× 视觉参数）
+  share_image_encoder: false
+  latent_dim: 512
+  consistency_weight: 1.0
+  enc_recon_weight: 0.5
+  flow_recon_weight: 0.5
+  # CLIP 式 InfoNCE：obs_latents（图+状态）↔ GT 动作 latent；5e-4 略高于 VITA 默认 1e-4
+  enc_contrastive_weight: 0.0005
+  history_noise_std: 0.15
+  # 关节绝对姿态（非增量）
+  predict_joint_delta: false
+  flow_hidden_dim: 512
+  flow_num_layers: 4
+  flow_mlp_ratio: 4.0
+  ae_enc_hidden_dim: 512
+  ae_dec_hidden_dim: 512
+  ae_num_layers: 4
+  rtc:
+    # RTC 推理引导（训练不受影响）；A2A 要求 n_action_steps == horizon
+    enabled: false
+    execution_horizon: 8
+    max_guidance_weight: 10.0
+    prefix_attention_schedule: exp
+    inference_delay: 2
+    debug: false
+
+train:
+  # 40ep；bs=20 + workers=3（A/B 略优；勿 workers≥6）
+  batch_size: 20
+  steps: 165880
+  lr: 0.0005
+  weight_decay: 0.000001
+  log_freq: 100
+  save_freq: 8294
+  device: cuda
+  num_workers: 3
+  cosine_lr: true
+  warmup_steps: 500
+  encoder_lr_scale: 0.1
+  max_grad_norm: 1.0
+  amp: false  # 已知 bug：amp 训练易 nan
