@@ -10,6 +10,9 @@ from t0 is >= ``--motion-thresh-deg``.
 Optional ``--drop-n-last-frames N``: also drop the last N frames of each episode
 (after the idle-prefix trim).
 
+Optional ``--min-episode-index K``: drop episodes with index < K (parquet + image
+dirs + recording_audit) before trimming the rest.
+
 In-place mode rewrites parquet + meta, deletes unused leading/trailing JPEGs, and
 recomputes ``stats.json``. Missing on-disk episodes listed in meta are dropped.
 
@@ -19,6 +22,9 @@ Examples (from ``va/``, conda env ``lerobot``)::
         data/openarm_hcx_dual_arm --dry-run
     PYTHONPATH=. python scripts/trim_left_arm_idle_prefix.py \\
         data/openarm_hcx_dual_arm --drop-n-last-frames 30 --in-place
+    PYTHONPATH=. python scripts/trim_left_arm_idle_prefix.py \\
+        datasets/openarm_hcx_dual_arm --min-episode-index 108 \\
+        --drop-n-last-frames 35 --in-place
 """
 
 from __future__ import annotations
@@ -26,6 +32,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import shutil
 from pathlib import Path
 from typing import Any
 
@@ -220,6 +227,34 @@ def _episode_stats_entry(table: pa.Table, episode_index: int) -> dict[str, Any]:
     return entry
 
 
+def _delete_episode_assets(
+    run_dir: Path,
+    info: dict[str, Any],
+    episode_index: int,
+    *,
+    feat_keys: list[str],
+) -> None:
+    """Remove parquet + per-camera episode dirs + recording_audit for one ep."""
+    chunks_size = int(info["chunks_size"])
+    rel = _format_data_path(info["data_path"], episode_index, chunks_size)
+    pq_path = run_dir / rel
+    if pq_path.is_file():
+        pq_path.unlink()
+    ep_name = f"episode_{episode_index:06d}"
+    for key in feat_keys:
+        # images/chunk-XXX/<feature>/episode_YYYYYY
+        img_root = run_dir / "images"
+        if not img_root.is_dir():
+            continue
+        for chunk_dir in img_root.glob("chunk-*"):
+            ep_dir = chunk_dir / key / ep_name
+            if ep_dir.is_dir():
+                shutil.rmtree(ep_dir)
+    audit = run_dir / "meta" / "recording_audit" / f"{ep_name}.jsonl"
+    if audit.is_file():
+        audit.unlink()
+
+
 def run(
     run_dir: Path,
     *,
@@ -228,6 +263,7 @@ def run(
     speed_thresh_deg: float,
     enter_frames: int,
     drop_n_last_frames: int,
+    min_episode_index: int,
     dry_run: bool,
     in_place: bool,
     delete_images: bool,
@@ -238,13 +274,17 @@ def run(
         raise SystemExit("Pass --in-place to apply, or --dry-run to only report")
     if drop_n_last_frames < 0:
         raise SystemExit(f"drop_n_last_frames must be >= 0, got {drop_n_last_frames}")
+    if min_episode_index < 0:
+        raise SystemExit(f"min_episode_index must be >= 0, got {min_episode_index}")
 
     info = load_lerobot_info(run_dir)
     fps = float(info["fps"])
     chunks_size = int(info["chunks_size"])
     meta_eps = list_episode_indices(run_dir, info)
-    eps = _episodes_on_disk(run_dir, info)
-    missing = sorted(set(meta_eps) - set(eps))
+    eps_all = _episodes_on_disk(run_dir, info)
+    drop_eps = [ep for ep in eps_all if ep < min_episode_index]
+    eps = [ep for ep in eps_all if ep >= min_episode_index]
+    missing = sorted(set(meta_eps) - set(eps_all))
     feat_keys = _camera_feature_keys(info)
     n_cams = len(feat_keys)
 
@@ -258,6 +298,13 @@ def run(
                     continue
                 row = json.loads(line)
                 ep_meta_src[int(row["episode_index"])] = row
+
+    frames_in_dropped_eps = 0
+    for ep in drop_eps:
+        rel = _format_data_path(info["data_path"], ep, chunks_size)
+        frames_in_dropped_eps += pq.read_table(
+            run_dir / rel, columns=["frame_index"]
+        ).num_rows
 
     # ep, length, drop_prefix, drop_suffix
     plans: list[tuple[int, int, int, int]] = []
@@ -296,7 +343,9 @@ def run(
         else f"mode=speed thresh={speed_thresh_deg}deg/step enter={enter_frames}"
     )
     print(
-        f"src={run_dir}  eps_on_disk={len(eps)}/{len(meta_eps)}  "
+        f"src={run_dir}  eps_on_disk={len(eps_all)}/{len(meta_eps)}  "
+        f"min_episode_index={min_episode_index}  drop_eps_lt={len(drop_eps)} "
+        f"(frames={frames_in_dropped_eps})  keep_eps={len(eps)}  "
         f"missing_parquet={missing}  {crit}  drop_last={drop_n_last_frames}  "
         f"{'[DRY-RUN]' if dry_run else '[IN-PLACE]'}"
     )
@@ -310,13 +359,19 @@ def run(
         )
     n_with = sum(1 for _, _, d, s in plans if d > 0 or s > 0)
     print(
-        f"summary: {n_with}/{len(plans)} eps trimmed  "
+        f"summary: drop_eps<{min_episode_index}={len(drop_eps)}  "
+        f"{n_with}/{len(plans)} eps trimmed  "
         f"prefix=-{total_drop_prefix} suffix=-{total_drop_suffix}  "
-        f"frames {total_src}->{total_src - total_drop} (-{total_drop}, "
+        f"kept-ep frames {total_src}->{total_src - total_drop} (-{total_drop}, "
         f"{100.0 * total_drop / max(total_src, 1):.1f}%)"
     )
     if dry_run:
         return
+
+    # Remove episodes below min index first
+    for ep in drop_eps:
+        _delete_episode_assets(run_dir, info, ep, feat_keys=feat_keys)
+        print(f"  deleted ep{ep:03d}")
 
     # Apply in place
     global_index = 0
@@ -376,6 +431,9 @@ def run(
         "speed_thresh_deg": speed_thresh_deg,
         "enter_frames": enter_frames,
         "drop_n_last_frames": drop_n_last_frames,
+        "min_episode_index": min_episode_index,
+        "episodes_deleted_lt_min": drop_eps,
+        "frames_in_deleted_episodes": frames_in_dropped_eps,
         "frames_dropped_this_pass": total_drop,
         "frames_dropped_prefix": total_drop_prefix,
         "frames_dropped_suffix": total_drop_suffix,
@@ -397,8 +455,9 @@ def run(
 
     # Drop orphan recording_audit for missing eps if present
     audit_dir = run_dir / "meta" / "recording_audit"
-    if audit_dir.is_dir() and missing:
-        for ep in missing:
+    orphan_audit = sorted(set(missing) | set(drop_eps))
+    if audit_dir.is_dir() and orphan_audit:
+        for ep in orphan_audit:
             p = audit_dir / f"episode_{ep:06d}.jsonl"
             if p.is_file():
                 p.unlink()
@@ -416,7 +475,8 @@ def run(
     save_stats(run_dir, stats)
 
     print(
-        f"done: episodes={len(plans)} frames {total_src}->{total_frames}  "
+        f"done: deleted_eps<{min_episode_index}={len(drop_eps)}  "
+        f"episodes={len(plans)} frames {total_src}->{total_frames}  "
         f"deleted_jpegs={deleted_images}"
     )
 
@@ -454,6 +514,12 @@ def main() -> None:
         default=0,
         help="Also drop this many trailing frames per episode (default 0)",
     )
+    p.add_argument(
+        "--min-episode-index",
+        type=int,
+        default=0,
+        help="Drop episodes with index < this value (default 0 = keep all)",
+    )
     p.add_argument("--dry-run", action="store_true")
     p.add_argument("--in-place", action="store_true", help="Rewrite dataset in place")
     p.add_argument(
@@ -469,6 +535,7 @@ def main() -> None:
         speed_thresh_deg=args.speed_thresh_deg,
         enter_frames=args.enter_frames,
         drop_n_last_frames=args.drop_n_last_frames,
+        min_episode_index=args.min_episode_index,
         dry_run=args.dry_run,
         in_place=args.in_place,
         delete_images=not args.keep_images,
