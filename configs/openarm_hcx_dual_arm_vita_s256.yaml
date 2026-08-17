@@ -1,0 +1,79 @@
+# 离线 BC：VITA（视觉潜变量 → 动作潜变量，OT-CFM）
+# 硬件：RTX 5060 Ti 16GB + i5-13500 (14C/20T) + 31GB RAM
+# 数据：data/openarm_hcx_dual_arm N=82948（325 ep；左臂静止前缀已裁 + 每 ep 末尾 -30）
+# 图像：1280×720 中心裁 720×720 → resize 256×256；horizon=16
+# 加速：uint8 盘缓存（由 512 cache INTER_AREA 降采样）+ GPU color_jitter
+#       + torch.compile；amp 关闭（已知中途 loss=nan）
+# 三相机独立 ResNet（share_image_encoder=false）；视觉是 flow 起点
+# 本机吞吐 2026-08-17（fp32, uint8_cache 256, workers=2~4 无差）：
+#   bs32 75.6 samp/s 4.1GB；bs64 77.7 / 7.7GB；bs80 78.6 / 9.5GB ←
+#   bs84 76.0 / 9.9GB；bs88 76.0 / 10.4GB；bs96 OOM
+# 100 epoch：floor(N/80)=1036 steps/epoch → steps=103600；约 29h（compile 前）
+cameras: [head, left_hand, right_hand]
+state_dim: 16
+action_dim: 16
+state_names:
+  [L0, L1, L2, L3, L4, L5, L6, R0, R1, R2, R3, R4, R5, R6, left_gripper, right_gripper]
+action_names:
+  [L0, L1, L2, L3, L4, L5, L6, R0, R1, R2, R3, R4, R5, R6, left_gripper, right_gripper]
+fps: 15
+data_root: data
+output_dir: outputs/vita_openarm_hcx_dual_arm_s256
+
+dataset:
+  n_obs_steps: 8
+  horizon: 16
+  run_name: openarm_hcx_dual_arm
+  pre_crop_size: 720
+  resize_size: 256
+  crop_size: null
+  color_jitter_brightness: 0.2
+  color_jitter_contrast: 0.2
+  color_jitter_saturation: 0.1
+  color_jitter_hue: 0.02
+  norm_mode: gaussian_2std
+  uint8_cache: true
+  gpu_augment: true
+
+policy:
+  type: vita
+  hidden_dim: 256
+  num_inference_steps: 6
+  n_action_steps: 16
+  pretrained_encoder: true
+  use_frame_diff: true
+  share_image_encoder: false
+  latent_dim: 512
+  consistency_weight: 1.0
+  enc_recon_weight: 0.5
+  flow_recon_weight: 0.5
+  enc_contrastive_weight: 0.0001
+  flow_contrastive_weight: 0.0
+  use_ot_matcher: true
+  decode_flow_latents: true
+  flow_hidden_dim: 512
+  flow_num_layers: 4
+  flow_mlp_ratio: 4.0
+  flow_dropout: 0.0
+  ae_enc_hidden_dim: 512
+  ae_dec_hidden_dim: 512
+  ae_num_layers: 4
+  ae_dropout: 0.0
+
+train:
+  batch_size: 80
+  steps: 103600
+  lr: 0.0003
+  weight_decay: 0.000001
+  log_freq: 50
+  save_freq: 2072            # 编号 ckpt：每 2 epoch
+  latest_save_freq: 1036     # latest：每 1 epoch 覆盖
+  keep_last_ckpts: 5
+  device: cuda
+  num_workers: 2
+  cosine_lr: true
+  warmup_steps: 500
+  encoder_lr_scale: 1.67
+  max_grad_norm: 1.0
+  amp: false
+  compile: true

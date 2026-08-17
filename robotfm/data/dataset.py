@@ -395,6 +395,86 @@ def apply_camera_dropout(
     return images * mask
 
 
+def state_group_masks(
+    state_names: list[str] | None,
+    state_dim: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """按名字拆关节 / 夹爪掩码，形状均为 ``(D,)`` bool。
+
+    夹爪维：名字（忽略大小写）含 ``gripper``。
+    无夹爪名且 ``state_dim >= 7`` 时，沿用单臂惯例把最后一维当夹爪。
+    """
+    dim = int(state_dim)
+    names = list(state_names or [])
+    if len(names) != dim:
+        names = [f"s{i}" for i in range(dim)]
+    gripper = torch.tensor(
+        ["gripper" in name.lower() for name in names],
+        dtype=torch.bool,
+    )
+    if dim > 0 and not bool(gripper.any()) and dim >= 7:
+        gripper[-1] = True
+    return ~gripper, gripper
+
+
+def apply_state_dropout(
+    state: torch.Tensor,
+    *,
+    joint_p: float,
+    gripper_p: float,
+    joint_mask: torch.Tensor,
+    gripper_mask: torch.Tensor,
+    keep_at_least_one: bool = True,
+) -> torch.Tensor:
+    """关节组 / 夹爪组独立 Bernoulli 整组置零。
+
+    ``state``: (B, T, D)。同一组对所有历史帧一起遮挡。两组概率都 ``<=0`` 时原样返回。
+    若 ``keep_at_least_one`` 且某样本两组都被抽中，随机放回一组。
+    """
+    if joint_p <= 0.0 and gripper_p <= 0.0:
+        return state
+    if state.ndim != 3:
+        raise ValueError(
+            f"apply_state_dropout expects (B, T, D), got {tuple(state.shape)}"
+        )
+    batch, _time, dim = state.shape
+    device = state.device
+    joint_mask = joint_mask.to(device=device, dtype=torch.bool).reshape(-1)
+    gripper_mask = gripper_mask.to(device=device, dtype=torch.bool).reshape(-1)
+    if joint_mask.numel() != dim or gripper_mask.numel() != dim:
+        raise ValueError(
+            f"state_dropout masks must have length {dim}, got "
+            f"joint={tuple(joint_mask.shape)} gripper={tuple(gripper_mask.shape)}"
+        )
+
+    groups: list[tuple[torch.Tensor, torch.Tensor]] = []
+    if joint_p > 0.0 and bool(joint_mask.any()):
+        groups.append((torch.rand(batch, device=device) < float(joint_p), joint_mask))
+    if gripper_p > 0.0 and bool(gripper_mask.any()):
+        groups.append((torch.rand(batch, device=device) < float(gripper_p), gripper_mask))
+    if not groups:
+        return state
+
+    drop = torch.zeros(batch, dim, device=device, dtype=torch.bool)
+    for group_drop, group_mask in groups:
+        drop = drop | (group_drop.unsqueeze(1) & group_mask.unsqueeze(0))
+
+    if keep_at_least_one:
+        stacked = torch.stack([group_drop for group_drop, _ in groups], dim=1)
+        all_dropped = stacked.all(dim=1)
+        if bool(all_dropped.any()):
+            n_restore = int(all_dropped.sum().item())
+            keep_group = torch.randint(0, len(groups), (n_restore,), device=device)
+            for group_idx, (_group_drop, group_mask) in enumerate(groups):
+                restore = all_dropped.clone()
+                restore[all_dropped] = keep_group == group_idx
+                if bool(restore.any()):
+                    drop[restore] = drop[restore] & ~group_mask
+
+    mask = (~drop).to(dtype=state.dtype).view(batch, 1, dim)
+    return state * mask
+
+
 class EpisodeDataset(Dataset):
     """帧级索引的数据集，支持多相机与 action chunking。
 

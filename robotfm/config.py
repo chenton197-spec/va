@@ -46,6 +46,27 @@ class CameraDropoutConfig:
 
 
 @dataclass
+class StateDropoutConfig:
+    """训练时对关节 / 夹爪状态整组置零（与相机遮挡同一套三阶段日程）。
+
+    按 ``state_names`` 含 ``gripper`` 的维为夹爪组，其余为关节组；两组独立 Bernoulli。
+    同一组在所有历史帧上一起遮挡。``keep_at_least_one`` 时两组都被抽中则随机放回一组。
+    """
+
+    enabled: bool = False
+    keep_at_least_one: bool = True
+    schedule_steps: int | None = None
+    early_frac: float = 0.30
+    mid_frac: float = 0.40
+    joint_early_prob: float = 0.40
+    joint_mid_prob: float = 0.25
+    joint_late_prob: float = 0.12
+    gripper_early_prob: float = 0.40
+    gripper_mid_prob: float = 0.25
+    gripper_late_prob: float = 0.12
+
+
+@dataclass
 class DatasetConfig:
     """数据集与 action chunking 相关配置。"""
 
@@ -75,6 +96,7 @@ class DatasetConfig:
     # True: Dataset 不裁剪/不抖动，由训练循环在 GPU 上做（需配合 train）
     gpu_augment: bool = False
     camera_dropout: CameraDropoutConfig = field(default_factory=CameraDropoutConfig)
+    state_dropout: StateDropoutConfig = field(default_factory=StateDropoutConfig)
 
 
 @dataclass

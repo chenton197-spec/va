@@ -37,9 +37,11 @@ from robotfm.collect.loop import get_run_dir
 from robotfm.data.dataset import (
     apply_camera_dropout,
     apply_image_augments_batch,
+    apply_state_dropout,
     build_episode_dataset,
     camera_dropout_prob,
     images_to_float01,
+    state_group_masks,
 )
 from robotfm.data.stats import ensure_stats, is_limits_mode, resolve_image_stats
 from robotfm.policies.act import ACTConfig, ACTPolicy
@@ -610,6 +612,13 @@ def train_flow_matching(
             )
 
         pbar = tqdm(total=cfg.train.steps, initial=step, desc="train")
+        state_drop_cfg = cfg.dataset.state_dropout
+        state_joint_mask = None
+        state_gripper_mask = None
+        if state_drop_cfg.enabled:
+            state_joint_mask, state_gripper_mask = state_group_masks(
+                cfg.state_names, cfg.state_dim
+            )
         while step < cfg.train.steps:
             for batch in loader:
                 batch = {k: v.to(device, non_blocking=True) for k, v in batch.items()}
@@ -641,6 +650,41 @@ def train_flow_matching(
                         batch["obs_images"],
                         cam_drop_p,
                         keep_at_least_one=cam_drop_cfg.keep_at_least_one,
+                    )
+                joint_drop_p = 0.0
+                gripper_drop_p = 0.0
+                if (
+                    state_drop_cfg.enabled
+                    and state_joint_mask is not None
+                    and state_gripper_mask is not None
+                ):
+                    joint_drop_p = camera_dropout_prob(
+                        step,
+                        cfg.train.steps,
+                        schedule_steps=state_drop_cfg.schedule_steps,
+                        early_frac=state_drop_cfg.early_frac,
+                        mid_frac=state_drop_cfg.mid_frac,
+                        early_prob=state_drop_cfg.joint_early_prob,
+                        mid_prob=state_drop_cfg.joint_mid_prob,
+                        late_prob=state_drop_cfg.joint_late_prob,
+                    )
+                    gripper_drop_p = camera_dropout_prob(
+                        step,
+                        cfg.train.steps,
+                        schedule_steps=state_drop_cfg.schedule_steps,
+                        early_frac=state_drop_cfg.early_frac,
+                        mid_frac=state_drop_cfg.mid_frac,
+                        early_prob=state_drop_cfg.gripper_early_prob,
+                        mid_prob=state_drop_cfg.gripper_mid_prob,
+                        late_prob=state_drop_cfg.gripper_late_prob,
+                    )
+                    batch["obs_state"] = apply_state_dropout(
+                        batch["obs_state"],
+                        joint_p=joint_drop_p,
+                        gripper_p=gripper_drop_p,
+                        joint_mask=state_joint_mask,
+                        gripper_mask=state_gripper_mask,
+                        keep_at_least_one=state_drop_cfg.keep_at_least_one,
                     )
                 if cfg.train.cosine_lr:
                     _set_cosine_lr(optim, step, cfg)
@@ -676,11 +720,19 @@ def train_flow_matching(
                     }
                     if cam_drop_cfg.enabled:
                         postfix["cam_drop_p"] = cam_drop_p
+                    if state_drop_cfg.enabled:
+                        postfix["joint_drop_p"] = joint_drop_p
+                        postfix["grip_drop_p"] = gripper_drop_p
                     pbar.set_postfix(**postfix)
                     # 只写文件，避免打断 tqdm 进度条
                     drop_msg = (
                         f" cam_drop_p={cam_drop_p:.4g}" if cam_drop_cfg.enabled else ""
                     )
+                    if state_drop_cfg.enabled:
+                        drop_msg += (
+                            f" joint_drop_p={joint_drop_p:.4g}"
+                            f" gripper_drop_p={gripper_drop_p:.4g}"
+                        )
                     logger.log(
                         f"step={step}/{cfg.train.steps} loss={loss_v:.6f} "
                         f"lr={lr:.8g} grad_norm={grad_norm_v:.6f} "
