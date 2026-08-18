@@ -1,20 +1,25 @@
 # 基于 openarm_hcx_dual_arm_a2a_noise_sepenc.yaml
-# 差异：horizon/n_action_steps=32；resize=256；predict_joint_delta=false；
+# 差异：horizon/n_action_steps=32；resize=256；predict_joint_delta=true；
 #       enc_contrastive_weight=5e-4（视觉/状态 latent ↔ 动作 latent InfoNCE）
 # 离线 BC：A2A+noise + gaussian_2std（(x-mean)/(2*std)），无 OT
 # 硬件（本机实测）：RTX 5060 Ti 16GB（16311 MiB；桌面约占 ~0.4GB）
 #   + i5-13500 (14C/20T) + 31GB RAM
-# 数据：openarm_hcx_dual_arm（双臂 14 关节 + L/R gripper → 16-D；三相机）
-# N=82948（左臂静止前缀已裁 + 每 ep 末尾 -30；缺 5 ep）
-# → floor(N/20)=4147 steps/epoch → 40 epoch = 165880
+# 数据：openarm_hcx_dual_arm_merged（双臂 14 关节 + L/R gripper → 16-D；三相机）
+# N=99262（411 ep；两库合并后抽 10 ep 验证集）
+# → floor(N/80)=1240 steps/epoch → 50 epoch = 62000
 # 图像：1280×720 中心裁 720×720 → resize 256×256（保比例）；horizon=32
-# 加速：uint8 盘缓存跳过 JPEG + GPU color_jitter（先 build_uint8_image_cache.py
-#   --pre-crop-size 720 --resize-size 256）
+# 加速：uint8 盘缓存跳过 JPEG + GPU color_jitter + torch.compile
+# 本机吞吐 2026-08-17（fp32, uint8_cache 256, h32, workers=2）：
+#   bs48 73.8 samp/s 6.4GB；bs72 73.4 / 9.4GB；bs80 74.0 / 10.3GB ←
+#   compile bs72 75.3 / 8.7GB；compile bs80 75.2 / 9.5GB（并列最快，取 bs80）
+#   bs88 73.5 / 11.3GB；更大 batch 不再涨吞吐
 # 三相机独立 ResNet 权重（share_image_encoder=false）
 # 注意：train.amp 已知 bug，训练中途易 loss=nan，保持 amp=false
-# 每 2 epoch 存盘：save_freq = 2 * 4147 = 8294
-# 状态遮挡：关节组（L0–L6+R0–R6）与夹爪组（left/right_gripper）独立整组置零；
-#   与相机同一套 early/mid/late 日程；两组全灭时随机放回一组
+# 编号 ckpt 每 5 epoch：save_freq = 5 * 1240 = 6200
+# latest 每 1 epoch：latest_save_freq = 1240
+# 状态遮挡：逼模型用图像。关节组 / 夹爪组独立整组置零（obs_state + A2A obs_history
+#   共用同一 mask）。勿开 camera_dropout（相机会逼模型更抄关节）。
+#   后期故意保持较高 drop，避免 cosine 尾段把视觉依赖训掉；两组全灭时随机放回一组
 cameras: [head, left_hand, right_hand]
 state_dim: 16
 action_dim: 16
@@ -24,12 +29,12 @@ action_names:
   [L0, L1, L2, L3, L4, L5, L6, R0, R1, R2, R3, R4, R5, R6, left_gripper, right_gripper]
 fps: 15
 data_root: data
-output_dir: outputs/a2a_noise_openarm_hcx_dual_arm_sepenc_statedrop_h32_s256_gaussian_2std
+output_dir: outputs/a2a_noise_openarm_hcx_dual_arm_merged_sepenc_statedrop_h32_s256_gaussian_2std
 
 dataset:
   n_obs_steps: 8
   horizon: 32
-  run_name: openarm_hcx_dual_arm
+  run_name: openarm_hcx_dual_arm_merged
   pre_crop_size: 720
   resize_size: 256
   crop_size: null
@@ -44,16 +49,16 @@ dataset:
   state_dropout:
     enabled: true
     keep_at_least_one: true
-    # 日程长度；续训把 train.steps 调大时保持此值，超出后固定 late_prob
-    schedule_steps: 165880
-    early_frac: 0.20
+    # 与 train.steps 对齐
+    schedule_steps: 62000
+    early_frac: 0.30
     mid_frac: 0.40
-    joint_early_prob: 0.45
-    joint_mid_prob: 0.3
-    joint_late_prob: 0.12
-    gripper_early_prob: 0.45
-    gripper_mid_prob: 0.3
-    gripper_late_prob: 0.12
+    joint_early_prob: 0.50
+    joint_mid_prob: 0.40
+    joint_late_prob: 0.30
+    gripper_early_prob: 0.50
+    gripper_mid_prob: 0.40
+    gripper_late_prob: 0.30
 
 policy:
   type: a2a
@@ -71,8 +76,8 @@ policy:
   # CLIP 式 InfoNCE：obs_latents（图+状态）↔ GT 动作 latent；5e-4 略高于 VITA 默认 1e-4
   enc_contrastive_weight: 0.0005
   history_noise_std: 0.15
-  # 关节绝对姿态（非增量）
-  predict_joint_delta: false
+  # 关节增量 Δq=action−q_now（夹爪仍绝对）；flow 历史同样相对 q_now；须从头训
+  predict_joint_delta: true
   flow_hidden_dim: 512
   flow_num_layers: 4
   flow_mlp_ratio: 4.0
@@ -89,17 +94,20 @@ policy:
     debug: false
 
 train:
-  # 40ep；bs=20 + workers=3（A/B 略优；勿 workers≥6）
-  batch_size: 20
-  steps: 165880
-  lr: 0.0005
+  # 50ep；bs=80 + workers=2 + compile（本机最快；勿 workers≥6）
+  batch_size: 80
+  steps: 62000
+  lr: 0.0003
   weight_decay: 0.000001
-  log_freq: 100
-  save_freq: 8294
+  log_freq: 50
+  save_freq: 6200            # 编号 ckpt：每 5 epoch
+  latest_save_freq: 1240     # latest：每 1 epoch 覆盖
+  keep_last_ckpts: 10        # 每份 ~460MB；只留最近 10 个编号 ckpt
   device: cuda
-  num_workers: 3
+  num_workers: 2
   cosine_lr: true
   warmup_steps: 500
-  encoder_lr_scale: 0.1
+  encoder_lr_scale: 1.0      # ResNet lr = 3e-4，与主体同 lr，让视觉跟得上状态遮挡
   max_grad_norm: 1.0
   amp: false  # 已知 bug：amp 训练易 nan
+  compile: true

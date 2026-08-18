@@ -24,6 +24,7 @@ from torch.utils.data import Dataset
 
 from robotfm.data.dataset import color_jitter_images, crop_images
 from robotfm.data.action_delta import (
+    flow_history_from_phys,
     joint_mask_from_names,
     overlay_joint_delta_action_stats,
     subtract_joint_pose,
@@ -554,7 +555,20 @@ class LeRobotImageSequenceDataset(Dataset):
                     hue=self.color_jitter_hue,
                 )
 
-        state = self._normalize_state(state_all[obs_indices].astype(np.float32))
+        state_phys = state_all[obs_indices].astype(np.float32)
+        state = self._normalize_state(state_phys)
+        if self.predict_joint_delta:
+            if self.stats is None:
+                raise ValueError("predict_joint_delta requires stats")
+            flow_hist = flow_history_from_phys(
+                state_phys,
+                self.stats,
+                self.norm_mode,
+                predict_joint_delta=True,
+                joint_mask=self._joint_mask,
+            )
+        else:
+            flow_hist = state
 
         action_end = min(t + self.horizon, length)
         valid_len = action_end - t
@@ -573,6 +587,7 @@ class LeRobotImageSequenceDataset(Dataset):
         return {
             "obs_images": obs_images,
             "obs_state": torch.from_numpy(state),
+            "obs_history": torch.from_numpy(np.asarray(flow_hist, dtype=np.float32)),
             "action": torch.from_numpy(actions),
             "action_mask": torch.from_numpy(mask),
         }

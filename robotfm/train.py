@@ -406,6 +406,30 @@ def _build_optimizer(policy: PolicyModule, cfg: RobotFMConfig) -> torch.optim.Op
     )
 
 
+_LOSS_TERM_KEYS = ("flow", "consistency", "enc_recon", "flow_recon")
+
+
+def _unpack_policy_loss(
+    out: torch.Tensor | tuple[torch.Tensor, dict],
+) -> tuple[torch.Tensor, dict]:
+    """``compute_loss`` 可返回 Tensor 或 ``(loss, terms)``。"""
+    if isinstance(out, tuple):
+        loss = out[0]
+        terms = out[1] if len(out) > 1 and isinstance(out[1], dict) else {}
+        return loss, terms
+    return out, {}
+
+
+def _loss_terms_as_floats(terms: dict) -> dict[str, float]:
+    extra: dict[str, float] = {}
+    for key in _LOSS_TERM_KEYS:
+        if key not in terms:
+            continue
+        val = terms[key]
+        extra[key] = float(val.detach().item() if torch.is_tensor(val) else val)
+    return extra
+
+
 def _set_cosine_lr(optim: torch.optim.Optimizer, step: int, cfg: RobotFMConfig) -> None:
     """线性 warmup + cosine 衰减；各组按各自 base_lr 缩放。"""
     warmup = max(cfg.train.warmup_steps, 1)
@@ -542,7 +566,8 @@ def train_flow_matching(
         if cfg.policy.predict_joint_delta:
             logger.log(
                 "policy.predict_joint_delta: joint targets are action-q_now; "
-                "grippers stay absolute; action mean/std recomputed on residuals"
+                "grippers stay absolute; action mean/std recomputed on residuals; "
+                "A2A flow source obs_history is also q_now-relative (action-norm)"
             )
             rtc_on = bool(getattr(cfg.policy.rtc, "enabled", False))
             if rtc_on:
@@ -612,6 +637,22 @@ def train_flow_matching(
             if reset_step:
                 logger.log(f"resume: reset_step enabled (was {step} -> 0)")
                 step = 0
+            else:
+                # load_state_dict 会带回旧 ckpt 的 base_lr；按当前 yaml 重写，
+                # 否则续训改 lr / encoder_lr_scale 不生效（Adam 矩仍沿用）。
+                encoder_lr = cfg.train.lr * cfg.train.encoder_lr_scale
+                new_bases = [encoder_lr, cfg.train.lr]
+                for i, group in enumerate(optim.param_groups):
+                    new_base = float(
+                        new_bases[i] if i < len(new_bases) else cfg.train.lr
+                    )
+                    old_base = float(group.get("base_lr", group["lr"]))
+                    group["base_lr"] = new_base
+                    if abs(old_base - new_base) > 1e-12:
+                        logger.log(
+                            f"resume: param_group[{i}] base_lr {old_base:.6g} -> {new_base:.6g} "
+                            "(current yaml lr / encoder_lr_scale)"
+                        )
 
         # compile 放在 load_state_dict / optimizer 之后，ckpt 仍存未包装权重
         policy = _maybe_compile_policy(policy, enabled=use_compile, logger=logger)
@@ -690,18 +731,36 @@ def train_flow_matching(
                         mid_prob=state_drop_cfg.gripper_mid_prob,
                         late_prob=state_drop_cfg.gripper_late_prob,
                     )
-                    batch["obs_state"] = apply_state_dropout(
-                        batch["obs_state"],
-                        joint_p=joint_drop_p,
-                        gripper_p=gripper_drop_p,
-                        joint_mask=state_joint_mask,
-                        gripper_mask=state_gripper_mask,
-                        keep_at_least_one=state_drop_cfg.keep_at_least_one,
-                    )
+                    state = batch["obs_state"]
+                    history = batch.get("obs_history")
+                    # obs_history 是 A2A flow 起点；只遮 obs_state 时模型仍能从
+                    # 关节历史抄动作。沿时间维拼在一起，共用同一组 drop mask。
+                    if history is not None:
+                        t_state = state.shape[1]
+                        stacked = torch.cat([state, history], dim=1)
+                        stacked = apply_state_dropout(
+                            stacked,
+                            joint_p=joint_drop_p,
+                            gripper_p=gripper_drop_p,
+                            joint_mask=state_joint_mask,
+                            gripper_mask=state_gripper_mask,
+                            keep_at_least_one=state_drop_cfg.keep_at_least_one,
+                        )
+                        batch["obs_state"] = stacked[:, :t_state]
+                        batch["obs_history"] = stacked[:, t_state:]
+                    else:
+                        batch["obs_state"] = apply_state_dropout(
+                            state,
+                            joint_p=joint_drop_p,
+                            gripper_p=gripper_drop_p,
+                            joint_mask=state_joint_mask,
+                            gripper_mask=state_gripper_mask,
+                            keep_at_least_one=state_drop_cfg.keep_at_least_one,
+                        )
                 if cfg.train.cosine_lr:
                     _set_cosine_lr(optim, step, cfg)
                 with torch.amp.autocast("cuda", enabled=use_amp):
-                    loss = policy.compute_loss(batch)
+                    loss, loss_terms = _unpack_policy_loss(policy.compute_loss(batch))
                 optim.zero_grad(set_to_none=True)
                 scaler.scale(loss).backward()
                 # clip_grad_norm_ 返回值为 clip 前的总梯度范数
@@ -719,6 +778,7 @@ def train_flow_matching(
                 lr = float(optim.param_groups[-1]["lr"])
                 loss_v = float(loss.item())
                 if step % cfg.train.log_freq == 0:
+                    loss_terms_f = _loss_terms_as_floats(loss_terms)
                     clipped = (
                         cfg.train.max_grad_norm > 0
                         and grad_norm_v == grad_norm_v  # not NaN
@@ -735,6 +795,9 @@ def train_flow_matching(
                     if state_drop_cfg.enabled:
                         postfix["joint_drop_p"] = joint_drop_p
                         postfix["grip_drop_p"] = gripper_drop_p
+                    for key in _LOSS_TERM_KEYS:
+                        if key in loss_terms_f:
+                            postfix[key] = loss_terms_f[key]
                     pbar.set_postfix(**postfix)
                     # 只写文件，避免打断 tqdm 进度条
                     drop_msg = (
@@ -745,8 +808,13 @@ def train_flow_matching(
                             f" joint_drop_p={joint_drop_p:.4g}"
                             f" gripper_drop_p={gripper_drop_p:.4g}"
                         )
+                    term_msg = "".join(
+                        f" {key}={loss_terms_f[key]:.6f}"
+                        for key in _LOSS_TERM_KEYS
+                        if key in loss_terms_f
+                    )
                     logger.log(
-                        f"step={step}/{cfg.train.steps} loss={loss_v:.6f} "
+                        f"step={step}/{cfg.train.steps} loss={loss_v:.6f}{term_msg} "
                         f"lr={lr:.8g} grad_norm={grad_norm_v:.6f} "
                         f"max_grad_norm={cfg.train.max_grad_norm:g} "
                         f"clipped={int(clipped)}{drop_msg}",

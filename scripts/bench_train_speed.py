@@ -28,6 +28,14 @@ def main() -> None:
     p.add_argument("--config", type=str, required=True)
     p.add_argument("--warmup", type=int, default=5)
     p.add_argument("--steps", type=int, default=30)
+    p.add_argument("--batch-size", type=int, default=None, help="覆盖 train.batch_size")
+    p.add_argument("--num-workers", type=int, default=None, help="覆盖 train.num_workers")
+    p.add_argument(
+        "--compile",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="覆盖 train.compile",
+    )
     p.add_argument("--horizon", type=int, default=None, help="覆盖 dataset.horizon")
     p.add_argument(
         "--n-action-steps",
@@ -42,6 +50,12 @@ def main() -> None:
     if not config_path.is_absolute():
         config_path = base_dir / config_path
     cfg = load_config(config_path)
+    if args.batch_size is not None:
+        cfg.train.batch_size = int(args.batch_size)
+    if args.num_workers is not None:
+        cfg.train.num_workers = int(args.num_workers)
+    if args.compile is not None:
+        cfg.train.compile = bool(args.compile)
     if args.horizon is not None:
         cfg.dataset.horizon = int(args.horizon)
         if args.n_action_steps is None:
@@ -143,7 +157,8 @@ def main() -> None:
             )
         optim.zero_grad(set_to_none=True)
         with torch.amp.autocast("cuda", enabled=use_amp):
-            loss = policy.compute_loss(batch)
+            out = policy.compute_loss(batch)
+            loss = out[0] if isinstance(out, tuple) else out
         if use_amp:
             scaler.scale(loss).backward()
             if cfg.train.max_grad_norm is not None:

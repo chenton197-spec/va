@@ -141,7 +141,8 @@ def main() -> int:
         cfg.policy.pretrained_encoder = False
         policy = _build_fm_policy(cfg).to(device)
         batch_dev = {k: v.to(device) for k, v in batch.items()}
-        loss = policy.compute_loss(batch_dev)
+        out = policy.compute_loss(batch_dev)
+        loss = out[0] if isinstance(out, tuple) else out
         loss.backward()
         print(f"train step ok: device={device} loss={float(loss.detach().cpu()):.6f}")
 

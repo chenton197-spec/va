@@ -30,7 +30,11 @@ import torch
 from robotfm.collect.loop import get_run_dir
 from robotfm.config import load_config, resolve_path
 from robotfm.data.dataset import spatial_preprocess_images
-from robotfm.data.action_delta import denormalize_predicted_action, joint_mask_from_names
+from robotfm.data.action_delta import (
+    denormalize_predicted_action,
+    flow_history_from_phys,
+    joint_mask_from_names,
+)
 from robotfm.data.lerobot_dataset import (
     _load_image_rgb,
     _short_camera_name,
@@ -102,9 +106,16 @@ def _build_obs_batch(
     )
 
     state = normalize(states[obs_indices].astype(np.float32), stats, prefix="state", mode=norm_mode)
+    flow_hist = flow_history_from_phys(
+        states[obs_indices].astype(np.float32),
+        stats,
+        norm_mode,
+        action_names=None,
+    )
     return {
         "obs_images": obs_images.unsqueeze(0).to(device),
         "obs_state": torch.from_numpy(state).unsqueeze(0).to(device),
+        "obs_history": torch.from_numpy(flow_hist).unsqueeze(0).to(device),
     }
 
 
@@ -151,6 +162,19 @@ def main() -> None:
         default=None,
         help="Gaussian noise std added to obs_state (flow start) at inference. "
         "Default: training policy.history_noise_std.",
+    )
+    parser.add_argument(
+        "--run-dir",
+        type=str,
+        default=None,
+        help="Override LeRobot dataset root (default: data_root / dataset.run_name).",
+    )
+    parser.add_argument(
+        "--reanchor-pred0-to-qnow",
+        action="store_true",
+        help="Inference-time pseudo-delta: per chunk, joints become "
+        "pred - pred[0] + q_now. Grippers stay absolute. Does not require "
+        "predict_joint_delta training.",
     )
     args = parser.parse_args()
 
@@ -200,8 +224,15 @@ def main() -> None:
     history_noise_std = float(cfg.policy.history_noise_std)
     action_names = _action_names_from_cfg(cfg)
     cameras = list(cfg.cameras)
+    delta_joint_mask = joint_mask_from_names(action_names, int(cfg.action_dim))
+    reanchor = bool(args.reanchor_pred0_to_qnow)
 
-    run_dir = get_run_dir(cfg, base_dir)
+    if args.run_dir:
+        run_dir = Path(args.run_dir)
+        if not run_dir.is_absolute():
+            run_dir = (base_dir / run_dir).resolve()
+    else:
+        run_dir = get_run_dir(cfg, base_dir)
     info = load_lerobot_info(run_dir)
     features = info["features"]
     cam_feat_keys = [
@@ -239,7 +270,8 @@ def main() -> None:
         f"n_action_steps={n_action_steps} exec_steps={exec_steps} "
         f"num_inference_steps={num_inference_steps} "
         f"history_noise_std={history_noise_std} "
-        f"predict_joint_delta={bool(cfg.policy.predict_joint_delta)}"
+        f"predict_joint_delta={bool(cfg.policy.predict_joint_delta)} "
+        f"reanchor_pred0_to_qnow={reanchor}"
     )
     print(
         f"pre_crop={cfg.dataset.pre_crop_size} resize={cfg.dataset.resize_size} "
@@ -247,6 +279,7 @@ def main() -> None:
         f"device={device}"
     )
 
+    pred_actions_raw = np.full_like(actions_gt, np.nan, dtype=np.float32)
     pred_actions = np.full_like(actions_gt, np.nan, dtype=np.float32)
     replan_ts: list[int] = []
 
@@ -268,28 +301,42 @@ def main() -> None:
         )
         with torch.no_grad():
             pred_norm = policy.sample_actions(batch)[0].cpu()
+        q_now = states[t].astype(np.float32)
         pred_phys = np.asarray(
             denormalize_predicted_action(
                 pred_norm,
                 stats,
                 norm_mode,
-                q_now_phys=states[t].astype(np.float32),
+                q_now_phys=q_now,
                 predict_joint_delta=bool(cfg.policy.predict_joint_delta),
-                joint_mask=joint_mask_from_names(action_names, int(cfg.action_dim)),
+                joint_mask=delta_joint_mask,
             )
         )
 
         take = min(exec_steps, length - t, pred_phys.shape[0])
-        pred_actions[t : t + take] = pred_phys[:take]
+        chunk_raw = pred_phys[:take]
+        pred_actions_raw[t : t + take] = chunk_raw
+        if reanchor:
+            chunk = np.array(chunk_raw, dtype=np.float32, copy=True)
+            offset = q_now[delta_joint_mask] - chunk[0, delta_joint_mask]
+            chunk[:, delta_joint_mask] = chunk[:, delta_joint_mask] + offset
+            pred_actions[t : t + take] = chunk
+        else:
+            pred_actions[t : t + take] = chunk_raw
         replan_ts.append(t)
         t += take
+
+    def _mae_rmse(pred_arr: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        valid_m = np.isfinite(pred_arr).all(axis=1)
+        err_m = pred_arr[valid_m] - actions_gt[valid_m]
+        return np.mean(np.abs(err_m), axis=0), np.sqrt(np.mean(err_m**2, axis=0))
 
     valid = np.isfinite(pred_actions).all(axis=1)
     gt = actions_gt[valid]
     pred = pred_actions[valid]
     err = pred - gt
-    mae = np.mean(np.abs(err), axis=0)
-    rmse = np.sqrt(np.mean(err**2, axis=0))
+    mae, rmse = _mae_rmse(pred_actions)
+    mae_raw, rmse_raw = _mae_rmse(pred_actions_raw) if reanchor else (None, None)
 
     # Dual-arm 16-D: [L0..L6, R0..R6, left_gripper, right_gripper]
     # Single-arm 7-D: [j1..j6, gripper]
@@ -317,6 +364,8 @@ def main() -> None:
         "num_inference_steps": num_inference_steps,
         "history_noise_std": history_noise_std,
         "predict_joint_delta": bool(cfg.policy.predict_joint_delta),
+        "reanchor_pred0_to_qnow": reanchor,
+        "run_dir": str(run_dir),
         "pre_crop_size": cfg.dataset.pre_crop_size,
         "resize_size": cfg.dataset.resize_size,
         "crop_size": cfg.dataset.crop_size,
@@ -328,15 +377,24 @@ def main() -> None:
         "mae_gripper": mae_gripper,
         "mae_all": float(np.mean(mae)),
     }
+    if reanchor and mae_raw is not None:
+        metrics["mae_joints_raw"] = float(np.mean(mae_raw[joint_mask])) if joint_mask.any() else float("nan")
+        metrics["mae_gripper_raw"] = (
+            float(np.mean(mae_raw[gripper_mask])) if gripper_mask.any() else float("nan")
+        )
+        metrics["mae_all_raw"] = float(np.mean(mae_raw))
+        metrics["mae_per_dim_raw"] = {n: float(v) for n, v in zip(action_names, mae_raw)}
     (out_dir / "metrics.json").write_text(json.dumps(metrics, indent=2) + "\n")
-    np.savez_compressed(
-        out_dir / "pred_vs_gt.npz",
+    npz_kw = dict(
         pred=pred_actions,
         gt=actions_gt,
         state=states,
         replan_ts=np.asarray(replan_ts, dtype=np.int32),
         action_names=np.asarray(action_names),
     )
+    if reanchor:
+        npz_kw["pred_raw"] = pred_actions_raw
+    np.savez_compressed(out_dir / "pred_vs_gt.npz", **npz_kw)
 
     steps = np.arange(length)
     n_dim = len(action_names)
@@ -347,7 +405,26 @@ def main() -> None:
     for i, name in enumerate(action_names):
         ax = axes[i]
         ax.plot(steps, actions_gt[:, i], label="GT", color="#1f77b4", linewidth=1.2)
-        ax.plot(steps, pred_actions[:, i], label="Pred", color="#d62728", linewidth=1.0, alpha=0.85)
+        if reanchor:
+            ax.plot(
+                steps,
+                pred_actions_raw[:, i],
+                label="Pred raw",
+                color="#7f7f7f",
+                linewidth=0.9,
+                alpha=0.7,
+                linestyle="--",
+            )
+            ax.plot(
+                steps,
+                pred_actions[:, i],
+                label="Pred Δq+q_now",
+                color="#d62728",
+                linewidth=1.0,
+                alpha=0.9,
+            )
+        else:
+            ax.plot(steps, pred_actions[:, i], label="Pred", color="#d62728", linewidth=1.0, alpha=0.85)
         ax.set_ylabel(name)
         ax.grid(True, alpha=0.3)
         ax.set_title(f"{name}  MAE={mae[i]:.4f}  RMSE={rmse[i]:.4f}")
@@ -359,7 +436,8 @@ def main() -> None:
         ax.set_xlabel("frame")
     fig.suptitle(
         f"Episode {args.episode} open-loop  |  {ckpt_path.name}  |  "
-        f"fm={num_inference_steps} exec={exec_steps}/{n_action_steps}  |  "
+        f"fm={num_inference_steps} exec={exec_steps}/{n_action_steps}"
+        f"{'  |  reanchor pred-pred[0]+q_now' if reanchor else ''}  |  "
         f"MAE joints={metrics['mae_joints']:.4f} gripper={metrics['mae_gripper']:.4f}",
         fontsize=12,
     )
@@ -399,7 +477,8 @@ def main() -> None:
             ax.grid(True, alpha=0.3)
             ax.legend(loc="upper right", fontsize=8, ncol=2)
         fig_lr.suptitle(
-            f"Episode {args.episode} joint deviation  |  {ckpt_path.name}",
+            f"Episode {args.episode} joint deviation"
+            f"{'  (reanchor pred-pred[0]+q_now)' if reanchor else ''}  |  {ckpt_path.name}",
             fontsize=12,
         )
         fig_lr.tight_layout()
@@ -408,11 +487,20 @@ def main() -> None:
         plt.close(fig_lr)
 
     print("\n===== MAE / RMSE (physical units) =====")
+    if reanchor and mae_raw is not None:
+        print("  (Pred = reanchor pred-pred[0]+q_now; raw = absolute decode)")
     for i, name in enumerate(action_names):
-        print(f"  {name:8s}  MAE={mae[i]:.6f}  RMSE={rmse[i]:.6f}")
+        extra = ""
+        if reanchor and mae_raw is not None:
+            extra = f"  raw_MAE={mae_raw[i]:.6f}"
+        print(f"  {name:8s}  MAE={mae[i]:.6f}  RMSE={rmse[i]:.6f}{extra}")
     print(f"  joints   MAE={metrics['mae_joints']:.6f}")
+    if reanchor and "mae_joints_raw" in metrics:
+        print(f"  joints   MAE_raw={metrics['mae_joints_raw']:.6f}")
     print(f"  gripper  MAE={metrics['mae_gripper']:.6f}")
     print(f"  all      MAE={metrics['mae_all']:.6f}")
+    if reanchor and "mae_all_raw" in metrics:
+        print(f"  all      MAE_raw={metrics['mae_all_raw']:.6f}")
     print(f"\nsaved: {plot_path}")
     if left_idx or right_idx:
         print(f"saved: {dev_plot_path}")

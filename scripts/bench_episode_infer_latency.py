@@ -34,6 +34,7 @@ from robotfm.data.lerobot_dataset import (
     load_episode_arrays_from_parquet,
     load_lerobot_info,
 )
+from robotfm.data.action_delta import flow_history_from_phys
 from robotfm.data.stats import normalize
 from robotfm.policies.encoders import MultiCameraEncoder
 from robotfm.policies.rtc import RTCConfig
@@ -115,9 +116,15 @@ def _build_obs_batch(
     )
 
     state = normalize(states[obs_indices].astype(np.float32), stats, prefix="state", mode=norm_mode)
+    flow_hist = flow_history_from_phys(
+        states[obs_indices].astype(np.float32),
+        stats,
+        norm_mode,
+    )
     return {
         "obs_images": obs_images.unsqueeze(0).to(device),
         "obs_state": torch.from_numpy(state).unsqueeze(0).to(device),
+        "obs_history": torch.from_numpy(flow_hist).unsqueeze(0).to(device),
     }
 
 

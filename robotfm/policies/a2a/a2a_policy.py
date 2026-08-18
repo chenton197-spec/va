@@ -156,12 +156,23 @@ class A2APolicy(nn.Module):
         return self.obs_projector(cond)
 
     def _encode_history(self, batch: dict[str, torch.Tensor]) -> torch.Tensor:
-        """Encode state history as flow source (original A2A: agent_pos)."""
-        history = self._add_history_noise(batch["obs_state"])
+        """Encode state history as flow source (original A2A: agent_pos).
+
+        ``obs_history`` is the flow start: with ``predict_joint_delta`` it is
+        q_now-relative joints in **action** norm space, matching residual targets.
+        ``obs_state`` stays absolute for the vision/state conditioner.
+        """
+        history = batch["obs_history"] if "obs_history" in batch else batch["obs_state"]
+        history = self._add_history_noise(history)
         return self.history_action_encoder(history)
 
-    def compute_loss(self, batch: dict[str, torch.Tensor]) -> torch.Tensor:
+    def compute_loss(
+        self, batch: dict[str, torch.Tensor]
+    ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
         """CFM + consistency + recon losses (A2A_Flow_Matching defaults).
+
+        Returns ``(loss, terms)`` where ``terms`` are **unweighted** scalars:
+        ``flow``, ``consistency``, ``enc_recon``, ``flow_recon``.
 
         batch:
             obs_images: (B, Cams, T_obs, 3, H, W)
@@ -187,6 +198,10 @@ class A2APolicy(nn.Module):
             start=history_latents,
             global_cond=obs_latents,
         )
+        zero = flow_loss.new_zeros(())
+        consistency_loss = zero
+        flow_recon_loss = zero
+        enc_recon_loss = zero
         loss = flow_loss
 
         if self.cfg.enc_contrastive_weight > 0:
@@ -218,18 +233,23 @@ class A2APolicy(nn.Module):
             if self.cfg.flow_recon_weight > 0:
                 actions_recon = self.action_decoder(action_latents_pred)
                 recon = F.l1_loss(actions_recon, future_actions, reduction="none") * future_mask
-                loss = loss + self.cfg.flow_recon_weight * (
-                    recon.sum() / future_mask.sum().clamp_min(1.0)
-                )
+                # mask 是 (B, T, 1)，必须按元素数平均，否则 recon 会被 action_dim 放大
+                flow_recon_loss = recon.sum() / future_mask.expand_as(recon).sum().clamp_min(1.0)
+                loss = loss + self.cfg.flow_recon_weight * flow_recon_loss
 
         if self.cfg.enc_recon_weight > 0:
             actions_recon = self.action_decoder(future_action_latents)
             recon = F.l1_loss(actions_recon, future_actions, reduction="none") * future_mask
-            loss = loss + self.cfg.enc_recon_weight * (
-                recon.sum() / future_mask.sum().clamp_min(1.0)
-            )
+            enc_recon_loss = recon.sum() / future_mask.expand_as(recon).sum().clamp_min(1.0)
+            loss = loss + self.cfg.enc_recon_weight * enc_recon_loss
 
-        return loss
+        terms = {
+            "flow": flow_loss,
+            "consistency": consistency_loss,
+            "enc_recon": enc_recon_loss,
+            "flow_recon": flow_recon_loss,
+        }
+        return loss, terms
 
     @torch.no_grad()
     def sample_actions(

@@ -89,7 +89,8 @@ def run_one(
     while step < steps:
         for batch in loader:
             batch = {k: v.to(device) for k, v in batch.items()}
-            loss = policy.compute_loss(batch)
+            out = policy.compute_loss(batch)
+            loss = out[0] if isinstance(out, tuple) else out
             optim.zero_grad(set_to_none=True)
             loss.backward()
             # 记录梯度范数，便于发现 lr 过大导致爆炸

@@ -145,7 +145,7 @@ class FlowMatchingPolicy(nn.Module):
         # action_mask：有效动作步=1，episode 末尾 padding 步=0
         # 乘上 mask 后，末尾 pad 不进 loss；真实短 chunk 动作仍会训练到
         loss = F.mse_loss(pred_v, target_v, reduction="none") * mask
-        return loss.sum() / mask.sum().clamp_min(1.0)
+        return loss.sum() / mask.expand_as(loss).sum().clamp_min(1.0)
 
     @torch.no_grad()
     def sample_actions(

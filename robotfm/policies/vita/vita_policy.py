@@ -126,8 +126,13 @@ class VITAPolicy(nn.Module):
         cond = self.encoder(batch["obs_images"], batch["obs_state"])
         return self.obs_projector(cond)
 
-    def compute_loss(self, batch: dict[str, torch.Tensor]) -> torch.Tensor:
+    def compute_loss(
+        self, batch: dict[str, torch.Tensor]
+    ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
         """CFM + consistency + recon losses (upstream VITA defaults).
+
+        Returns ``(loss, terms)`` where ``terms`` are **unweighted** scalars:
+        ``flow``, ``consistency``, ``enc_recon``, ``flow_recon``.
 
         batch:
             obs_images: (B, Cams, T_obs, 3, H, W)
@@ -147,6 +152,10 @@ class VITAPolicy(nn.Module):
             target=action_latents,
             start=obs_latents,
         )
+        zero = flow_loss.new_zeros(())
+        consistency_loss = zero
+        flow_recon_loss = zero
+        enc_recon_loss = zero
         loss = flow_loss
 
         if self.cfg.enc_contrastive_weight > 0:
@@ -177,18 +186,22 @@ class VITAPolicy(nn.Module):
             if self.cfg.flow_recon_weight > 0:
                 actions_recon = self.action_decoder(action_latents_pred)
                 recon = F.l1_loss(actions_recon, actions, reduction="none") * mask
-                loss = loss + self.cfg.flow_recon_weight * (
-                    recon.sum() / mask.sum().clamp_min(1.0)
-                )
+                flow_recon_loss = recon.sum() / mask.expand_as(recon).sum().clamp_min(1.0)
+                loss = loss + self.cfg.flow_recon_weight * flow_recon_loss
 
         if self.cfg.enc_recon_weight > 0:
             actions_recon = self.action_decoder(action_latents)
             recon = F.l1_loss(actions_recon, actions, reduction="none") * mask
-            loss = loss + self.cfg.enc_recon_weight * (
-                recon.sum() / mask.sum().clamp_min(1.0)
-            )
+            enc_recon_loss = recon.sum() / mask.expand_as(recon).sum().clamp_min(1.0)
+            loss = loss + self.cfg.enc_recon_weight * enc_recon_loss
 
-        return loss
+        terms = {
+            "flow": flow_loss,
+            "consistency": consistency_loss,
+            "enc_recon": enc_recon_loss,
+            "flow_recon": flow_recon_loss,
+        }
+        return loss, terms
 
     @torch.no_grad()
     def sample_actions(self, batch: dict[str, torch.Tensor], **_kwargs) -> torch.Tensor:

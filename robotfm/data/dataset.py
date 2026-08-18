@@ -20,6 +20,7 @@ from torch.utils.data import Dataset
 
 from robotfm.data.schema import image_key, load_episode, load_meta
 from robotfm.data.action_delta import (
+    flow_history_from_phys,
     joint_mask_from_names,
     overlay_joint_delta_action_stats,
     subtract_joint_pose,
@@ -672,7 +673,20 @@ class EpisodeDataset(Dataset):
                 )
 
         # ---- 4) 状态取 obs_indices，并用 stats 归一化 ----
-        state = self._normalize_state(arrays["state"][obs_indices].astype(np.float32))
+        state_phys = arrays["state"][obs_indices].astype(np.float32)
+        state = self._normalize_state(state_phys)
+        if self.predict_joint_delta:
+            if self.stats is None:
+                raise ValueError("predict_joint_delta requires stats")
+            flow_hist = flow_history_from_phys(
+                state_phys,
+                self.stats,
+                self.norm_mode,
+                predict_joint_delta=True,
+                joint_mask=self._joint_mask,
+            )
+        else:
+            flow_hist = state
 
         # ---- 5) 动作标签：从当前 t 起往后取 horizon 步 ----
         # 末尾不够则 0-pad，action_mask 标出有效步（不丢帧）。
@@ -697,6 +711,7 @@ class EpisodeDataset(Dataset):
         return {
             "obs_images": obs_images,
             "obs_state": torch.from_numpy(state),
+            "obs_history": torch.from_numpy(np.asarray(flow_hist, dtype=np.float32)),
             "action": torch.from_numpy(actions),
             "action_mask": torch.from_numpy(mask),
         }

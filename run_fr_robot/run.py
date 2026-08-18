@@ -59,7 +59,7 @@ if str(VA_ROOT) not in sys.path:
     sys.path.insert(0, str(VA_ROOT))
 
 from robotfm.config import _normalize_rtc_config, load_config  # noqa: E402
-from robotfm.data.action_delta import denormalize_predicted_action, joint_mask_from_names  # noqa: E402
+from robotfm.data.action_delta import denormalize_predicted_action, flow_history_from_phys, joint_mask_from_names  # noqa: E402
 from robotfm.data.dataset import spatial_preprocess_images  # noqa: E402
 from robotfm.data.stats import normalize  # noqa: E402
 from robotfm.policies.rtc import ActionQueue, RTCConfig  # noqa: E402
@@ -461,6 +461,18 @@ def _build_obs_batch(
     return {
         "obs_images": torch.stack(camera_histories, dim=0).unsqueeze(0).to(device),
         "obs_state": torch.stack(states, dim=0).unsqueeze(0).to(device),
+        "obs_history": torch.from_numpy(
+            flow_history_from_phys(
+                np.stack(
+                    [np.asarray(obs.state, dtype=np.float32) for obs in history],
+                    axis=0,
+                ),
+                stats,
+                norm_mode,
+            )
+        )
+        .unsqueeze(0)
+        .to(device),
     }
 
 

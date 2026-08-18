@@ -10,7 +10,7 @@ from __future__ import annotations
 import numpy as np
 import torch
 
-from robotfm.data.stats import denormalize
+from robotfm.data.stats import denormalize, normalize
 
 
 def joint_mask_from_names(action_names: list[str] | None, action_dim: int) -> np.ndarray:
@@ -75,6 +75,39 @@ def add_joint_pose(
     out = np.array(actions, dtype=np.float32, copy=True)
     out[..., mask] = out[..., mask] + q[..., mask]
     return out
+
+
+def stats_predict_joint_delta(stats: dict | None) -> bool:
+    """True if action stats were overlaid with joint-delta residuals."""
+    if not stats:
+        return False
+    return "action_delta_mean" in stats or "action_delta_std" in stats
+
+
+def flow_history_from_phys(
+    state_phys: np.ndarray,
+    stats: dict,
+    norm_mode: str,
+    *,
+    predict_joint_delta: bool | None = None,
+    joint_mask: np.ndarray | None = None,
+    action_names: list[str] | None = None,
+) -> np.ndarray:
+    """Physical state window ``(T, D)`` → normalized A2A flow source.
+
+    Last row is ``q_now``. With joint-delta: joints become ``state - q_now``,
+    then **action** normalization (same space as residual action targets).
+    Otherwise: state normalization (same as ``obs_state``).
+    """
+    state_phys = np.asarray(state_phys, dtype=np.float32)
+    if predict_joint_delta is None:
+        predict_joint_delta = stats_predict_joint_delta(stats)
+    if not predict_joint_delta:
+        return normalize(state_phys, stats, prefix="state", mode=norm_mode)
+    if joint_mask is None:
+        joint_mask = joint_mask_from_names(action_names, int(state_phys.shape[-1]))
+    hist = subtract_joint_pose(state_phys, state_phys[-1], joint_mask)
+    return normalize(hist, stats, prefix="action", mode=norm_mode)
 
 
 def overlay_joint_delta_action_stats(

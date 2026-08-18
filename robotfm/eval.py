@@ -26,7 +26,11 @@ import torch
 
 from robotfm.config import RobotFMConfig, _normalize_rtc_config, resolve_path
 from robotfm.collect.loop import get_run_dir
-from robotfm.data.action_delta import denormalize_predicted_action, joint_mask_from_names
+from robotfm.data.action_delta import (
+    denormalize_predicted_action,
+    flow_history_from_phys,
+    joint_mask_from_names,
+)
 from robotfm.data.dataset import spatial_preprocess_images
 from robotfm.data.stats import ensure_stats, normalize
 from robotfm.envs.registry import make_env
@@ -130,7 +134,21 @@ def _build_obs_batch(
 
     obs_images = obs_images.unsqueeze(0).to(device)
     obs_state = torch.stack(states, dim=0).unsqueeze(0).to(device)
-    return {"obs_images": obs_images, "obs_state": obs_state}
+    state_phys = np.stack(
+        [np.asarray(obs.state, dtype=np.float32) for obs in obs_history], axis=0
+    )
+    obs_history_n = flow_history_from_phys(
+        state_phys,
+        stats,
+        norm_mode,
+        predict_joint_delta=bool(cfg.policy.predict_joint_delta),
+        action_names=list(cfg.action_names) if cfg.action_names else None,
+    )
+    return {
+        "obs_images": obs_images,
+        "obs_state": obs_state,
+        "obs_history": torch.from_numpy(obs_history_n).unsqueeze(0).to(device),
+    }
 
 
 def evaluate_flow_matching(
