@@ -1,0 +1,81 @@
+backend: pusht
+embodiment: pusht_sim
+cameras: [head, left_hand, right_hand]
+state_dim: 16
+action_dim: 16
+state_names:
+  [L0, L1, L2, L3, L4, L5, L6, R0, R1, R2, R3, R4, R5, R6, left_gripper, right_gripper]
+action_names:
+  [L0, L1, L2, L3, L4, L5, L6, R0, R1, R2, R3, R4, R5, R6, left_gripper, right_gripper]
+fps: 15
+data_root: data
+output_dir: outputs/act_openarm_hcx_dual_arm_resnet18
+
+dataset:
+  # ACT 仅支持单帧观测；保留当前 openarm 数据与空间预处理
+  n_obs_steps: 1
+  horizon: 32
+  run_name: openarm_hcx_dual_arm
+  pre_crop_size: 720
+  resize_size: 360
+  crop_size: null
+  eval_fixed_crop: true
+  color_jitter_brightness: 0.2
+  color_jitter_contrast: 0.2
+  color_jitter_saturation: 0.1
+  color_jitter_hue: 0.0
+  norm_mode: gaussian_2std
+  image_norm_mode: dataset
+  uint8_cache: true
+  gpu_augment: true
+
+policy:
+  type: act
+  vision_backbone: resnet18
+  pretrained_encoder: true
+  dim_model: 512
+  dim_feedforward: 3200
+  n_heads: 8
+  n_encoder_layers: 4
+  n_decoder_layers: 1
+  n_vae_encoder_layers: 4
+  latent_dim: 32
+  kl_weight: 10.0
+  dropout: 0.1
+  use_vae: true
+  pre_norm: false
+  feedforward_activation: relu
+  replace_final_stride_with_dilation: false
+  # 先用经典 ACT：每次预测整个 chunk，并执行完整 chunk
+  n_action_steps: 32
+  temporal_ensemble_coeff: null
+  rtc:
+    enabled: false
+
+train:
+  # 三相机 360 分辨率先保守起步，避免 ACT 首跑直接 OOM
+  batch_size: 8
+  steps: 1941200
+  lr: 0.00001
+  weight_decay: 0.0001
+  log_freq: 50
+  save_freq: 48530
+  latest_save_freq: 4853
+  keep_last_ckpts: 10
+  device: cuda
+  num_workers: 1
+  cosine_lr: true
+  warmup_steps: 500
+  encoder_lr_scale: 1.0
+  max_grad_norm: 1.0
+
+eval:
+  num_episodes: 50
+  save_video: false
+  video_dir: outputs/eval_videos
+  success_coverage: 0.85
+
+collect:
+  target_episodes: 30
+  save_all: false
+  task: push the T block to the target
