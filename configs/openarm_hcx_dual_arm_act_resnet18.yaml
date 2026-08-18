@@ -28,6 +28,17 @@ dataset:
   image_norm_mode: dataset
   uint8_cache: true
   gpu_augment: true
+  # 30% 样本将当前关节角与夹爪状态整组置零，迫使 ACT 更多利用视觉。
+  state_dropout:
+    enabled: true
+    whole_state_prob: 0.3
+    keep_at_least_one: true
+    joint_early_prob: 0.0
+    joint_mid_prob: 0.0
+    joint_late_prob: 0.0
+    gripper_early_prob: 0.0
+    gripper_mid_prob: 0.0
+    gripper_late_prob: 0.0
 
 policy:
   type: act

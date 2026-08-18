@@ -426,18 +426,20 @@ def state_group_masks(
 def apply_state_dropout(
     state: torch.Tensor,
     *,
+    whole_p: float,
     joint_p: float,
     gripper_p: float,
     joint_mask: torch.Tensor,
     gripper_mask: torch.Tensor,
     keep_at_least_one: bool = True,
 ) -> torch.Tensor:
-    """关节组 / 夹爪组独立 Bernoulli 整组置零。
+    """全状态 / 关节组 / 夹爪组按样本 Bernoulli 置零。
 
-    ``state``: (B, T, D)。同一组对所有历史帧一起遮挡。两组概率都 ``<=0`` 时原样返回。
+    ``state``: (B, T, D)。同一组对所有历史帧一起遮挡。所有概率都 ``<=0`` 时原样返回。
     若 ``keep_at_least_one`` 且某样本两组都被抽中，随机放回一组。
+    ``whole_p`` 抽中的样本始终全部置零，不受 ``keep_at_least_one`` 影响。
     """
-    if joint_p <= 0.0 and gripper_p <= 0.0:
+    if whole_p <= 0.0 and joint_p <= 0.0 and gripper_p <= 0.0:
         return state
     if state.ndim != 3:
         raise ValueError(
@@ -458,14 +460,13 @@ def apply_state_dropout(
         groups.append((torch.rand(batch, device=device) < float(joint_p), joint_mask))
     if gripper_p > 0.0 and bool(gripper_mask.any()):
         groups.append((torch.rand(batch, device=device) < float(gripper_p), gripper_mask))
-    if not groups:
-        return state
-
-    drop = torch.zeros(batch, dim, device=device, dtype=torch.bool)
+    group_drop_mask = torch.zeros(batch, dim, device=device, dtype=torch.bool)
     for group_drop, group_mask in groups:
-        drop = drop | (group_drop.unsqueeze(1) & group_mask.unsqueeze(0))
+        group_drop_mask = group_drop_mask | (
+            group_drop.unsqueeze(1) & group_mask.unsqueeze(0)
+        )
 
-    if keep_at_least_one:
+    if keep_at_least_one and groups:
         stacked = torch.stack([group_drop for group_drop, _ in groups], dim=1)
         all_dropped = stacked.all(dim=1)
         if bool(all_dropped.any()):
@@ -475,7 +476,10 @@ def apply_state_dropout(
                 restore = all_dropped.clone()
                 restore[all_dropped] = keep_group == group_idx
                 if bool(restore.any()):
-                    drop[restore] = drop[restore] & ~group_mask
+                    group_drop_mask[restore] = group_drop_mask[restore] & ~group_mask
+
+    whole_drop = torch.rand(batch, device=device) < float(whole_p)
+    drop = group_drop_mask | whole_drop.unsqueeze(1)
 
     mask = (~drop).to(dtype=state.dtype).view(batch, 1, dim)
     return state * mask

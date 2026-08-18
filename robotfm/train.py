@@ -666,6 +666,7 @@ def train_flow_matching(
 
         pbar = tqdm(total=cfg.train.steps, initial=step, desc="train")
         state_drop_cfg = cfg.dataset.state_dropout
+        whole_state_drop_p = float(state_drop_cfg.whole_state_prob)
         state_joint_mask = None
         state_gripper_mask = None
         if state_drop_cfg.enabled:
@@ -740,6 +741,7 @@ def train_flow_matching(
                         stacked = torch.cat([state, history], dim=1)
                         stacked = apply_state_dropout(
                             stacked,
+                            whole_p=whole_state_drop_p,
                             joint_p=joint_drop_p,
                             gripper_p=gripper_drop_p,
                             joint_mask=state_joint_mask,
@@ -751,6 +753,7 @@ def train_flow_matching(
                     else:
                         batch["obs_state"] = apply_state_dropout(
                             state,
+                            whole_p=whole_state_drop_p,
                             joint_p=joint_drop_p,
                             gripper_p=gripper_drop_p,
                             joint_mask=state_joint_mask,

@@ -51,10 +51,12 @@ class StateDropoutConfig:
 
     按 ``state_names`` 含 ``gripper`` 的维为夹爪组，其余为关节组；两组独立 Bernoulli。
     同一组在所有历史帧上一起遮挡。``keep_at_least_one`` 时两组都被抽中则随机放回一组。
+    ``whole_state_prob`` 额外按样本将全部状态维及所有历史帧一起置零。
     """
 
     enabled: bool = False
     keep_at_least_one: bool = True
+    whole_state_prob: float = 0.0
     schedule_steps: int | None = None
     early_frac: float = 0.30
     mid_frac: float = 0.40
