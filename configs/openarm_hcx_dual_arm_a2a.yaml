@@ -1,0 +1,83 @@
+# 干净 A2A 基线：对齐 A2A_Flow_Matching 的 a2a.yaml（无历史噪声、无 OT、无对比损失）
+# 数据：openarm_hcx_dual_arm，双臂 14 关节 + 双夹爪，三相机，15 FPS
+# 时间窗：8 帧历史观测 -> 8 帧未来动作
+cameras: [head, left_hand, right_hand]
+state_dim: 16
+action_dim: 16
+state_names:
+  [L0, L1, L2, L3, L4, L5, L6, R0, R1, R2, R3, R4, R5, R6, left_gripper, right_gripper]
+action_names:
+  [L0, L1, L2, L3, L4, L5, L6, R0, R1, R2, R3, R4, R5, R6, left_gripper, right_gripper]
+fps: 15
+data_root: data
+output_dir: outputs/a2a_openarm_hcx_dual_arm
+
+dataset:
+  n_obs_steps: 8
+  horizon: 8
+  run_name: openarm_hcx_dual_arm
+  # 对齐参考实现的 256x256 输入，不额外随机裁剪或颜色增强
+  pre_crop_size: 720
+  resize_size: 256
+  crop_size: null
+  eval_fixed_crop: true
+  norm_mode: gaussian
+  uint8_cache: true
+  gpu_augment: true
+
+policy:
+  type: a2a
+  vision_backbone: resnet18
+  hidden_dim: 256
+  num_inference_steps: 6
+  n_action_steps: 8
+  # 参考实现使用 weights=null，并直接逐帧编码 RGB
+  pretrained_encoder: false
+  use_frame_diff: false
+  # 每个相机使用独立 ResNet，对齐 share_rgb_model=false
+  share_image_encoder: false
+  latent_dim: 512
+  consistency_weight: 1.0
+  enc_recon_weight: 0.5
+  flow_recon_weight: 0.5
+  enc_contrastive_weight: 0.0
+  flow_contrastive_weight: 0.0
+  history_noise_std: 0.0
+  use_ot_matcher: false
+  decode_flow_latents: true
+  predict_joint_delta: false
+  flow_hidden_dim: 512
+  flow_num_layers: 4
+  flow_mlp_ratio: 4.0
+  flow_dropout: 0.0
+  ae_enc_hidden_dim: 512
+  ae_dec_hidden_dim: 512
+  ae_num_layers: 4
+  ae_dropout: 0.0
+  rtc:
+    enabled: false
+    execution_horizon: 8
+    max_guidance_weight: 10.0
+    prefix_attention_schedule: exp
+    inference_delay: 2
+    debug: false
+
+train:
+  # 参考实现：batch=32、1000 个截断 epoch，每个 epoch 最多 250 step
+  batch_size: 32
+  steps: 250000
+  lr: 0.0001
+  weight_decay: 0.000001
+  log_freq: 100
+  save_freq: 12500
+  latest_save_freq: 2500
+  keep_last_ckpts: 5
+  device: cuda
+  num_workers: 2
+  cosine_lr: true
+  warmup_steps: 500
+  # 随机初始化视觉编码器时使用与主体相同的学习率
+  encoder_lr_scale: 1.0
+  max_grad_norm: 1.0
+  amp: false
+  compile: false
