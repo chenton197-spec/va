@@ -6,6 +6,7 @@ returns the same batch keys as ``EpisodeDataset``:
 
 State/action concatenate the arm vector with gripper scalar(s):
 - single-arm: ``observation.gripper`` / ``action.gripper`` → +1-D
+- left-only: ``*.left_gripper`` (no ``right_gripper``) → +1-D
 - dual-arm: ``*.left_gripper`` + ``*.right_gripper`` → +2-D
 Camera feature keys ``observation.images.<name>`` map to short names ``<name>``.
 """
@@ -37,6 +38,8 @@ IMAGE_FEATURE_PREFIX = "observation.images."
 
 # Gripper feature layouts supported by this loader / stats merge.
 _SINGLE_GRIPPER = ("gripper",)
+_LEFT_GRIPPER = ("left_gripper",)
+_RIGHT_GRIPPER = ("right_gripper",)
 _DUAL_GRIPPER = ("left_gripper", "right_gripper")
 
 
@@ -81,6 +84,8 @@ def resolve_gripper_suffixes(features: dict[str, Any]) -> tuple[str, ...]:
     Supports:
     - ``()``: no gripper columns
     - ``(\"gripper\",)``: single-arm
+    - ``(\"left_gripper\",)``: left arm only (e.g. with_depth left subset)
+    - ``(\"right_gripper\",)``: right arm only
     - ``(\"left_gripper\", \"right_gripper\")``: dual-arm (openarm etc.)
     """
     def _present(prefix: str, suffixes: tuple[str, ...]) -> bool:
@@ -90,6 +95,10 @@ def resolve_gripper_suffixes(features: dict[str, Any]) -> tuple[str, ...]:
     dual_action = _present("action", _DUAL_GRIPPER)
     single_state = _present("observation", _SINGLE_GRIPPER)
     single_action = _present("action", _SINGLE_GRIPPER)
+    left_state = _present("observation", _LEFT_GRIPPER)
+    left_action = _present("action", _LEFT_GRIPPER)
+    right_state = _present("observation", _RIGHT_GRIPPER)
+    right_action = _present("action", _RIGHT_GRIPPER)
 
     if dual_state or dual_action:
         if dual_state != dual_action:
@@ -109,7 +118,27 @@ def resolve_gripper_suffixes(features: dict[str, Any]) -> tuple[str, ...]:
             "action.gripper and observation.gripper must both exist or both be absent"
         )
     if single_state:
+        if left_state or left_action or right_state or right_action:
+            raise ValueError(
+                "Cannot mix single gripper (*.gripper) with "
+                "*.left_gripper / *.right_gripper"
+            )
         return _SINGLE_GRIPPER
+
+    if left_state != left_action:
+        raise ValueError(
+            "action.left_gripper and observation.left_gripper must both exist "
+            "or both be absent"
+        )
+    if right_state != right_action:
+        raise ValueError(
+            "action.right_gripper and observation.right_gripper must both exist "
+            "or both be absent"
+        )
+    if left_state:
+        return _LEFT_GRIPPER
+    if right_state:
+        return _RIGHT_GRIPPER
     return ()
 
 

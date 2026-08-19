@@ -86,9 +86,10 @@ def _stats_from_state_action(
 def _merge_episode_stats_jsonl(run_dir: Path) -> dict[str, np.ndarray] | None:
     """Weighted merge of ``meta/episodes_stats.jsonl`` into robotfm stats.
 
-    Supports single gripper (``*.gripper``) and dual grippers
-    (``*.left_gripper`` + ``*.right_gripper``). Returns None if the file is
-    missing or incomplete.
+    Supports single gripper (``*.gripper``), left/right-only (``*.left_gripper``
+    or ``*.right_gripper``), and dual grippers (``*.left_gripper`` +
+    ``*.right_gripper``). Returns None if the file is missing, incomplete, or
+    the arm vector length disagrees with ``meta/info.json``.
     """
     path = Path(run_dir) / "meta" / "episodes_stats.jsonl"
     if not path.is_file():
@@ -96,6 +97,8 @@ def _merge_episode_stats_jsonl(run_dir: Path) -> dict[str, np.ndarray] | None:
 
     info_path = Path(run_dir) / "meta" / "info.json"
     gripper_suffixes: tuple[str, ...] = ()
+    arm_state_dim: int | None = None
+    arm_action_dim: int | None = None
     if info_path.is_file():
         with info_path.open() as f:
             features = json.load(f).get("features", {})
@@ -105,6 +108,12 @@ def _merge_episode_stats_jsonl(run_dir: Path) -> dict[str, np.ndarray] | None:
             gripper_suffixes = resolve_gripper_suffixes(features)
         except ValueError:
             return None
+        try:
+            arm_state_dim = int(features["observation.state"]["shape"][0])
+            arm_action_dim = int(features["action"]["shape"][0])
+        except (KeyError, TypeError, IndexError, ValueError):
+            arm_state_dim = None
+            arm_action_dim = None
 
     # Accumulators for mean / min / max / second moment via count-weighted merge
     keys = (
@@ -161,6 +170,12 @@ def _merge_episode_stats_jsonl(run_dir: Path) -> dict[str, np.ndarray] | None:
                         return None
                     grips.append(grip)
                 mean, std, vmin, vmax, count = _as_vec(ep_stats[arm_key], grips)
+                expected_arm = arm_state_dim if prefix == "state" else arm_action_dim
+                if expected_arm is not None:
+                    arm_len = int(np.asarray(ep_stats[arm_key]["mean"]).size)
+                    if arm_len != int(expected_arm):
+                        # Stale episodes_stats (e.g. 14-D dual-arm leftover on 7-D left-only).
+                        return None
                 bucket = acc[prefix]
                 sq = np.square(std) + np.square(mean)  # E[x^2] = var + mean^2
                 if bucket["sum"] is None:
