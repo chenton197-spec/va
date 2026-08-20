@@ -152,7 +152,7 @@ def _load_replay_config(path: Path) -> dict[str, Any]:
         raise ValueError(f"回放配置根节点必须是映射: {path}")
 
     dataset_root = _resolve_path(
-        data.get("dataset_root", "datasets/to_init"), base=VA_ROOT
+        data.get("dataset_root", "/home/a/Code/teleop_project/datasets/to_init"), base=VA_ROOT
     )
     teleop_yaml = _resolve_path(
         data.get("teleop_yaml", TELEOP_ROOT / "teleop.yaml"),

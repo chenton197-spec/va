@@ -1,0 +1,69 @@
+# run_w2/run.py 部署配置（HCX 左臂 8-D；脚本仅支持 --deploy）
+# A2A ResNet18 + 深度数据集左臂 + 训练期 state_dropout：head/left_hand，state/action = L0–L6 + left_gripper
+# a2a_noise_statedrop_openarm_hcx_dual_arm_with_depth_260819220738
+# checkpoint_best_val.pt = step 3108（val 开环 mae_joints≈1.51deg）；final=44400（mae_joints≈2.60deg）
+
+# 策略 checkpoint；相对路径相对于 ct/va/
+checkpoint: outputs/a2a_noise_statedrop_openarm_hcx_dual_arm_with_depth_260819220738/checkpoint_final.pt
+# 训练配置可选；不设或 null 时回退到 checkpoint 内嵌 config
+config: outputs/a2a_noise_statedrop_openarm_hcx_dual_arm_with_depth_260819220738/config.yaml
+# 训练 history_noise_std=0.1 / state_dropout 仅训练期；run.py 推理强制 history_noise_std=0
+
+# teleop 部署 YAML（HCX、Orbbec、Gloria-M）
+# 相机从 teleop.yaml 的 hcx_orbbec 段读取；本模型只用 head/left_hand
+teleop_yaml: /home/a/Code/teleop_project/teleop.yaml
+
+# 观测模式：
+#   fps          后台按 obs_fps 采图（默认，不改原控制步）
+#   after_action 不用 obs_fps：每步动作物理到位后采一组图像+本体，写入滑动队列
+#                每次推理执行 chunk 前 exec_action_steps 步，再重新推理
+obs_mode: fps
+
+# 运行时弹出 OpenCV 窗口显示训练用相机（本模型为 head + left_hand）
+display_cameras: false
+
+# 闭环最大步数（按实际执行的动作步计数）
+max_steps: 50000
+
+# after_action 忽略 obs_fps；exec_action_steps 为每次推理执行的 chunk 步数
+# 不写或 null：after_action 默认 1，fps 默认等于 n_action_steps（本模型为 8）
+# 必须 <= n_action_steps
+obs_fps: 10
+exec_action_steps: 8
+# RTC 覆盖（可选）；字段为 null 或不写则沿用训练 YAML 的 policy.rtc
+# 训练 config 里 rtc.enabled=false 且 execution_horizon=8（等于 n_action_steps）
+# 若打开 RTC，execution_horizon 必须 < 8，否则 leftover 为空无法做 prefix 引导
+rtc:
+  enabled: false
+  guidance_enabled: true
+  inference_delay: 2
+  execution_horizon: 4
+
+# 启动时 HCX 左右臂可选起始位（关节角单位：度，7轴）
+# 左臂取自 data/openarm_hcx_dual_arm_with_depth episode_000007 第一帧
+# observation.state[:7] + observation.left_gripper
+# 可设为 null 跳过起始位动作 / 夹爪渐变。
+start_pose:
+  left_joints_deg: [105.848, -64.945, -131.184, -112.439, -34.477, 15.385, -16.704]
+  right_joints_deg: null
+  left_gripper: 0.923
+  right_gripper: 1.0
+  gripper_ramp_s: 0.9
+
+# 左右臂共用 7 轴限位（度）；闭环与起始位下发前 clip
+joint_limits_deg:
+  min: [-169.0, -100.0, -169.0, -139.0, -169.0, -54.0, -59.0]
+  max: [169.0, 100.0, 169.0, 54.0, 169.0, 54.0, 59.0]
+
+# HCX move_joints 规划参数
+move_joints:
+  speed_ratio: 0.2
+  acceleration_seconds: 0.1
+  deceleration_seconds: 0.1
+  feedback_confirm_timeout_s: 30.0
+  feedback_confirm_poll_interval_s: 0.05
+  angle_tolerance_deg: 0.01
+  # 相对当前反馈，每轴每步最大关节角变化量（度）
+  max_delta_deg: 12.0
+
+# 夹爪频率由 teleop.yaml 的 gloria_m_dual.rate_hz 统一控制

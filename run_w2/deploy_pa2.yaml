@@ -2,7 +2,7 @@
 # PA2 gaussian_2std：a2a_noise_openarm_hcx_dual_arm_pa2_gaussian_2std_260814173958
 
 # 策略 checkpoint；相对路径相对于 ct/va/
-checkpoint: outputs/a2a_noise_openarm_hcx_dual_arm_pa2_gaussian_2std_260814173958/checkpoint_873540.pt
+checkpoint: model/a2a_noise_openarm_hcx_dual_arm_pa2_gaussian_2std_260814173958/checkpoint_1164720.pt
 # 训练配置可选；不设或 null 时回退到 checkpoint 内嵌 config
 # config: outputs/a2a_noise_openarm_hcx_dual_arm_pa2_gaussian_2std_260814173958/config.yaml
 
@@ -22,12 +22,12 @@ exec_action_steps: 16
 # 取自 openarm_hcx_dual_arm episode_000300 第一帧 observation.state
 # 可设为 null 跳过起始位动作 / 夹爪渐变。
 start_pose:
-  left_joints_deg: [71.5380, -85.8680, -76.6380, -104.0880, -21.0110, 31.8240, 12.3960]
-  right_joints_deg: [-28.6370, -47.7140, -3.7640, -75.6040, 18.9890, -18.6370, 27.9560]
+  left_joints_deg: [73.472, -99.825, -68.715, -113.846, -8.094, 49.670, 18.022]
+  right_joints_deg: [-53.615, -26.528, 24.762, -99.165, 8.271, -11.516, 28.923]
   # left_joints_deg: null
   # right_joints_deg: null
   # 归一化开口 [0,1]；启动时从当前开口线性插值到目标
-  left_gripper: 1.0
+  left_gripper: 0.902
   right_gripper: 1.0
   gripper_ramp_s: 1.0
 
@@ -45,6 +45,6 @@ move_joints:
   feedback_confirm_poll_interval_s: 0.05
   angle_tolerance_deg: 0.01
   # 相对当前反馈，每轴每步最大关节角变化量（度）
-  max_delta_deg: 5.0
+  max_delta_deg: 10.0
 
 # 夹爪频率由 teleop.yaml 的 gloria_m_dual.rate_hz 统一控制

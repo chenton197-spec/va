@@ -1,10 +1,10 @@
 # run_w2/run.py 部署配置（HCX 双臂；脚本仅支持 --deploy）
-# sepenc s360/bs80/lr3e4/enc1p67/limits：a2a_noise_openarm_hcx_dual_arm_sepenc_s360_bs80_lr3e4_enc1p67_limits_260815183443
+# sepenc statedrop/camdrop h32 s180：a2a_noise_openarm_hcx_dual_arm_sepenc_statedrop_camdrop_h32_s180_gaussian_2std_260817223351
 
 # 策略 checkpoint；相对路径相对于 ct/va/
-checkpoint: outputs/a2a_noise_openarm_hcx_dual_arm_sepenc_s360_bs80_lr3e4_enc1p67_limits_260815183443/checkpoint_latest.pt
+checkpoint: model/a2a_noise_openarm_hcx_dual_arm_sepenc_statedrop_camdrop_h32_s180_gaussian_2std_260817223351/checkpoint_final.pt
 # 训练配置可选；不设或 null 时回退到 checkpoint 内嵌 config
-# config: outputs/a2a_noise_openarm_hcx_dual_arm_sepenc_s360_bs80_lr3e4_enc1p67_limits_260815183443/config.yaml
+config: model/a2a_noise_openarm_hcx_dual_arm_sepenc_statedrop_camdrop_h32_s180_gaussian_2std_260817223351/config.yaml
 
 # teleop 部署 YAML（HCX、Orbbec、Gloria-M）
 # 相机从 teleop.yaml 的 hcx_orbbec 段读取（head/left_hand/right_hand），不是 orbbec 段
@@ -14,18 +14,28 @@ teleop_yaml: /home/a/Code/teleop_project/teleop.yaml
 max_steps: 5000
 
 # 每次推理后执行几步再 replan（仅切片，不改模型结构）
-# null / 省略：等于 checkpoint 的 policy.n_action_steps
+# null / 省略：等于 checkpoint 的 policy.n_action_steps（该模型为 32）
 # 只能缩短（更频繁 replan），不能大于 n_action_steps
-exec_action_steps: null
+# rtc.enabled=true 时忽略此项，改用 rtc.execution_horizon
+exec_action_steps: 16
+
+# RTC 覆盖（可选）；字段为 null 或不写则沿用训练 YAML 的 policy.rtc
+# enabled 后：执行 execution_horizon 步就 replan，用未执行 leftover 约束新 chunk 前缀
+rtc:
+  enabled: true
+  guidance_enabled: true
+  inference_delay: 2
+  execution_horizon: 15
 
 # 启动时 HCX 左右臂可选起始位（关节角单位：度，7轴）
-# 可设为 null 跳过起始位动作。
+# 取自 openarm_hcx_dual_arm episode_000300 第一帧 observation.state
+# 可设为 null 跳过起始位动作 / 夹爪渐变。
 start_pose:
   left_joints_deg: [73.472, -99.825, -68.715, -113.846, -8.094, 49.670, 18.022]
   right_joints_deg: [-53.615, -26.528, 24.762, -99.165, 8.271, -11.516, 28.923]
   left_gripper: 0.902
   right_gripper: 1.0
-  gripper_ramp_s: 0.9
+  gripper_ramp_s: 1.0
 
 # 左右臂共用 7 轴限位（度）；闭环与起始位下发前 clip
 joint_limits_deg:
@@ -35,12 +45,12 @@ joint_limits_deg:
 # HCX move_joints 规划参数
 move_joints:
   speed_ratio: 0.1
-  acceleration_seconds: 0.5
-  deceleration_seconds: 0.5
+  acceleration_seconds: 0.3
+  deceleration_seconds: 0.3
   feedback_confirm_timeout_s: 30.0
   feedback_confirm_poll_interval_s: 0.05
   angle_tolerance_deg: 0.01
   # 相对当前反馈，每轴每步最大关节角变化量（度）
-  max_delta_deg: 3.0
+  max_delta_deg: 8.0
 
 # 夹爪频率由 teleop.yaml 的 gloria_m_dual.rate_hz 统一控制

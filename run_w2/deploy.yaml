@@ -1,9 +1,10 @@
 # run_w2/run.py 部署配置（HCX 双臂；脚本仅支持 --deploy）
 
 # 策略 checkpoint；相对路径相对于 ct/va/
-checkpoint: outputs/a2a_noise_openarm_hcx_dual_arm_sepenc_gaussian_2std_260815170822/checkpoint_latest.pt
+# sepenc gaussian_2std：a2a_noise_openarm_hcx_dual_arm_sepenc_gaussian_2std_260815170822
+checkpoint: outputs/a2a_noise_openarm_hcx_dual_arm_sepenc_gaussian_2std_260815170822/checkpoint_final.pt
 # 训练配置可选；不设或 null 时回退到 checkpoint 内嵌 config
-# config: outputs/a2a_noise_openarm_hcx_dual_arm_sepenc_gaussian_2std_260815170822/config.yaml
+config: outputs/a2a_noise_openarm_hcx_dual_arm_sepenc_gaussian_2std_260815170822/config.yaml
 
 # teleop 部署 YAML（HCX、Orbbec、Gloria-M）
 # 相机从 teleop.yaml 的 hcx_orbbec 段读取（head/left_hand/right_hand），不是 orbbec 段
@@ -12,32 +13,37 @@ teleop_yaml: /home/a/Code/teleop_project/teleop.yaml
 # 闭环最大步数
 max_steps: 5000
 
+# 观测采样频率（Hz）：后台抓图像+状态的节奏
+# null / 省略：等于训练 config 的 fps
+# 改大/改小会改变 n_obs_steps 帧覆盖的时间跨度，与训练时间窗不一致
+obs_fps: 10
+
 # 每次推理后执行几步再 replan（仅切片，不改模型结构）
 # null / 省略：等于 checkpoint 的 policy.n_action_steps
 # 只能缩短（更频繁 replan），不能大于 n_action_steps
 # rtc.enabled=true 时忽略此项，改用 rtc.execution_horizon
-exec_action_steps: 16
+exec_action_steps: 15
 
 # RTC 覆盖（可选）；字段为 null 或不写则沿用训练 YAML 的 policy.rtc
 # enabled 后：执行 execution_horizon 步就 replan，用未执行 leftover 约束新 chunk 前缀
 rtc:
-  enabled: true
-  guidance_enabled: true
-  inference_delay: 4
+  enabled: false
+  guidance_enabled: false
+  inference_delay: 2
   execution_horizon: 15
 
 # 启动时 HCX 左右臂可选起始位（关节角单位：度，7轴）
-# 取自 openarm_hcx_dual_arm episode_000300 第一帧 observation.state
+# 取自 datasets/to_init episode_000000 末几帧 observation.state（已稳定，帧间差为 0）
 # 可设为 null 跳过起始位动作 / 夹爪渐变。
 start_pose: 
-  left_joints_deg: [71.5380, -85.8680, -76.6380, -104.0880, -21.0110, 31.8240, 12.3960]
-  right_joints_deg: [-28.6370, -47.7140, -3.7640, -75.6040, 18.9890, -18.6370, 27.9560]
+  left_joints_deg: [91.758, -74.176, -98.527, -101.011, -23.560, 11.429, 6.945]
+  right_joints_deg: [-34.791, -37.604, 1.121, -92.044, 4.659, -15.209, 14.242]
   # # left_joints_deg: null
   # # right_joints_deg: null
   # # 归一化开口 [0,1]；启动时从当前开口线性插值到目标
-  # left_gripper: 1.0
-  # right_gripper: 1.0
-  # gripper_ramp_s: 1.0
+  left_gripper: 0.998
+  right_gripper: 1.0
+  gripper_ramp_s: 0.9
 
 # 左右臂共用 7 轴限位（度）；闭环与起始位下发前 clip
 joint_limits_deg:
@@ -51,7 +57,7 @@ move_joints:
   deceleration_seconds: 0.3
   feedback_confirm_timeout_s: 30.0
   feedback_confirm_poll_interval_s: 0.05
-  angle_tolerance_deg: 0.01
+  angle_tolerance_deg: 0.02
   # 相对当前反馈，每轴每步最大关节角变化量（度）
   max_delta_deg: 12.0
 

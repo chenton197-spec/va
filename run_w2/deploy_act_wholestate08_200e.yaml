@@ -1,0 +1,53 @@
+# run_w2/run.py 部署配置（HCX 双臂；脚本仅支持 --deploy）
+# ACT ResNet18 + 整段 state dropout 80% 200e：
+# act_openarm_hcx_dual_arm_merged_resnet18_wholestate08_200e_260818222551
+
+# 策略 checkpoint；相对路径相对于 ct/va/
+checkpoint: model/act_openarm_hcx_dual_arm_resnet18_tuned_260819001900/checkpoint_final.pt
+# 训练配置可选；不设或 null 时回退到 checkpoint 内嵌 config
+config: null
+
+# teleop 部署 YAML（HCX、Orbbec、Gloria-M）
+teleop_yaml: /home/a/Code/teleop_project/teleop.yaml
+
+# 闭环最大步数
+max_steps: 5000
+
+# 观测采样频率（Hz）：后台抓图像+状态的节奏
+# null / 省略：等于训练 config 的 fps
+obs_fps: 8
+
+# 每次推理后执行几步再 replan
+exec_action_steps: 8
+
+# RTC 覆盖
+rtc:
+  enabled: true
+  guidance_enabled: true
+  inference_delay: 2
+  execution_horizon: 8
+
+# 启动时 HCX 左右臂起始位（关节角单位：度，7轴）
+start_pose: 
+  left_joints_deg: [73.472, -99.825, -68.715, -113.846, -8.094, 49.670, 18.022]
+  right_joints_deg: [-53.615, -26.528, 24.762, -99.165, 8.271, -11.516, 28.923]
+  # left_joints_deg: null
+  # right_joints_deg: null
+  left_gripper: 0.902
+  right_gripper: 1.0
+  gripper_ramp_s: 0.9
+
+# 左右臂共用 7 轴限位（度）
+joint_limits_deg:
+  min: [-169.0, -100.0, -169.0, -139.0, -169.0, -54.0, -59.0]
+  max: [169.0, 100.0, 169.0, 54.0, 169.0, 54.0, 59.0]
+
+# HCX move_joints 规划参数
+move_joints:
+  speed_ratio: 0.1
+  acceleration_seconds: 0.3
+  deceleration_seconds: 0.3
+  feedback_confirm_timeout_s: 30.0
+  feedback_confirm_poll_interval_s: 0.05
+  angle_tolerance_deg: 0.8
+  max_delta_deg: 12.0

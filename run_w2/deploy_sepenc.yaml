@@ -21,8 +21,11 @@ exec_action_steps: null
 # 启动时 HCX 左右臂可选起始位（关节角单位：度，7轴）
 # 可设为 null 跳过起始位动作。
 start_pose:
-  left_joints_deg: null
-  right_joints_deg: null
+  left_joints_deg: [73.472, -99.825, -68.715, -113.846, -8.094, 49.670, 18.022]
+  right_joints_deg: [-53.615, -26.528, 24.762, -99.165, 8.271, -11.516, 28.923]
+  left_gripper: 0.902
+  right_gripper: 1.0
+  gripper_ramp_s: 0.9
 
 # 左右臂共用 7 轴限位（度）；闭环与起始位下发前 clip
 joint_limits_deg:
