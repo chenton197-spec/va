@@ -2,12 +2,11 @@
 
 每个样本对应 (episode_id, 时间步 t)：
 - 输入：过去 n_obs_steps 帧的多相机图像 + 状态
-- 标签：从 t 开始的 horizon 步动作序列（不足则 padding + mask）
+- 标签：从 t 开始的 horizon 步动作序列
 
-重要：索引的是「每一帧」，不是整段 episode。
-默认丢弃每个 episode 末尾 ``n_action_steps`` 帧，保证每条样本至少有
-``n_action_steps`` 步真实未来动作（与闭环实际执行长度对齐），避免
-短 chunk + pad 经 UNet 时序卷积泄漏，干扰精细对齐。
+未来动作不够 ``horizon`` 时，按原版 A2A / Diffusion Policy sampler
+**重复最后一帧动作**补齐（不是 0-pad）。``action_mask`` 仍标出真实步 vs
+补齐步，供 ACT 等策略可选屏蔽；A2A 重建损失按原版对整段 chunk 计算。
 """
 
 from __future__ import annotations
@@ -490,8 +489,8 @@ class EpisodeDataset(Dataset):
 
     索引方式：内部维护 (ep_idx, t) 列表，__getitem__(idx) 取第 idx 个 (ep, t)。
 
-    默认 ``drop_n_last_frames = 0``：不丢末尾帧；未来动作不够 ``horizon`` 时 0-pad，
-    并用 ``action_mask`` 标出有效步。
+    默认 ``drop_n_last_frames = 0``：不丢末尾帧；未来动作不够 ``horizon`` 时
+    重复最后一帧动作补齐，并用 ``action_mask`` 标出真实步 vs 补齐步。
     """
 
     def __init__(
@@ -571,7 +570,7 @@ class EpisodeDataset(Dataset):
 
         # self.index: 扁平化后的「所有 episode × 保留帧」
         # 每个元素是 (第几个 episode, 该 episode 内的时间步 t)
-        # 默认不丢末尾帧；未来不够 horizon 时在 __getitem__ 里 0-pad
+        # 默认不丢末尾帧；未来不够 horizon 时在 __getitem__ 里重复最后动作
         self.index: list[tuple[int, int]] = []
         self._episode_lengths: list[int] = []
         for ep_idx, ep_file in enumerate(self.episode_files):
@@ -624,8 +623,8 @@ class EpisodeDataset(Dataset):
         返回张量:
             obs_images:      (Cams, T_obs, 3, H', W')  float32 [0,1]（可选裁剪）
             obs_state:       (T_obs, state_dim)
-            action:          (horizon, action_dim)  已归一化；末尾不足则 0-pad
-            action_mask:     (horizon, 1)  有效步为 1，padding 为 0（loss 只算有效步）
+            action:          (horizon, action_dim)  已归一化；末尾不足则重复最后一帧
+            action_mask:     (horizon, 1)  真实步为 1，末尾重复补齐为 0
         """
         # ---- 1) 定位到某个 episode 的某一帧 t ----
         ep_idx, t = self.index[idx]
@@ -693,10 +692,10 @@ class EpisodeDataset(Dataset):
             flow_hist = state
 
         # ---- 5) 动作标签：从当前 t 起往后取 horizon 步 ----
-        # 末尾不够则 0-pad，action_mask 标出有效步（不丢帧）。
+        # 末尾不够则重复最后一帧（原版 A2A sampler），action_mask 标出真实步。
         #
         # 例 length=100, horizon=8, t=95:
-        #   action[95:100] → valid_len=5，后 3 步 0-pad，mask=[1,1,1,1,1,0,0,0]
+        #   action[95:100] → valid_len=5，后 3 步 = a99，mask=[1,1,1,1,1,0,0,0]
         action_end = min(t + self.horizon, length)
         valid_len = action_end - t  # 本样本里「真实动作」有几步
         actions = arrays["action"][t:action_end].astype(np.float32)
@@ -704,11 +703,13 @@ class EpisodeDataset(Dataset):
             q_now = arrays["state"][t].astype(np.float32)
             actions = subtract_joint_pose(actions, q_now, self._joint_mask)
 
-        # mask: 前 valid_len 步=1（参与 loss），后面 pad 步=0（不参与 loss）
+        # mask: 前 valid_len 步=1（真实），后面 pad 步=0（重复最后动作补齐）
         mask = np.zeros((self.horizon, 1), dtype=np.float32)
         mask[:valid_len] = 1.0
         if valid_len < self.horizon:
-            pad = np.zeros((self.horizon - valid_len, self.meta.action_dim), dtype=np.float32)
+            # 原版 sampler：末尾用最后一帧重复填充，而非 0
+            last = actions[-1:]
+            pad = np.repeat(last, self.horizon - valid_len, axis=0)
             actions = np.concatenate([actions, pad], axis=0)
         actions = self._normalize_action(actions)
 

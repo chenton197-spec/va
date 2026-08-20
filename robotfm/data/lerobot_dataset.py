@@ -606,10 +606,12 @@ class LeRobotImageSequenceDataset(Dataset):
             q_now = state_all[t].astype(np.float32)
             actions = subtract_joint_pose(actions, q_now, self._joint_mask)
 
+        # 原版 A2A sampler：末尾不够时重复最后一帧，而非 0-pad
         mask = np.zeros((self.horizon, 1), dtype=np.float32)
         mask[:valid_len] = 1.0
         if valid_len < self.horizon:
-            pad = np.zeros((self.horizon - valid_len, self.meta.action_dim), dtype=np.float32)
+            last = actions[-1:]
+            pad = np.repeat(last, self.horizon - valid_len, axis=0)
             actions = np.concatenate([actions, pad], axis=0)
         actions = self._normalize_action(actions)
 

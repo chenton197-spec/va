@@ -177,16 +177,14 @@ class A2APolicy(nn.Module):
         batch:
             obs_images: (B, Cams, T_obs, 3, H, W)
             obs_state: (B, T_obs, state_dim)  — also used as flow source
-            action: (B, horizon, action_dim)
-            action_mask: (B, horizon, 1)
+            action: (B, horizon, action_dim)  — end pads repeat last action
         """
         actions = batch["action"]
-        mask = batch["action_mask"]
         batch_size = actions.shape[0]
         n_act = self.cfg.n_action_steps
 
+        # 与原版一致：整段未来 chunk 都参与 AE / recon，不使用 action_mask
         future_actions = actions[:, :n_act]
-        future_mask = mask[:, :n_act]
 
         obs_latents = self._encode_obs(batch)
         history_latents = self._encode_history(batch)
@@ -232,15 +230,12 @@ class A2APolicy(nn.Module):
 
             if self.cfg.flow_recon_weight > 0:
                 actions_recon = self.action_decoder(action_latents_pred)
-                recon = F.l1_loss(actions_recon, future_actions, reduction="none") * future_mask
-                # mask 是 (B, T, 1)，必须按元素数平均，否则 recon 会被 action_dim 放大
-                flow_recon_loss = recon.sum() / future_mask.expand_as(recon).sum().clamp_min(1.0)
+                flow_recon_loss = F.l1_loss(actions_recon, future_actions)
                 loss = loss + self.cfg.flow_recon_weight * flow_recon_loss
 
         if self.cfg.enc_recon_weight > 0:
             actions_recon = self.action_decoder(future_action_latents)
-            recon = F.l1_loss(actions_recon, future_actions, reduction="none") * future_mask
-            enc_recon_loss = recon.sum() / future_mask.expand_as(recon).sum().clamp_min(1.0)
+            enc_recon_loss = F.l1_loss(actions_recon, future_actions)
             loss = loss + self.cfg.enc_recon_weight * enc_recon_loss
 
         terms = {
