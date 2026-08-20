@@ -1,0 +1,4 @@
+# OpenArm Mini leader adapter and dependencies shared with Alicia-D.
+-r requirements.txt
+
+feetech-servo-sdk>=1.0.0,<2.0.0

@@ -1,0 +1,118 @@
+{
+  "left": {
+    "joint_1": {
+      "id": 1,
+      "drive_mode": 0,
+      "homing_offset": -1874,
+      "range_min": 0,
+      "range_max": 4095
+    },
+    "joint_2": {
+      "id": 2,
+      "drive_mode": 0,
+      "homing_offset": -1326,
+      "range_min": 0,
+      "range_max": 4095
+    },
+    "joint_3": {
+      "id": 3,
+      "drive_mode": 0,
+      "homing_offset": -1856,
+      "range_min": 0,
+      "range_max": 4095
+    },
+    "joint_4": {
+      "id": 4,
+      "drive_mode": 0,
+      "homing_offset": -1563,
+      "range_min": 0,
+      "range_max": 4095
+    },
+    "joint_5": {
+      "id": 5,
+      "drive_mode": 0,
+      "homing_offset": 410,
+      "range_min": 0,
+      "range_max": 4095
+    },
+    "joint_6": {
+      "id": 6,
+      "drive_mode": 0,
+      "homing_offset": 1848,
+      "range_min": 0,
+      "range_max": 4095
+    },
+    "joint_7": {
+      "id": 7,
+      "drive_mode": 0,
+      "homing_offset": 1814,
+      "range_min": 0,
+      "range_max": 4095
+    },
+    "gripper": {
+      "id": 8,
+      "drive_mode": 0,
+      "homing_offset": 1520,
+      "range_min": 2047,
+      "range_max": 2327
+    }
+  },
+  "right": {
+    "joint_1": {
+      "id": 1,
+      "drive_mode": 0,
+      "homing_offset": -1588,
+      "range_min": 0,
+      "range_max": 4095
+    },
+    "joint_2": {
+      "id": 2,
+      "drive_mode": 0,
+      "homing_offset": 1546,
+      "range_min": 0,
+      "range_max": 4095
+    },
+    "joint_3": {
+      "id": 3,
+      "drive_mode": 0,
+      "homing_offset": 1428,
+      "range_min": 0,
+      "range_max": 4095
+    },
+    "joint_4": {
+      "id": 4,
+      "drive_mode": 0,
+      "homing_offset": -1369,
+      "range_min": 0,
+      "range_max": 4095
+    },
+    "joint_5": {
+      "id": 5,
+      "drive_mode": 0,
+      "homing_offset": -1635,
+      "range_min": 0,
+      "range_max": 4095
+    },
+    "joint_6": {
+      "id": 6,
+      "drive_mode": 0,
+      "homing_offset": -1711,
+      "range_min": 0,
+      "range_max": 4095
+    },
+    "joint_7": {
+      "id": 7,
+      "drive_mode": 0,
+      "homing_offset": 1756,
+      "range_min": 0,
+      "range_max": 4095
+    },
+    "gripper": {
+      "id": 8,
+      "drive_mode": 1,
+      "homing_offset": -1715,
+      "range_min": 1530,
+      "range_max": 2047
+    }
+  }
+}

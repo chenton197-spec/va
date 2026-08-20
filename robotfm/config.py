@@ -187,7 +187,8 @@ class TrainConfig:
     amp: bool = False
     # torch.compile 整策略（mode=default）；CPU 上自动忽略。首步会编译变慢。
     compile: bool = False
-    # 每隔多少步在验证集上做开环物理 MAE；0 = 若设了 val_run_name 则跟 save_freq，否则关闭
+    # 每隔多少步在验证集上做训练 loss + 开环物理 MAE/MSE；
+    # 0 = 若设了 val_run_name 则跟 save_freq，否则关闭
     val_freq: int = 0
 
 

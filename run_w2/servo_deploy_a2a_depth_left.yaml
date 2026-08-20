@@ -1,0 +1,69 @@
+# run_w2/servo_deploy.py 伺服部署配置（HCX 左臂 8-D）
+# 与 deploy_a2a_depth_left.yaml（move_joints 规划模式）不同：
+# 本配置由 servo_deploy.py 使用，15Hz 推理 → 500Hz 线性插值 → Arm.pluse_to_servo()
+# （厂商 PluseToServo 直伺服，不经 move_joints 规划）
+# A2A ResNet18 + 深度数据集左臂：head/left_hand，state/action = L0–L6 + left_gripper
+# a2a_noise_openarm_hcx_dual_arm_with_depth_left_260819212600
+
+# 策略 checkpoint；相对路径相对于 ct/va/
+checkpoint: outputs/a2a_noise_openarm_hcx_dual_arm_with_depth_left_260819212600/checkpoint_best_val.pt
+# 训练配置可选；不设或 null 时回退到 checkpoint 内嵌 config
+config: outputs/a2a_noise_openarm_hcx_dual_arm_with_depth_left_260819212600/config.yaml
+
+# teleop 部署 YAML（HCX、Orbbec、Gloria-M）
+# 注意：run.py 里旧路径 /home/a/Code/teleop_project 已失效，SDK 实际在
+# /home/casbot/ct/teleop_project；servo_deploy.py 找不到时会回退到该路径
+teleop_yaml: /home/casbot/ct/teleop_project/teleop.yaml
+
+# 观测模式：fps = 后台按训练 fps（cfg.fps=15）采图
+# （servo_deploy.py 固定使用训练 config 的 fps 做推理节拍，忽略 deploy 的 obs_fps）
+obs_mode: fps
+
+# 运行时弹出 OpenCV 窗口显示训练用相机（本模型为 head + left_hand）
+display_cameras: true
+
+# 闭环最大推理步数
+max_steps: 50000
+
+# RTC 与伺服模式每步重规划冲突，servo_deploy.py 会强制关闭 policy.rtc，
+# 无需在此配置；此处仅作记录
+rtc:
+  enabled: false
+
+# 伺服段（servo_deploy.py 独有，_load_deploy_config 会丢弃未知键，
+# 由脚本直接从本 yaml 读取）：
+servo:
+  # 机械臂伺服下发频率（Hz）：15Hz 推理目标点之间线性插值
+  rate_hz: 500
+  # 推理看门狗（s）：主线程超过该时长未提交新 chunk 时，
+  # 伺服线程保持最后目标持续发送并告警（PluseToServo 必须持续刷新）
+  watchdog_s: 0.5
+
+# 启动时 HCX 左臂可选起始位（关节角单位：度，7轴）
+# 左臂取自 data/openarm_hcx_dual_arm_with_depth episode_000007 第一帧
+# 起始位用 move_joints 规划模式到位（安全），到位后再进入伺服闭环
+start_pose:
+  left_joints_deg: [105.848, -64.945, -131.184, -112.439, -34.477, 15.385, -16.704]
+  right_joints_deg: null
+  left_gripper: 0.923
+  right_gripper: 1.0
+  gripper_ramp_s: 0.9
+
+# 左右臂共用 7 轴限位（度）；伺服线程每周期 clamp 目标
+joint_limits_deg:
+  min: [-169.0, -100.0, -169.0, -139.0, -169.0, -54.0, -59.0]
+  max: [169.0, 100.0, 169.0, 54.0, 169.0, 54.0, 59.0]
+
+# HCX move_joints 规划参数：仅用于起始位到位，不进伺服循环
+move_joints:
+  speed_ratio: 1.0
+  acceleration_seconds: 0.1
+  deceleration_seconds: 0.1
+  feedback_confirm_timeout_s: 30.0
+  feedback_confirm_poll_interval_s: 0.05
+  angle_tolerance_deg: 0.2
+  feedback_confirm: true
+  interrupt: false
+  max_delta_deg: 12.0
+
+# 夹爪频率由 teleop.yaml 的 gloria_m_dual.rate_hz 统一控制

@@ -1,0 +1,196 @@
+# 部署覆盖配置。未填写的字段使用 teleop_sdk/config.py 中的代码默认值。
+# joint_count 由示教臂和从臂适配器固定声明，不能在本文件中覆盖。
+
+teleop:
+  # 主臂采样、映射和通用平滑计算频率；HCX 直伺服可独立更高频下发。
+  rate_hz: 100
+  # 两级滤波组：One Euro 与固定低通同时启用或关闭。
+  filter_enabled: true
+  # 弹簧组：临界阻尼和前瞻预测同时启用或关闭。
+  spring_enabled: false
+  # 直伺服的保守平滑参数：先在插值前限制速度和加速度，避免高频目标激发振动。
+  # 临界阻尼弹簧的固有频率，单位 rad/s；越大越跟手但更易激发振动，越小越柔和但滞后更明显。
+  spring_omega: 2.0
+  # 单个关节目标允许的最大加速度，单位 deg/s^2；每周期速度最多改变 max_accel_deg_s2 / rate_hz。
+  max_accel_deg_s2: 50.0
+  # 单个关节目标允许的最大速度，单位 deg/s；限制持续跟随速度，不改变 HCX 底层 EtherCAT 周期。
+  max_vel_deg_s: 25.0
+  # 基于当前限幅速度向前外推的时间，单位 ms；0.0 表示关闭前瞻，避免预测目标造成超调。
+  predict_lookahead_ms: 0.0
+  # 仅诊断目标提交时间，不读取 HCX 实际反馈；实时遥操必须关闭，避免终端输出扰动周期。
+  latency_probe_enabled: false
+
+alicia:
+  port: "/dev/ttyACM1"
+  gripper_type: "50mm"
+
+# OpenArm Mini 双主臂。calibration_path 是独立标定示例创建或更新的
+# 顶层包含 left / right 的组合标定 JSON；运行标定前必须设置，不能留空。
+openarm_mini:
+  port_left: "/dev/serial/by-id/usb-1a86_USB_Single_Serial_5B8E115195-if00" # 左主臂 Feetech USB 串口。
+  port_right: "/dev/serial/by-id/usb-1a86_USB_Single_Serial_5B61033229-if00" # 右主臂 Feetech USB 串口。
+  calibration_path: "./my_openarm_mini.json" # 标定输出 JSON；可使用当前目录下的文件。
+  baudrate: 1000000 # STS3215 默认串口波特率。
+
+fr3:
+  robot_ip: "192.168.57.2"
+  # Alicia-D -> FR3 的安装方向；只由 Alicia-FR3 参考入口使用。
+  axis_sign: [1.0, 1.0, 1.0, 1.0, -1.0, -1.0]
+
+# HCX 双七轴部署。只读状态示例不会使用下列自动操作开关；遥操从臂适配器
+# 只有在现场确认安全后才会使用明确设为 true 的状态修改操作。
+hcx:
+  local_ip: "172.16.0.111" # 本机与 HCX 控制器通信的网卡地址。
+  remote_ip: "172.16.0.89" # HCX 控制器地址。
+  port: 12345
+  connect_timeout_s: 10.0
+  left_robot_id: 1
+  right_robot_id: 2
+  # OpenArm Mini -> HCX 双臂遥操的关节方向：1.0 同向，-1.0 反向。
+  left_axis_sign: [-1.0, -1.0, -1.0, 1.0, -1.0, -1.0, -1.0]
+  right_axis_sign: [-1.0, -1.0, -1.0, -1.0, -1.0, -1.0, -1.0]
+  # 直接关节伺服绕过 HCX 规划器。每侧 Python 输出线程按此频率调用一次
+  # 薄原生 PluseToServo 绑定；可按现场性能设置为 500、800 或 1000 Hz。
+  direct_servo_rate_hz: 500
+  direct_servo_watchdog_s: 2.0
+  # direct: Python 输出线程重复发送最新主臂目标，不生成插值队列。
+  # linear: Python 将每个主臂目标段重采样为 direct_servo_rate_hz 的线性队列。
+  # limited: HCX 适配器在每个 teleop.rate_hz 主臂目标周期预生成一批
+  # 低通、限速、限加速度点；direct_servo_rate_hz 线程只发送批次点或重发旧点。
+  direct_servo_interpolation: "limited"
+  # limited 模式的第二层整形参数，单位分别为 deg/s、deg/s^2；alpha 越小低通越强。
+  direct_servo_limited_max_vel_deg_s: 150.0
+  direct_servo_limited_max_accel_deg_s2: 150.0
+  direct_servo_limited_lowpass_alpha: 0.2
+  # 仅在隔离单元、硬件保护和独立急停均已现场确认后改为 true。
+  direct_servo_confirm_unsafe: true
+  # 仅在未接示教器且已物理拔除时设为 true；会请求控制器脱离示教器。
+  auto_detach_hmi: true
+  # 仅在已排除报警原因、允许复位后设为 true；会有限次数请求清除报警。
+  auto_clear_alarms: true
+  # 设为 true 后才会自动开启全局和左右单臂使能。
+  auto_enable: true
+  controller_initialization_wait_s: 2.0
+  ethercat_master_indices: [0, 1] # 非 EtherCAT 保持为空；否则填入 0 和/或 1。
+  ethercat_op_timeout_s: 15.0
+  alarm_clear_retry_count: 5
+  alarm_clear_retry_interval_s: 1.0
+  global_enable_retry_count: 5
+  global_enable_retry_interval_s: 1.0
+  single_arm_enable_timeout_s: 5.0
+  enable_status_poll_interval_s: 0.1
+
+gloria_m:
+  enabled: true
+  port: "/dev/ttyACM2"
+  baudrate: 921600
+  command_id: 1
+  feedback_id: 257 # 接收电机位置、速度和扭矩反馈的 CAN ID。
+  contact_detection_enabled: true # 是否启用硬物接触检测和低扭矩保压。
+  contact_torque_nm: 0.50 # Nm；闭合阶段的最大扭矩，也是开始判定接触的门限。
+  contact_stall_duration_s: 0.12 # 秒；闭合高扭矩且位置停滞至少这么久才判定接触。
+  contact_position_tolerance_rad: 0.01 # 弧度；上述时间窗内允许的位置总变化量。
+  hold_torque_nm: 0.20 # Nm；检测到接触后持续下发的较小闭合保压扭矩。
+  contact_release_hysteresis_rad: 0.05 # 弧度；扳机请求张开超过此量后才退出保压。
+
+# OpenArm Mini 双侧夹爪 -> Gloria-M 双侧夹爪示例。
+# 两个 Gloria-M 必须使用不同的串口；可单独启用左侧或右侧，至少启用一侧后才能运行示例。
+gloria_m_dual:
+  # 每侧独立的 OpenArm 读取与 Gloria-M 目标下发频率。
+  rate_hz: 30.0
+  # 单次读取本侧 OpenArm 夹爪允许等待的最长时间，单位为秒。
+  leader_read_timeout_s: 0.05
+  # 每侧状态打印间隔，单位为秒；不会逐帧打印干扰串口控制。
+  status_print_interval_s: 1.0
+  # 以下目标跟随、接触检测和保压参数由左右 Gloria-M 共同使用。
+  stiffness_nm_per_rad: 1.0 # 位置误差转力矩的刚度，单位 Nm/rad。
+  damping_nm_s_per_rad: 0.1 # 速度阻尼，单位 Nm*s/rad。
+  contact_detection_enabled: true # 是否启用硬物接触检测和低扭矩保压。
+  contact_torque_nm: 0.45 # Nm；闭合阶段最大扭矩，也是接触判定门限。
+  contact_stall_duration_s: 0.12 # 秒；闭合高扭矩且位置停滞至少这么久才判定接触。
+  contact_position_tolerance_rad: 0.01 # 弧度；上述时间窗内允许的位置总变化量。
+  hold_torque_nm: 0.20 # Nm；检测到接触后持续下发的较小闭合保压扭矩。
+  contact_release_hysteresis_rad: 0.05 # 弧度；张开请求超过此量后才退出保压。
+  left:
+    enabled: true
+    # 请按实际枚举结果修改。左侧 OpenArm 已使用 /dev/ttyACM1。
+    port: "/dev/serial/by-path/pci-0000:00:14.0-usb-0:6.1:1.0"
+    baudrate: 921600
+    command_id: 1
+    feedback_id: 257
+  right:
+    enabled: true
+    # 请按实际枚举结果修改。右侧 OpenArm 已使用 /dev/ttyACM0。
+    port: "/dev/serial/by-path/pci-0000:00:14.0-usb-0:3.1:1.0"
+    baudrate: 921600
+    command_id: 1
+    feedback_id: 257
+
+# 本次性能排查只启动 RGB 流，不采集或保存深度图。
+orbbec:
+  cameras:
+    - name: "hand"
+      serial_number: "CV2R1610007N"
+      mode: "rgb"
+      rgb_resolution: [1280, 720]
+      depth_resolution: [848, 480] # 保留供切回 RGB-D 模式时使用；RGB 模式不会启动深度流。
+      fps: 30
+    - name: "head"
+      serial_number: "CP9E1630005C"
+      mode: "rgb"
+      rgb_resolution: [1280, 720]
+      depth_resolution: [848, 480] # 保留供切回 RGB-D 模式时使用；RGB 模式不会启动深度流。
+      fps: 30
+
+# Alicia-D -> FR3 正式采集程序的输出配置。
+recording:
+  # 持久数据集目录。程序重启后会继续在此追加兼容的 episode。
+  root: "datasets/alicia_fr3"
+  enabled_cameras: ["hand", "head"]
+  fps: 30 # 最终数据集行频率；启用相机时应与主相机帧率一致。
+  numeric_sample_fps: 60 # FR3 状态、动作和夹爪反馈的父进程采样频率。
+  master_camera: "hand" # 多相机时每张新帧驱动一条数据集记录的相机名称。
+  min_free_disk_gb: 20 # 启动正式采集前要求的最小可用磁盘空间。
+  task: "alicia_fr3_teleoperation"
+  # 可选 png（逐帧无损）、jpg（逐帧压缩）或 video（AV1 MP4）。
+  # PNG/JPG 输出不是 LeRobot v2.1 的 MP4 视频格式。
+  image_storage: "jpg"
+  # 仅 image_storage: jpg 时生效，范围 1-100；75 为 Pillow 默认质量。
+  quality: 75
+
+# OpenArm Mini -> HCX 双臂正式采集的三路 RGB 相机。
+# 请将三个 serial_number 改为现场实际序列号；名称不能改，因为采集程序以
+# head 为主相机事件源，并将 left_hand/right_hand 因果配对到同一条记录。
+hcx_orbbec:
+  cameras:
+    - name: "head"
+      serial_number: "CP9E1630005C"
+      mode: "rgb"
+      rgb_resolution: [1280, 720]
+      depth_resolution: [848, 480]
+      fps: 15
+    - name: "left_hand"
+      serial_number: "CV2R1610007N"
+      mode: "rgb"
+      rgb_resolution: [1280, 720]
+      depth_resolution: [848, 480]
+      fps: 15
+    - name: "right_hand"
+      serial_number: "CV2R46P0002W"
+      mode: "rgb"
+      rgb_resolution: [1280, 720]
+      depth_resolution: [848, 480]
+      fps: 15
+
+# OpenArm Mini -> HCX 双臂采集输出。每张头部相机新帧才会触发一条数据集
+# 记录及一次真实双臂/双夹爪反馈读取；这里不使用 numeric_sample_fps。
+hcx_recording:
+  root: "datasets/openarm_hcx_dual_arm"
+  enabled_cameras: ["head", "left_hand", "right_hand"]
+  fps: 15
+  master_camera: "head"
+  min_free_disk_gb: 60
+  task: "openarm_hcx_dual_arm_teleoperation"
+  # 可选 png（逐帧无损）、jpg（逐帧压缩）或 video（AV1 MP4）。
+  image_storage: "jpg"
+  quality: 75

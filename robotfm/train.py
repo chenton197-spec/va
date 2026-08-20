@@ -15,9 +15,10 @@ Checkpoint 含 ``step`` / ``policy_state_dict`` / ``optimizer_state_dict`` /
 ``train.keep_last_ckpts`` 清理（0 = 不清理；``checkpoint_final.pt`` 始终保留）。
 ``train.compile`` 在 CUDA 上对整策略 ``torch.compile``（mode=default）；
 checkpoint 存未包装权重，可与非 compile 推理/续训互通。
-``dataset.val_run_name`` + ``train.val_freq`` 时，训练中在验证集上算开环
-物理 MAE（无 jitter / dropout / history noise，用训练集 stats）。最优
-``mae_joints`` 另存 ``checkpoint_best_val.pt``，曲线写 ``val.jsonl``。
+``dataset.val_run_name`` + ``train.val_freq`` 时，训练中在验证集上算
+训练 loss（``compute_loss``）以及开环物理 MAE/MSE（无 jitter / dropout /
+history noise，用训练集 stats）。最优 ``mae_joints`` 另存
+``checkpoint_best_val.pt``，曲线写 ``val.jsonl``。
 """
 
 from __future__ import annotations
@@ -505,6 +506,17 @@ def _build_val_loader(
     return DataLoader(dataset, **loader_kwargs)
 
 
+def _split_joint_gripper_means(
+    dim_err: torch.Tensor, joint_mask: torch.Tensor | list | tuple,
+) -> tuple[float, float, float]:
+    """``dim_err`` 为 (action_dim,) 的 per-dim 均值。返回 joints / gripper / all。"""
+    joint_t = torch.as_tensor(joint_mask, device=dim_err.device, dtype=torch.bool)
+    grip_t = ~joint_t
+    joints = float(dim_err[joint_t].mean().item()) if bool(joint_t.any()) else float("nan")
+    gripper = float(dim_err[grip_t].mean().item()) if bool(grip_t.any()) else float("nan")
+    return joints, gripper, float(dim_err.mean().item())
+
+
 @torch.no_grad()
 def _evaluate_val_mae(
     policy: PolicyModule,
@@ -516,7 +528,10 @@ def _evaluate_val_mae(
     use_amp: bool,
     gpu_augment: bool,
 ) -> dict[str, float]:
-    """开环物理 MAE（history_noise=0）。走未 compile 模块，避免再编译 sample_actions。"""
+    """验证集：训练 loss + 开环物理 MAE/MSE（history_noise=0）。
+
+    走未 compile 模块，避免再编译 ``sample_actions`` / ``compute_loss``。
+    """
     n_act = int(cfg.policy.n_action_steps)
     predict_delta = bool(cfg.policy.predict_joint_delta)
     joint_mask = joint_mask_from_names(list(cfg.action_names), int(cfg.action_dim))
@@ -526,10 +541,15 @@ def _evaluate_val_mae(
         raw.cfg.history_noise_std = 0.0
     was_training = policy.training
     policy.eval()
+    raw.eval()
     t0 = time.perf_counter()
     sum_abs = None
+    sum_sq = None
     n_valid = 0.0
     n_samples = 0
+    sum_loss = 0.0
+    sum_terms = {key: 0.0 for key in _LOSS_TERM_KEYS}
+    seen_terms: set[str] = set()
     try:
         for batch in loader:
             batch = {k: v.to(device, non_blocking=True) for k, v in batch.items()}
@@ -545,7 +565,18 @@ def _evaluate_val_mae(
                     hue=0.0,
                 )
             with torch.amp.autocast("cuda", enabled=use_amp):
+                loss, terms = _unpack_policy_loss(raw.compute_loss(batch))
                 pred_norm = raw.sample_actions(batch)[:, :n_act].float()
+            bsz = int(pred_norm.shape[0])
+            sum_loss += float(loss.detach().float().item()) * bsz
+            for key in _LOSS_TERM_KEYS:
+                if key not in terms:
+                    continue
+                seen_terms.add(key)
+                val = terms[key]
+                sum_terms[key] += float(
+                    val.detach().float().item() if torch.is_tensor(val) else val
+                ) * bsz
             gt_norm = batch["action"][:, :n_act].float()
             mask = batch["action_mask"][:, :n_act].float()
             q_now = denormalize(
@@ -570,31 +601,39 @@ def _evaluate_val_mae(
                 predict_joint_delta=predict_delta,
                 joint_mask=joint_mask,
             )
-            err = (pred_phys - gt_phys).abs() * mask
-            dim_sum = err.sum(dim=(0, 1))
-            sum_abs = dim_sum if sum_abs is None else sum_abs + dim_sum
+            delta = (pred_phys - gt_phys) * mask
+            abs_sum = delta.abs().sum(dim=(0, 1))
+            sq_sum = delta.pow(2).sum(dim=(0, 1))
+            sum_abs = abs_sum if sum_abs is None else sum_abs + abs_sum
+            sum_sq = sq_sum if sum_sq is None else sum_sq + sq_sum
             n_valid += float(mask.sum().item())
-            n_samples += int(pred_norm.shape[0])
+            n_samples += bsz
     finally:
         if old_noise is not None:
             raw.cfg.history_noise_std = old_noise
         if was_training:
             policy.train()
-    if sum_abs is None or n_valid <= 0:
+            raw.train()
+    if sum_abs is None or sum_sq is None or n_valid <= 0 or n_samples <= 0:
         raise RuntimeError("val loader produced no samples")
-    mae_dim = sum_abs / n_valid
-    joint_t = torch.as_tensor(joint_mask, device=mae_dim.device, dtype=torch.bool)
-    grip_t = ~joint_t
-    mae_joints = float(mae_dim[joint_t].mean().item()) if bool(joint_t.any()) else float("nan")
-    mae_gripper = float(mae_dim[grip_t].mean().item()) if bool(grip_t.any()) else float("nan")
-    return {
-        "mae_joints": mae_joints,
-        "mae_gripper": mae_gripper,
-        "mae_all": float(mae_dim.mean().item()),
+    mae_j, mae_g, mae_all = _split_joint_gripper_means(sum_abs / n_valid, joint_mask)
+    mse_j, mse_g, mse_all = _split_joint_gripper_means(sum_sq / n_valid, joint_mask)
+    metrics: dict[str, float] = {
+        "loss": sum_loss / float(n_samples),
+        "mae_joints": mae_j,
+        "mae_gripper": mae_g,
+        "mae_all": mae_all,
+        "mse_joints": mse_j,
+        "mse_gripper": mse_g,
+        "mse_all": mse_all,
         "n_samples": float(n_samples),
         "n_valid_steps": n_valid,
         "elapsed_s": time.perf_counter() - t0,
     }
+    for key in _LOSS_TERM_KEYS:
+        if key in seen_terms:
+            metrics[key] = sum_terms[key] / float(n_samples)
+    return metrics
 
 
 def _log_val_metrics(
@@ -607,11 +646,18 @@ def _log_val_metrics(
     pbar: tqdm | None = None,
     best: bool = False,
 ) -> None:
+    term_msg = "".join(
+        f" {key}={metrics[key]:.4f}"
+        for key in _LOSS_TERM_KEYS
+        if key in metrics
+    )
     msg = (
         f"val step={step}/{total_steps} "
+        f"loss={metrics['loss']:.4f}{term_msg} "
+        f"mse_joints={metrics['mse_joints']:.4f} "
+        f"mse_gripper={metrics['mse_gripper']:.4f} "
         f"mae_joints={metrics['mae_joints']:.4f} "
         f"mae_gripper={metrics['mae_gripper']:.4f} "
-        f"mae_all={metrics['mae_all']:.4f} "
         f"n={int(metrics['n_samples'])} "
         f"time={metrics['elapsed_s']:.1f}s"
         f"{'  [best]' if best else ''}"
@@ -620,8 +666,9 @@ def _log_val_metrics(
     if pbar is not None:
         pbar.write(msg)
         pbar.set_postfix(
-            val_j=metrics["mae_joints"],
-            val_g=metrics["mae_gripper"],
+            val_loss=metrics["loss"],
+            val_mse_j=metrics["mse_joints"],
+            val_mae_j=metrics["mae_joints"],
         )
     else:
         logger.log(msg)
@@ -841,7 +888,7 @@ def train_flow_matching(
             )
             logger.log(
                 f"val: run_dir={val_dir} num_samples={len(val_loader.dataset)} "
-                f"freq={val_freq} (open-loop physical MAE, history_noise=0)"
+                f"freq={val_freq} (val loss + open-loop physical MAE/MSE, history_noise=0)"
             )
             val_jsonl = output_dir / "val.jsonl"
             if resume_path is not None and val_jsonl.is_file():

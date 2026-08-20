@@ -1,0 +1,4 @@
+# MuJoCo 虚拟从臂的可选依赖。文件名按项目约定保留 mojoco 拼写，包名为 mujoco。
+-r requirements.txt
+
+mujoco>=3.2,<4

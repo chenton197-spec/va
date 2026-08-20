@@ -1,0 +1,17 @@
+# Dependencies shared by both Alicia-D and OpenArm Mini deployments.
+PyYAML
+numpy
+
+# Dataset, image, video, and depth recording support.
+pyarrow
+Pillow
+av
+zarr>=2.16,<3
+numcodecs>=0.12
+
+# Orbbec multi-camera SDK. Install the matching official wheel for the
+# Python version and platform in use.
+pyorbbecsdk2==2.0.18
+
+# Gloria-M follower gripper.
+pyserial>=3.5   
