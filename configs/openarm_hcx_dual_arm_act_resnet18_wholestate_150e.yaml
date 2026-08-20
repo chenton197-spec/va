@@ -1,0 +1,113 @@
+# 基于 openarm_hcx_dual_arm_act_resnet18.yaml
+# 差异：训练时 100% 把当前 obs 状态整段置零（关节+夹爪），逼 ACT 只靠三相机；
+#       150 epoch。关节/夹爪分组 dropout 关闭（whole_state_prob 不受 keep_at_least_one 影响）
+# 硬件（本机实测）：RTX 5060 Ti 16GB（16311 MiB；桌面约占 ~0.4GB）
+#   + i5-13500 (14C/20T) + 31GB RAM
+# 数据：openarm_hcx_dual_arm_train N=99262（411 ep；drop_n_last_frames=0）
+# 验证：openarm_hcx_dual_arm_val（10 ep）；val_freq 每 2 epoch
+# 图像：1280×720 中心裁 720×720 → resize 360×360；三相机共享 ResNet18
+# 加速：uint8 盘缓存 + GPU color_jitter；amp 关闭（已知中途 loss=nan）
+# 本机吞吐 2026-08-18（fp32, 无 uint8_cache, workers=2, JPEG 解码瓶颈 ~60 samp/s）：
+#   bs8 56.7 samp/s 2.5GB；bs16 58.6 / 4.4GB；bs32 59.5 / 8.1GB
+#   bs40 59.0 / 9.9GB；bs48 59.8 / 11.8GB ←
+#   bs56 60.0 / 13.6GB（太顶）；bs64 OOM
+# 有 cache 后吞吐应再涨；bs48 留 ~4GB，和本机 A2A bs80~10GB 同量级余量
+# → floor(N/48)=2067 steps/epoch → 150 epoch = 310050
+# 编号 ckpt 每 2 epoch：save_freq = 2 * 2067 = 4134（keep_last=10 只留最近 20e）
+# latest 每 1 epoch：latest_save_freq = 2067
+# 训前需建缓存：
+#   python scripts/build_uint8_image_cache.py --run-dir data/openarm_hcx_dual_arm_train \
+#     --resize-size 360 --pre-crop-size 720 --num-workers 8
+backend: pusht
+embodiment: pusht_sim
+cameras: [head, left_hand, right_hand]
+state_dim: 16
+action_dim: 16
+state_names:
+  [L0, L1, L2, L3, L4, L5, L6, R0, R1, R2, R3, R4, R5, R6, left_gripper, right_gripper]
+action_names:
+  [L0, L1, L2, L3, L4, L5, L6, R0, R1, R2, R3, R4, R5, R6, left_gripper, right_gripper]
+fps: 15
+data_root: data
+output_dir: outputs/act_openarm_hcx_dual_arm_train_resnet18_wholestate_150e
+
+dataset:
+  # ACT 仅支持单帧观测
+  n_obs_steps: 1
+  horizon: 32
+  run_name: openarm_hcx_dual_arm_train
+  val_run_name: openarm_hcx_dual_arm_val  # 10 ep holdout；训练中开环 MAE
+  pre_crop_size: 720
+  resize_size: 360
+  crop_size: null
+  eval_fixed_crop: true
+  color_jitter_brightness: 0.2
+  color_jitter_contrast: 0.2
+  color_jitter_saturation: 0.1
+  color_jitter_hue: 0.0
+  norm_mode: gaussian_2std
+  image_norm_mode: dataset
+  uint8_cache: true
+  gpu_augment: true
+  state_dropout:
+    enabled: true
+    whole_state_prob: 1.0
+    keep_at_least_one: true
+    joint_early_prob: 0.0
+    joint_mid_prob: 0.0
+    joint_late_prob: 0.0
+    gripper_early_prob: 0.0
+    gripper_mid_prob: 0.0
+    gripper_late_prob: 0.0
+
+policy:
+  type: act
+  vision_backbone: resnet18
+  pretrained_encoder: true
+  dim_model: 512
+  dim_feedforward: 3200
+  n_heads: 8
+  n_encoder_layers: 4
+  n_decoder_layers: 1
+  n_vae_encoder_layers: 4
+  latent_dim: 32
+  kl_weight: 10.0
+  dropout: 0.1
+  use_vae: true
+  pre_norm: false
+  feedforward_activation: relu
+  replace_final_stride_with_dilation: false
+  n_action_steps: 32
+  temporal_ensemble_coeff: null
+  rtc:
+    enabled: false
+
+train:
+  batch_size: 48
+  steps: 310050
+  lr: 0.00001
+  weight_decay: 0.0001
+  log_freq: 50
+  save_freq: 4134            # 编号 ckpt：每 2 epoch
+  latest_save_freq: 2067     # latest：每 1 epoch 覆盖
+  val_freq: 4134             # 验证集开环 MAE：每 2 epoch
+  keep_last_ckpts: 10
+  device: cuda
+  num_workers: 2
+  cosine_lr: true
+  warmup_steps: 500
+  encoder_lr_scale: 1.0
+  max_grad_norm: 1.0
+  amp: false
+  compile: true
+
+eval:
+  num_episodes: 50
+  save_video: false
+  video_dir: outputs/eval_videos
+  success_coverage: 0.85
+
+collect:
+  target_episodes: 30
+  save_all: false
+  task: push the T block to the target

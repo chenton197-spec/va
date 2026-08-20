@@ -15,11 +15,16 @@ Checkpoint 含 ``step`` / ``policy_state_dict`` / ``optimizer_state_dict`` /
 ``train.keep_last_ckpts`` 清理（0 = 不清理；``checkpoint_final.pt`` 始终保留）。
 ``train.compile`` 在 CUDA 上对整策略 ``torch.compile``（mode=default）；
 checkpoint 存未包装权重，可与非 compile 推理/续训互通。
+``dataset.val_run_name`` + ``train.val_freq`` 时，训练中在验证集上算开环
+物理 MAE（无 jitter / dropout / history noise，用训练集 stats）。最优
+``mae_joints`` 另存 ``checkpoint_best_val.pt``，曲线写 ``val.jsonl``。
 """
 
 from __future__ import annotations
 
+import json
 import math
+import time
 from datetime import datetime
 from pathlib import Path
 
@@ -34,6 +39,10 @@ from robotfm.config import (
     resolve_path,
 )
 from robotfm.collect.loop import get_run_dir
+from robotfm.data.action_delta import (
+    denormalize_predicted_action,
+    joint_mask_from_names,
+)
 from robotfm.data.dataset import (
     apply_camera_dropout,
     apply_image_augments_batch,
@@ -43,7 +52,12 @@ from robotfm.data.dataset import (
     images_to_float01,
     state_group_masks,
 )
-from robotfm.data.stats import ensure_stats, is_limits_mode, resolve_image_stats
+from robotfm.data.stats import (
+    denormalize,
+    ensure_stats,
+    is_limits_mode,
+    resolve_image_stats,
+)
 from robotfm.policies.act import ACTConfig, ACTPolicy
 from robotfm.policies.flow_matching import FlowMatchingConfig, FlowMatchingPolicy
 from robotfm.policies.vita import VITAConfig, VITAPolicy
@@ -430,6 +444,192 @@ def _loss_terms_as_floats(terms: dict) -> dict[str, float]:
     return extra
 
 
+def _val_run_name(cfg: RobotFMConfig) -> str | None:
+    name = getattr(cfg.dataset, "val_run_name", None)
+    if name is None:
+        return None
+    name = str(name).strip()
+    return name or None
+
+
+def _val_freq(cfg: RobotFMConfig) -> int:
+    """0 = 关闭。``val_run_name`` 已设且 ``val_freq<=0`` 时跟 ``save_freq``。"""
+    if _val_run_name(cfg) is None:
+        return 0
+    freq = int(getattr(cfg.train, "val_freq", 0) or 0)
+    if freq <= 0:
+        return int(cfg.train.save_freq)
+    return freq
+
+
+def _build_val_loader(
+    cfg: RobotFMConfig,
+    *,
+    val_dir: Path,
+    stats: dict,
+    gpu_augment: bool,
+) -> DataLoader:
+    """验证集：训练集 stats、无 jitter / random crop / dropout。"""
+    dataset = build_episode_dataset(
+        run_dir=val_dir,
+        n_obs_steps=cfg.dataset.n_obs_steps,
+        horizon=cfg.dataset.horizon,
+        n_action_steps=cfg.policy.n_action_steps,
+        drop_n_last_frames=0,
+        stats=stats,
+        normalize=True,
+        norm_mode=cfg.dataset.norm_mode,
+        resize_size=cfg.dataset.resize_size,
+        pre_crop_size=cfg.dataset.pre_crop_size,
+        crop_size=cfg.dataset.crop_size if cfg.dataset.eval_fixed_crop else None,
+        random_crop=False,
+        color_jitter_brightness=0.0,
+        color_jitter_contrast=0.0,
+        color_jitter_saturation=0.0,
+        color_jitter_hue=0.0,
+        defer_augment=gpu_augment,
+        uint8_cache=False,
+        uint8_cache_dir=None,
+        predict_joint_delta=bool(cfg.policy.predict_joint_delta),
+    )
+    loader_kwargs: dict = {
+        "batch_size": cfg.train.batch_size,
+        "shuffle": False,
+        "num_workers": min(int(cfg.train.num_workers), 2),
+        "pin_memory": True,
+        "drop_last": False,
+    }
+    if loader_kwargs["num_workers"] > 0:
+        loader_kwargs["persistent_workers"] = True
+        loader_kwargs["prefetch_factor"] = 2
+    return DataLoader(dataset, **loader_kwargs)
+
+
+@torch.no_grad()
+def _evaluate_val_mae(
+    policy: PolicyModule,
+    loader: DataLoader,
+    cfg: RobotFMConfig,
+    stats: dict,
+    device: torch.device,
+    *,
+    use_amp: bool,
+    gpu_augment: bool,
+) -> dict[str, float]:
+    """开环物理 MAE（history_noise=0）。走未 compile 模块，避免再编译 sample_actions。"""
+    n_act = int(cfg.policy.n_action_steps)
+    predict_delta = bool(cfg.policy.predict_joint_delta)
+    joint_mask = joint_mask_from_names(list(cfg.action_names), int(cfg.action_dim))
+    raw = _unwrap_compiled(policy)
+    old_noise = getattr(getattr(raw, "cfg", None), "history_noise_std", None)
+    if old_noise is not None:
+        raw.cfg.history_noise_std = 0.0
+    was_training = policy.training
+    policy.eval()
+    t0 = time.perf_counter()
+    sum_abs = None
+    n_valid = 0.0
+    n_samples = 0
+    try:
+        for batch in loader:
+            batch = {k: v.to(device, non_blocking=True) for k, v in batch.items()}
+            batch["obs_images"] = images_to_float01(batch["obs_images"])
+            if gpu_augment and cfg.dataset.crop_size is not None and cfg.dataset.eval_fixed_crop:
+                batch["obs_images"] = apply_image_augments_batch(
+                    batch["obs_images"],
+                    crop_size=cfg.dataset.crop_size,
+                    random_crop=False,
+                    brightness=0.0,
+                    contrast=0.0,
+                    saturation=0.0,
+                    hue=0.0,
+                )
+            with torch.amp.autocast("cuda", enabled=use_amp):
+                pred_norm = raw.sample_actions(batch)[:, :n_act].float()
+            gt_norm = batch["action"][:, :n_act].float()
+            mask = batch["action_mask"][:, :n_act].float()
+            q_now = denormalize(
+                batch["obs_state"][:, -1],
+                stats,
+                prefix="state",
+                mode=cfg.dataset.norm_mode,
+            )
+            pred_phys = denormalize_predicted_action(
+                pred_norm,
+                stats,
+                cfg.dataset.norm_mode,
+                q_now_phys=q_now,
+                predict_joint_delta=predict_delta,
+                joint_mask=joint_mask,
+            )
+            gt_phys = denormalize_predicted_action(
+                gt_norm,
+                stats,
+                cfg.dataset.norm_mode,
+                q_now_phys=q_now,
+                predict_joint_delta=predict_delta,
+                joint_mask=joint_mask,
+            )
+            err = (pred_phys - gt_phys).abs() * mask
+            dim_sum = err.sum(dim=(0, 1))
+            sum_abs = dim_sum if sum_abs is None else sum_abs + dim_sum
+            n_valid += float(mask.sum().item())
+            n_samples += int(pred_norm.shape[0])
+    finally:
+        if old_noise is not None:
+            raw.cfg.history_noise_std = old_noise
+        if was_training:
+            policy.train()
+    if sum_abs is None or n_valid <= 0:
+        raise RuntimeError("val loader produced no samples")
+    mae_dim = sum_abs / n_valid
+    joint_t = torch.as_tensor(joint_mask, device=mae_dim.device, dtype=torch.bool)
+    grip_t = ~joint_t
+    mae_joints = float(mae_dim[joint_t].mean().item()) if bool(joint_t.any()) else float("nan")
+    mae_gripper = float(mae_dim[grip_t].mean().item()) if bool(grip_t.any()) else float("nan")
+    return {
+        "mae_joints": mae_joints,
+        "mae_gripper": mae_gripper,
+        "mae_all": float(mae_dim.mean().item()),
+        "n_samples": float(n_samples),
+        "n_valid_steps": n_valid,
+        "elapsed_s": time.perf_counter() - t0,
+    }
+
+
+def _log_val_metrics(
+    metrics: dict[str, float],
+    *,
+    step: int,
+    total_steps: int,
+    output_dir: Path,
+    logger: _TrainLogger,
+    pbar: tqdm | None = None,
+    best: bool = False,
+) -> None:
+    msg = (
+        f"val step={step}/{total_steps} "
+        f"mae_joints={metrics['mae_joints']:.4f} "
+        f"mae_gripper={metrics['mae_gripper']:.4f} "
+        f"mae_all={metrics['mae_all']:.4f} "
+        f"n={int(metrics['n_samples'])} "
+        f"time={metrics['elapsed_s']:.1f}s"
+        f"{'  [best]' if best else ''}"
+    )
+    logger.log(msg, also_print=False)
+    if pbar is not None:
+        pbar.write(msg)
+        pbar.set_postfix(
+            val_j=metrics["mae_joints"],
+            val_g=metrics["mae_gripper"],
+        )
+    else:
+        logger.log(msg)
+    record = {"step": int(step), **{k: float(v) for k, v in metrics.items()}}
+    with (output_dir / "val.jsonl").open("a", encoding="utf-8") as fh:
+        fh.write(json.dumps(record) + "\n")
+
+
 def _set_cosine_lr(optim: torch.optim.Optimizer, step: int, cfg: RobotFMConfig) -> None:
     """线性 warmup + cosine 衰减；各组按各自 base_lr 缩放。"""
     warmup = max(cfg.train.warmup_steps, 1)
@@ -478,7 +678,8 @@ def train_flow_matching(
     logger.log(f"dataset.run_name: {cfg.dataset.run_name}")
     logger.log(
         f"train: steps={cfg.train.steps} batch_size={cfg.train.batch_size} "
-        f"lr={cfg.train.lr} log_freq={cfg.train.log_freq} save_freq={cfg.train.save_freq}"
+        f"lr={cfg.train.lr} log_freq={cfg.train.log_freq} save_freq={cfg.train.save_freq} "
+        f"val_freq={_val_freq(cfg)} val_run_name={_val_run_name(cfg)}"
     )
     if resume_path is not None:
         logger.log(f"resume_path: {resume_path}")
@@ -563,6 +764,31 @@ def train_flow_matching(
             predict_joint_delta=bool(cfg.policy.predict_joint_delta),
         )
         logger.log(f"dataset: run_dir={run_dir} num_samples={len(dataset)}")
+        probe = dataset[0]
+        n_cams = int(probe["obs_images"].shape[0])
+        state_d = int(probe["obs_state"].shape[-1])
+        action_d = int(probe["action"].shape[-1])
+        if n_cams != len(cfg.cameras):
+            raise ValueError(
+                f"dataset cameras={n_cams} != config cameras={cfg.cameras}"
+            )
+        if state_d != cfg.state_dim or action_d != cfg.action_dim:
+            raise ValueError(
+                f"dataset state/action dim {state_d}/{action_d} != "
+                f"config {cfg.state_dim}/{cfg.action_dim}"
+            )
+        stats_state = int(stats["state_mean"].shape[0])
+        stats_action = int(stats["action_mean"].shape[0])
+        if stats_state != cfg.state_dim or stats_action != cfg.action_dim:
+            raise ValueError(
+                f"stats state/action dim {stats_state}/{stats_action} != "
+                f"config {cfg.state_dim}/{cfg.action_dim}"
+            )
+        logger.log(
+            f"dataset.shapes: cams={n_cams} state={state_d} action={action_d} "
+            f"obs_T={tuple(probe['obs_state'].shape)} "
+            f"act_T={tuple(probe['action'].shape)}"
+        )
         if cfg.policy.predict_joint_delta:
             logger.log(
                 "policy.predict_joint_delta: joint targets are action-q_now; "
@@ -596,6 +822,39 @@ def train_flow_matching(
             loader_kwargs["persistent_workers"] = True
             loader_kwargs["prefetch_factor"] = 2
         loader = DataLoader(dataset, **loader_kwargs)
+
+        val_loader: DataLoader | None = None
+        val_freq = _val_freq(cfg)
+        best_val_mae = math.inf
+        last_val_step = -1
+        if val_freq > 0:
+            val_name = _val_run_name(cfg)
+            assert val_name is not None
+            val_dir = resolve_path(base_dir, cfg.data_root) / val_name
+            if not val_dir.is_dir():
+                raise FileNotFoundError(f"val dataset not found: {val_dir}")
+            val_loader = _build_val_loader(
+                cfg,
+                val_dir=val_dir,
+                stats=stats,
+                gpu_augment=gpu_augment,
+            )
+            logger.log(
+                f"val: run_dir={val_dir} num_samples={len(val_loader.dataset)} "
+                f"freq={val_freq} (open-loop physical MAE, history_noise=0)"
+            )
+            val_jsonl = output_dir / "val.jsonl"
+            if resume_path is not None and val_jsonl.is_file():
+                for line in val_jsonl.read_text(encoding="utf-8").splitlines():
+                    line = line.strip()
+                    if not line:
+                        continue
+                    rec = json.loads(line)
+                    prev = rec.get("mae_joints")
+                    if prev is not None and math.isfinite(float(prev)):
+                        best_val_mae = min(best_val_mae, float(prev))
+                if math.isfinite(best_val_mae):
+                    logger.log(f"val: resume best_mae_joints={best_val_mae:.4f}")
 
         device = torch.device(cfg.train.device if torch.cuda.is_available() else "cpu")
         logger.log(f"device: {device}")
@@ -849,10 +1108,84 @@ def train_flow_matching(
                     if save_latest:
                         latest = _save_latest_checkpoint(output_dir, payload)
                         logger.log(f"saved: {latest}", also_print=False)
+                do_val = (
+                    val_loader is not None
+                    and val_freq > 0
+                    and step > 0
+                    and step % val_freq == 0
+                )
+                if do_val:
+                    val_metrics = _evaluate_val_mae(
+                        policy,
+                        val_loader,
+                        cfg,
+                        stats,
+                        device,
+                        use_amp=use_amp,
+                        gpu_augment=gpu_augment,
+                    )
+                    last_val_step = step
+                    is_best = val_metrics["mae_joints"] < best_val_mae
+                    if is_best:
+                        best_val_mae = val_metrics["mae_joints"]
+                        best_payload = _checkpoint_payload(
+                            step=step,
+                            policy=policy,
+                            optim=optim,
+                            cfg=cfg,
+                            stats=stats,
+                            scaler=scaler if use_amp else None,
+                        )
+                        best_path = output_dir / "checkpoint_best_val.pt"
+                        torch.save(best_payload, best_path)
+                        logger.log(f"saved: {best_path}", also_print=False)
+                    _log_val_metrics(
+                        val_metrics,
+                        step=step,
+                        total_steps=cfg.train.steps,
+                        output_dir=output_dir,
+                        logger=logger,
+                        pbar=pbar,
+                        best=is_best,
+                    )
                 step += 1
                 pbar.update(1)
                 if step >= cfg.train.steps:
                     break
+
+        if val_loader is not None and last_val_step != step:
+            val_metrics = _evaluate_val_mae(
+                policy,
+                val_loader,
+                cfg,
+                stats,
+                device,
+                use_amp=use_amp,
+                gpu_augment=gpu_augment,
+            )
+            is_best = val_metrics["mae_joints"] < best_val_mae
+            if is_best:
+                best_val_mae = val_metrics["mae_joints"]
+                best_payload = _checkpoint_payload(
+                    step=step,
+                    policy=policy,
+                    optim=optim,
+                    cfg=cfg,
+                    stats=stats,
+                    scaler=scaler if use_amp else None,
+                )
+                best_path = output_dir / "checkpoint_best_val.pt"
+                torch.save(best_payload, best_path)
+                logger.log(f"saved: {best_path}", also_print=False)
+            _log_val_metrics(
+                val_metrics,
+                step=step,
+                total_steps=cfg.train.steps,
+                output_dir=output_dir,
+                logger=logger,
+                pbar=pbar,
+                best=is_best,
+            )
 
         final_payload = _checkpoint_payload(
             step=step,

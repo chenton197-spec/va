@@ -122,7 +122,12 @@ def overlay_joint_delta_action_stats(
 
     For each t, target[k] = action[t+k] − state[t] on joints (k < horizon).
     Mutates ``stats`` in place and returns it.
+
+    If ``action_delta_mean`` already exists (e.g. train overlay, then val dataset
+    on the same stats dict), skip so val keeps **train** residual normalization.
     """
+    if "action_delta_mean" in stats and "action_delta_std" in stats:
+        return stats
     if not states or not actions:
         raise ValueError("overlay_joint_delta_action_stats: empty state/action lists")
     if int(horizon) <= 0:
