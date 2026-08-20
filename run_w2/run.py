@@ -260,6 +260,10 @@ def _load_deploy_config(path: Path) -> dict[str, Any]:
         ),
         "move_angle_tolerance_deg": float(move.get("angle_tolerance_deg", 0.01)),
         "move_max_delta_deg": float(move.get("max_delta_deg", 3.0)),
+        "move_feedback_confirm": bool(move.get("feedback_confirm", True)),
+        # interrupt=false 时厂商 moveJoints2 将新目标排队；连续高频下发必须
+        # 用 interrupt=true 中断当前插补、始终追赶最新目标（旧 handle 被取消）
+        "move_interrupt": bool(move.get("interrupt", False)),
     }
 
 
@@ -1302,6 +1306,8 @@ def _send_action(
     max_delta_deg: float,
     joint_limits_min_deg: np.ndarray,
     joint_limits_max_deg: np.ndarray,
+    feedback_confirm: bool = True,
+    move_interrupt: bool = False,
 ) -> None:
     if hw.left_arm is None or hw.right_arm is None:
         raise RuntimeError("HCX 双臂未连接")
@@ -1360,7 +1366,7 @@ def _send_action(
 
     left_h = hw.left_arm.move_joints(
         left,
-        interrupt=False,
+        interrupt=move_interrupt,
         acceleration_seconds=acceleration_seconds,
         deceleration_seconds=deceleration_seconds,
         speed_ratio=speed_ratio,
@@ -1371,7 +1377,7 @@ def _send_action(
     if right is not None:
         right_h = hw.right_arm.move_joints(
             right,
-            interrupt=False,
+            interrupt=move_interrupt,
             acceleration_seconds=acceleration_seconds,
             deceleration_seconds=deceleration_seconds,
             speed_ratio=speed_ratio,
@@ -1380,14 +1386,15 @@ def _send_action(
         )
     del left_h, right_h
 
-    _confirm_targets_by_feedback(
-        hw,
-        left,
-        right,
-        timeout_s=feedback_confirm_timeout_s,
-        poll_interval_s=feedback_confirm_poll_interval_s,
-        angle_tolerance_deg=angle_tolerance_deg,
-    )
+    if feedback_confirm:
+        _confirm_targets_by_feedback(
+            hw,
+            left,
+            right,
+            timeout_s=feedback_confirm_timeout_s,
+            poll_interval_s=feedback_confirm_poll_interval_s,
+            angle_tolerance_deg=angle_tolerance_deg,
+        )
 
 
 def _confirm_targets_by_feedback(
@@ -1814,6 +1821,8 @@ def main() -> None:
                         max_delta_deg=deploy["move_max_delta_deg"],
                         joint_limits_min_deg=deploy["joint_limits_min_deg"],
                         joint_limits_max_deg=deploy["joint_limits_max_deg"],
+                        feedback_confirm=deploy["move_feedback_confirm"],
+                        move_interrupt=deploy["move_interrupt"],
                     )
                     obs_queue.push_after_action()
                     step_i += 1
@@ -1970,6 +1979,8 @@ def main() -> None:
                 max_delta_deg=deploy["move_max_delta_deg"],
                 joint_limits_min_deg=deploy["joint_limits_min_deg"],
                 joint_limits_max_deg=deploy["joint_limits_max_deg"],
+                feedback_confirm=deploy["move_feedback_confirm"],
+                move_interrupt=deploy["move_interrupt"],
             )
             hw.obs_sampler.raise_if_unhealthy()
             # 动作步节拍仍按训练 fps，与观测采样 obs_fps 解耦

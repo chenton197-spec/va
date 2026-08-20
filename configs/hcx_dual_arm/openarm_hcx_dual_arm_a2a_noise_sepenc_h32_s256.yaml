@@ -17,6 +17,8 @@
 # 注意：train.amp 已知 bug，训练中途易 loss=nan，保持 amp=false
 # 编号 ckpt 每 5 epoch：save_freq = 5 * 1240 = 6200
 # latest 每 1 epoch：latest_save_freq = 1240
+# 训练中验证：openarm_hcx_dual_arm_val（10 ep）；val_freq=2480（每 2 epoch）
+#   开环物理 MAE（无 jitter / dropout / history noise）；最优 mae_joints 存 checkpoint_best_val.pt
 # 状态遮挡：逼模型用图像。关节组 / 夹爪组独立整组置零（obs_state + A2A obs_history
 #   共用同一 mask）。勿开 camera_dropout（相机会逼模型更抄关节）。
 #   后期故意保持较高 drop，避免 cosine 尾段把视觉依赖训掉；两组全灭时随机放回一组
@@ -35,6 +37,7 @@ dataset:
   n_obs_steps: 8
   horizon: 32
   run_name: openarm_hcx_dual_arm_merged
+  val_run_name: openarm_hcx_dual_arm_val  # 10 ep holdout；训练中开环 MAE
   pre_crop_size: 720
   resize_size: 256
   crop_size: null
@@ -50,15 +53,15 @@ dataset:
     enabled: true
     keep_at_least_one: true
     # 与 train.steps 对齐
-    schedule_steps: 62000
+    schedule_steps: 31000
     early_frac: 0.30
     mid_frac: 0.40
-    joint_early_prob: 0.50
+    joint_early_prob: 0.250
     joint_mid_prob: 0.40
-    joint_late_prob: 0.30
-    gripper_early_prob: 0.50
+    joint_late_prob: 0.50
+    gripper_early_prob: 0.25
     gripper_mid_prob: 0.40
-    gripper_late_prob: 0.30
+    gripper_late_prob: 0.50
 
 policy:
   type: a2a
@@ -96,18 +99,19 @@ policy:
 train:
   # 50ep；bs=80 + workers=2 + compile（本机最快；勿 workers≥6）
   batch_size: 80
-  steps: 62000
-  lr: 0.0003
-  weight_decay: 0.000001
+  steps: 31000
+  lr: 0.0001
+  weight_decay: 0.00005
   log_freq: 50
   save_freq: 6200            # 编号 ckpt：每 5 epoch
   latest_save_freq: 1240     # latest：每 1 epoch 覆盖
+  val_freq: 2480             # 验证集开环 MAE：每 2 epoch
   keep_last_ckpts: 10        # 每份 ~460MB；只留最近 10 个编号 ckpt
   device: cuda
   num_workers: 2
   cosine_lr: true
-  warmup_steps: 500
-  encoder_lr_scale: 1.0      # ResNet lr = 3e-4，与主体同 lr，让视觉跟得上状态遮挡
+  warmup_steps: 1000
+  encoder_lr_scale: 0.1      # ResNet lr = 1e-5，保护预训练视觉特征不被破坏
   max_grad_norm: 1.0
   amp: false  # 已知 bug：amp 训练易 nan
   compile: true

@@ -1,0 +1,94 @@
+# 离线 BC：A2A + limits（min/max → [-1, 1]），左臂 7 关节 + left_gripper → 8-D；双相机
+# 与 openarm_hcx_dual_arm_with_depth_left_a2a.yaml 相同，仅观测改成单帧（n_obs_steps=1）+ limits 归一化
+# 硬件：RTX 5060 Ti 16GB + i5-13500 20T + 31GB RAM
+# 数据：openarm_hcx_dual_arm_with_depth 划出 train/val（seed=43；缺 ep4 parquet）
+#   train 19 ep / 54848 帧；val 2 ep [1, 10] / 5612 帧
+# → floor(N/128)=428 steps/epoch → 100 epoch = 42800
+# 图像：1280×720 中心裁 720 → resize 256；uint8_cache + GPU color_jitter
+# 光照/曝光：brightness=0.3 → 因子 [0.7, 1.3]；contrast=0.2 → [0.8, 1.2]
+# 吞吐参考（n_obs=8）：2026-08-19 fp32 uint8_cache 256 h8 2 cam sepenc
+#   bs128 w4 182 samp/s / 10.1GB；n_obs=1 图像解码更少，吞吐应更高、显存更低
+# 注意：train.amp 已知 bug（A2A Euler 在 fp16 溢出会 nan），必须 amp=false
+cameras: [head, left_hand]
+state_dim: 8
+action_dim: 8
+state_names:
+  [L0, L1, L2, L3, L4, L5, L6, left_gripper]
+action_names:
+  [L0, L1, L2, L3, L4, L5, L6, left_gripper]
+fps: 15
+data_root: data
+output_dir: outputs/a2a_noise_limits_openarm_hcx_dual_arm_with_depth_left_nobs1
+
+dataset:
+  n_obs_steps: 1
+  horizon: 8
+  run_name: openarm_hcx_dual_arm_with_depth_train
+  val_run_name: openarm_hcx_dual_arm_with_depth_val  # 2 ep holdout；训练中开环 MAE
+  pre_crop_size: 720
+  resize_size: 256
+  crop_size: null
+  eval_fixed_crop: true
+  # gaussian | gaussian_2std | limits([-1,1]) | limits_01([0,1])
+  norm_mode: limits
+  color_jitter_brightness: 0.3   # 曝光：因子均匀采样 [0.7, 1.3]
+  color_jitter_contrast: 0.2     # 光照对比度：[0.8, 1.2]
+  color_jitter_saturation: 0.1   # 轻微色温
+  color_jitter_hue: 0.02         # 轻微色相偏移
+  uint8_cache: true
+  gpu_augment: true
+
+policy:
+  type: a2a
+  vision_backbone: resnet18
+  hidden_dim: 256
+  num_inference_steps: 6
+  n_action_steps: 8
+  pretrained_encoder: true
+  use_frame_diff: false
+  share_image_encoder: false
+  latent_dim: 512
+  consistency_weight: 1.0
+  enc_recon_weight: 0.5
+  flow_recon_weight: 0.5
+  enc_contrastive_weight: 0.0
+  flow_contrastive_weight: 0.0
+  history_noise_std: 0.0
+  use_ot_matcher: false
+  decode_flow_latents: true
+  predict_joint_delta: false
+  flow_hidden_dim: 512
+  flow_num_layers: 4
+  flow_mlp_ratio: 4.0
+  flow_dropout: 0.0
+  ae_enc_hidden_dim: 512
+  ae_dec_hidden_dim: 512
+  ae_num_layers: 4
+  ae_dropout: 0.0
+  rtc:
+    enabled: false
+    execution_horizon: 8
+    max_guidance_weight: 10.0
+    prefix_attention_schedule: exp
+    inference_delay: 2
+    debug: false
+
+train:
+  # 100ep；本机最快稳（n_obs=8）：bs=128 + workers=4 + compile（~183 samp/s，VRAM~10.1G）
+  batch_size: 128
+  steps: 42800
+  lr: 0.0001
+  weight_decay: 0.000001
+  log_freq: 100
+  save_freq: 2140            # 编号 ckpt：每 5 epoch
+  latest_save_freq: 428      # latest：每 1 epoch 覆盖
+  val_freq: 856              # 验证集开环 MAE：每 2 epoch
+  keep_last_ckpts: 20
+  device: cuda
+  num_workers: 4
+  cosine_lr: true
+  warmup_steps: 500
+  encoder_lr_scale: 0.1
+  max_grad_norm: 1.0
+  amp: false                 # 已知 bug：amp 训练易 nan
+  compile: true

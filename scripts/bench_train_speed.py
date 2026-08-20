@@ -18,7 +18,7 @@ from torch.utils.data import DataLoader
 
 from robotfm.collect.loop import get_run_dir
 from robotfm.config import load_config
-from robotfm.data.dataset import apply_image_augments_batch, build_episode_dataset
+from robotfm.data.dataset import apply_image_augments_batch, build_episode_dataset, images_to_float01
 from robotfm.data.stats import ensure_stats, is_limits_mode
 from robotfm.train import _build_optimizer, build_policy
 
@@ -145,6 +145,7 @@ def main() -> None:
     def one_step():
         batch = next_batch()
         batch = {k: v.to(device, non_blocking=True) for k, v in batch.items()}
+        batch["obs_images"] = images_to_float01(batch["obs_images"])
         if gpu_augment:
             batch["obs_images"] = apply_image_augments_batch(
                 batch["obs_images"],
