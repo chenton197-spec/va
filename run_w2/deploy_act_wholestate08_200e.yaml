@@ -7,8 +7,8 @@ checkpoint: model/act_openarm_hcx_dual_arm_resnet18_tuned_260819001900/checkpoin
 # 训练配置可选；不设或 null 时回退到 checkpoint 内嵌 config
 config: null
 
-# teleop 部署 YAML（HCX、Orbbec、Gloria-M）
-teleop_yaml: /home/a/Code/teleop_project/teleop.yaml
+# teleop 部署 YAML（HCX、Orbbec、Gloria-M）；相对路径相对于 ct/va/
+teleop_yaml: teleop_project/teleop.yaml
 
 # 闭环最大步数
 max_steps: 5000

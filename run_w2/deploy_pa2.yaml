@@ -6,9 +6,9 @@ checkpoint: model/a2a_noise_openarm_hcx_dual_arm_pa2_gaussian_2std_260814173958/
 # 训练配置可选；不设或 null 时回退到 checkpoint 内嵌 config
 # config: outputs/a2a_noise_openarm_hcx_dual_arm_pa2_gaussian_2std_260814173958/config.yaml
 
-# teleop 部署 YAML（HCX、Orbbec、Gloria-M）
+# teleop 部署 YAML（HCX、Orbbec、Gloria-M）；相对路径相对于 ct/va/
 # 相机从 teleop.yaml 的 hcx_orbbec 段读取（head/left_hand/right_hand），不是 orbbec 段
-teleop_yaml: /home/a/Code/teleop_project/teleop.yaml
+teleop_yaml: teleop_project/teleop.yaml
 
 # 闭环最大步数
 max_steps: 5000

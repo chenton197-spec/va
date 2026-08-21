@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """回放 openarm_hcx_dual_arm_record.py 采集的 HCX 双臂轨迹（move_joints）。
 
-默认读取 ``datasets/to_init`` 中的 Parquet，按帧顺序用 ``RobotClient.arm.move_joints``
+默认读取 ``teleop_project/datasets/to_init`` 中的 Parquet，按帧顺序用 ``RobotClient.arm.move_joints``
 下发 ``action``（14 关节角）与左右夹爪目标，到位确认方式与 ``run_w2/run.py`` 一致。
 """
 
@@ -23,8 +23,7 @@ import yaml
 VA_ROOT = Path(__file__).resolve().parents[1]
 SCRIPT_DIR = Path(__file__).resolve().parent
 DEFAULT_REPLAY_YAML = SCRIPT_DIR / "replay.yaml"
-DEFAULT_TELEOP_ROOT = Path("/home/a/Code/teleop_project")
-FALLBACK_TELEOP_ROOT = Path("/home/a/Code/teleop_project")
+TELEOP_ROOT = VA_ROOT / "teleop_project"
 
 CAMERA_COLUMNS = (
     "observation.images.head",
@@ -37,18 +36,8 @@ CAMERA_WINDOWS = {
     "observation.images.right_hand": "Right Hand Camera",
 }
 
-
-def _resolve_teleop_root() -> Path:
-    if DEFAULT_TELEOP_ROOT.is_dir():
-        return DEFAULT_TELEOP_ROOT
-    if FALLBACK_TELEOP_ROOT.is_dir():
-        return FALLBACK_TELEOP_ROOT
-    raise FileNotFoundError(
-        f"找不到 teleop_project：尝试过 {DEFAULT_TELEOP_ROOT} 与 {FALLBACK_TELEOP_ROOT}"
-    )
-
-
-TELEOP_ROOT = _resolve_teleop_root()
+if not TELEOP_ROOT.is_dir():
+    raise FileNotFoundError(f"找不到 in-repo teleop_project: {TELEOP_ROOT}")
 if str(TELEOP_ROOT) not in sys.path:
     sys.path.insert(0, str(TELEOP_ROOT))
 
@@ -152,11 +141,11 @@ def _load_replay_config(path: Path) -> dict[str, Any]:
         raise ValueError(f"回放配置根节点必须是映射: {path}")
 
     dataset_root = _resolve_path(
-        data.get("dataset_root", "/home/a/Code/teleop_project/datasets/to_init"), base=VA_ROOT
+        data.get("dataset_root", TELEOP_ROOT / "datasets" / "to_init"), base=VA_ROOT
     )
     teleop_yaml = _resolve_path(
         data.get("teleop_yaml", TELEOP_ROOT / "teleop.yaml"),
-        base=SCRIPT_DIR,
+        base=VA_ROOT,
     )
     playback_speed = float(data.get("playback_speed", 1.0))
     if not math.isfinite(playback_speed) or playback_speed <= 0.0:

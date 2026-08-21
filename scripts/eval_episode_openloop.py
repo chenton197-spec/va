@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import time
 from pathlib import Path
 
 import matplotlib.pyplot as plt
@@ -41,6 +42,7 @@ from robotfm.data.lerobot_dataset import (
     load_episode_arrays_from_parquet,
     load_lerobot_info,
 )
+from robotfm.data.uint8_cache import Uint8ImageCache, resolve_cache_dir
 from robotfm.data.stats import normalize
 from robotfm.train import build_policy
 
@@ -119,6 +121,166 @@ def _build_obs_batch(
     }
 
 
+def _obs_indices(t: int, n_obs: int) -> list[int]:
+    obs_start = max(0, t - n_obs + 1)
+    obs_indices = list(range(obs_start, t + 1))
+    while len(obs_indices) < n_obs:
+        obs_indices.insert(0, obs_indices[0])
+    return obs_indices
+
+
+def _preload_episode_images(
+    *,
+    run_dir: Path,
+    image_paths: dict[str, list[str]],
+    cameras: list[str],
+    length: int,
+    pre_crop_size: int | None,
+    resize_size: int | None,
+    crop_size: int | None,
+    episode: int,
+) -> torch.Tensor:
+    """Load all episode images once. Returns ``(C, T, 3, H, W)`` uint8 RGB.
+
+    Prefers uint8 cache (already pre_crop + resize); otherwise decodes JPEGs.
+    """
+    cache_path = None
+    if resize_size is not None:
+        cache_path = resolve_cache_dir(
+            run_dir, resize_size=resize_size, pre_crop_size=pre_crop_size
+        )
+    if cache_path is not None and (cache_path / "meta.json").is_file():
+        cache = Uint8ImageCache(cache_path)
+        if episode in cache.episode_ids and all(c in cache.cameras for c in cameras):
+            ep_local = cache.episode_ids.index(episode)
+            if cache.episode_lengths[ep_local] == length:
+                cams = []
+                frame_idx = list(range(length))
+                for cam in cameras:
+                    hwc = cache.load_cam_frames(ep_local, cam, frame_idx)
+                    chw = np.ascontiguousarray(np.transpose(hwc, (0, 3, 1, 2)))
+                    cams.append(torch.from_numpy(chw))
+                images = torch.stack(cams, dim=0)
+                if crop_size is not None:
+                    images = images.float().div_(255.0)
+                    images = spatial_preprocess_images(
+                        images,
+                        pre_crop_size=None,
+                        resize_size=None,
+                        crop_size=crop_size,
+                        random_crop=False,
+                    )
+                    images = (images.clamp(0, 1) * 255.0).to(torch.uint8)
+                print(f"images: uint8_cache {cache_path} shape={tuple(images.shape)}")
+                return images
+
+    cams = []
+    for cam in cameras:
+        frames = []
+        for fi in range(length):
+            img = _load_image_rgb(run_dir / image_paths[cam][fi])
+            frames.append(torch.from_numpy(np.transpose(img, (2, 0, 1)).astype(np.float32) / 255.0))
+        stacked = torch.stack(frames, dim=0)
+        stacked = spatial_preprocess_images(
+            stacked,
+            pre_crop_size=pre_crop_size,
+            resize_size=resize_size,
+            crop_size=crop_size,
+            random_crop=False,
+        )
+        cams.append(stacked.to(torch.uint8) if stacked.dtype == torch.uint8 else (stacked.clamp(0, 1) * 255.0).to(torch.uint8))
+    images = torch.stack(cams, dim=0)
+    print(f"images: decoded JPEG shape={tuple(images.shape)}")
+    return images
+
+
+def _infer_episode_batched(
+    *,
+    policy,
+    cam_frames: torch.Tensor,
+    states: np.ndarray,
+    stats: dict,
+    norm_mode: str,
+    n_obs: int,
+    n_action_steps: int,
+    exec_steps: int,
+    delta_joint_mask: np.ndarray,
+    predict_joint_delta: bool,
+    device: torch.device,
+    batch_size: int,
+    reanchor: bool,
+) -> tuple[np.ndarray, np.ndarray, list[int]]:
+    """GPU batched open-loop. ``exec_steps=1`` infers every frame (uses pred[0])."""
+    length = int(states.shape[0])
+    action_dim = int(states.shape[1])
+    infer_ts = list(range(length)) if exec_steps == 1 else list(range(0, length, exec_steps))
+    n_infer = len(infer_ts)
+    obs_idx = np.array([_obs_indices(t, n_obs) for t in infer_ts], dtype=np.int64)
+    pred_raw = np.full((length, action_dim), np.nan, dtype=np.float32)
+    pred = np.full((length, action_dim), np.nan, dtype=np.float32)
+    cam_frames = cam_frames.contiguous()
+    bs = max(int(batch_size), 1)
+    for start in range(0, n_infer, bs):
+        sl = slice(start, min(start + bs, n_infer))
+        ts = infer_ts[sl]
+        idx = obs_idx[sl]
+        # cam_frames: (C, T, 3, H, W); idx: (B, n_obs) → (B, C, n_obs, 3, H, W)
+        obs_images = cam_frames[:, torch.as_tensor(idx)].permute(1, 0, 2, 3, 4, 5)
+        obs_images = obs_images.to(device, non_blocking=True)
+        if obs_images.dtype == torch.uint8:
+            obs_images = obs_images.float().div_(255.0)
+        state_win = states[idx].astype(np.float32)
+        state_norm = normalize(state_win, stats, prefix="state", mode=norm_mode)
+        if predict_joint_delta:
+            hist = np.stack(
+                [
+                    flow_history_from_phys(
+                        states[row].astype(np.float32),
+                        stats,
+                        norm_mode,
+                        predict_joint_delta=True,
+                        joint_mask=delta_joint_mask,
+                    )
+                    for row in idx
+                ],
+                axis=0,
+            )
+        else:
+            hist = state_norm
+        batch = {
+            "obs_images": obs_images,
+            "obs_state": torch.from_numpy(state_norm).to(device, non_blocking=True),
+            "obs_history": torch.from_numpy(np.ascontiguousarray(hist)).to(
+                device, non_blocking=True
+            ),
+        }
+        with torch.no_grad():
+            pred_norm = policy.sample_actions(batch)[:, :n_action_steps].float().cpu()
+        q_now = states[np.asarray(ts, dtype=np.int64)].astype(np.float32)
+        pred_phys = np.asarray(
+            denormalize_predicted_action(
+                pred_norm,
+                stats,
+                norm_mode,
+                q_now_phys=q_now,
+                predict_joint_delta=predict_joint_delta,
+                joint_mask=delta_joint_mask,
+            )
+        )
+        for i, t in enumerate(ts):
+            take = min(exec_steps, length - t, pred_phys.shape[1])
+            chunk_raw = np.asarray(pred_phys[i, :take], dtype=np.float32)
+            pred_raw[t : t + take] = chunk_raw
+            if reanchor:
+                chunk = chunk_raw.copy()
+                offset = q_now[i, delta_joint_mask] - chunk[0, delta_joint_mask]
+                chunk[:, delta_joint_mask] = chunk[:, delta_joint_mask] + offset
+                pred[t : t + take] = chunk
+            else:
+                pred[t : t + take] = chunk_raw
+    return pred, pred_raw, infer_ts
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Open-loop episode action comparison")
     parser.add_argument("--checkpoint", type=str, required=True)
@@ -147,7 +309,19 @@ def main() -> None:
         type=int,
         default=None,
         help="Only execute the first N steps of each predicted chunk before replanning "
-        "(default: policy.n_action_steps). Model still predicts full n_action_steps.",
+        "(default: policy.n_action_steps). Model still predicts full n_action_steps. "
+        "Use 1 to infer every frame.",
+    )
+    parser.add_argument(
+        "--batch-size",
+        type=int,
+        default=128,
+        help="GPU batched inference size (uint8 cache / preloaded frames). 1 = sequential.",
+    )
+    parser.add_argument(
+        "--compile",
+        action="store_true",
+        help="torch.compile the policy on CUDA (first batch slower, then faster).",
     )
     parser.add_argument(
         "--num-inference-steps",
@@ -261,6 +435,17 @@ def main() -> None:
     policy.load_state_dict(ckpt["policy_state_dict"])
     policy.to(device)
     policy.eval()
+    if device.type == "cuda":
+        torch.backends.cudnn.benchmark = True
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
+        torch.set_float32_matmul_precision("high")
+    if args.compile:
+        if device.type != "cuda":
+            print("warning: --compile ignored (not CUDA)")
+        else:
+            policy = torch.compile(policy, mode="default")
+            print("train.compile: True (mode=default)")
 
     print(f"checkpoint: {ckpt_path}")
     print(f"run_dir: {run_dir}")
@@ -268,6 +453,7 @@ def main() -> None:
     print(
         f"norm_mode={norm_mode} n_obs={n_obs} horizon={horizon} "
         f"n_action_steps={n_action_steps} exec_steps={exec_steps} "
+        f"batch_size={int(args.batch_size)} "
         f"num_inference_steps={num_inference_steps} "
         f"history_noise_std={history_noise_std} "
         f"predict_joint_delta={bool(cfg.policy.predict_joint_delta)} "
@@ -279,52 +465,40 @@ def main() -> None:
         f"device={device}"
     )
 
-    pred_actions_raw = np.full_like(actions_gt, np.nan, dtype=np.float32)
-    pred_actions = np.full_like(actions_gt, np.nan, dtype=np.float32)
-    replan_ts: list[int] = []
+    t_img = time.perf_counter()
+    cam_frames = _preload_episode_images(
+        run_dir=run_dir,
+        image_paths=image_paths,
+        cameras=cameras,
+        length=length,
+        pre_crop_size=cfg.dataset.pre_crop_size,
+        resize_size=cfg.dataset.resize_size,
+        crop_size=cfg.dataset.crop_size if cfg.dataset.eval_fixed_crop else None,
+        episode=args.episode,
+    )
+    print(f"preload_images: {time.perf_counter() - t_img:.2f}s")
 
-    t = 0
-    while t < length:
-        batch = _build_obs_batch(
-            run_dir=run_dir,
-            image_paths=image_paths,
-            states=states,
-            cameras=cameras,
-            t=t,
-            n_obs_steps=n_obs,
-            pre_crop_size=cfg.dataset.pre_crop_size,
-            resize_size=cfg.dataset.resize_size,
-            crop_size=cfg.dataset.crop_size,
-            stats=stats,
-            norm_mode=norm_mode,
-            device=device,
-        )
-        with torch.no_grad():
-            pred_norm = policy.sample_actions(batch)[0].cpu()
-        q_now = states[t].astype(np.float32)
-        pred_phys = np.asarray(
-            denormalize_predicted_action(
-                pred_norm,
-                stats,
-                norm_mode,
-                q_now_phys=q_now,
-                predict_joint_delta=bool(cfg.policy.predict_joint_delta),
-                joint_mask=delta_joint_mask,
-            )
-        )
-
-        take = min(exec_steps, length - t, pred_phys.shape[0])
-        chunk_raw = pred_phys[:take]
-        pred_actions_raw[t : t + take] = chunk_raw
-        if reanchor:
-            chunk = np.array(chunk_raw, dtype=np.float32, copy=True)
-            offset = q_now[delta_joint_mask] - chunk[0, delta_joint_mask]
-            chunk[:, delta_joint_mask] = chunk[:, delta_joint_mask] + offset
-            pred_actions[t : t + take] = chunk
-        else:
-            pred_actions[t : t + take] = chunk_raw
-        replan_ts.append(t)
-        t += take
+    t_inf = time.perf_counter()
+    pred_actions, pred_actions_raw, replan_ts = _infer_episode_batched(
+        policy=policy,
+        cam_frames=cam_frames,
+        states=states,
+        stats=stats,
+        norm_mode=norm_mode,
+        n_obs=n_obs,
+        n_action_steps=n_action_steps,
+        exec_steps=exec_steps,
+        delta_joint_mask=delta_joint_mask,
+        predict_joint_delta=bool(cfg.policy.predict_joint_delta),
+        device=device,
+        batch_size=int(args.batch_size),
+        reanchor=reanchor,
+    )
+    infer_s = time.perf_counter() - t_inf
+    print(
+        f"infer: {infer_s:.2f}s  {len(replan_ts) / max(infer_s, 1e-6):.1f} frames/s  "
+        f"n_replans={len(replan_ts)}"
+    )
 
     def _mae_rmse(pred_arr: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
         valid_m = np.isfinite(pred_arr).all(axis=1)

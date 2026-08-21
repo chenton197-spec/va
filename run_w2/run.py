@@ -19,9 +19,11 @@ import torch
 import yaml
 
 VA_ROOT = Path(__file__).resolve().parents[1]
-TELEOP_ROOT = Path("/home/a/Code/teleop_project")
+TELEOP_ROOT = VA_ROOT / "teleop_project"
 SCRIPT_DIR = Path(__file__).resolve().parent
 DEPLOY_YAML = SCRIPT_DIR / "deploy.yaml"
+if not TELEOP_ROOT.is_dir():
+    raise FileNotFoundError(f"找不到 in-repo teleop_project: {TELEOP_ROOT}")
 
 if str(TELEOP_ROOT) not in sys.path:
     sys.path.insert(0, str(TELEOP_ROOT))
@@ -225,7 +227,7 @@ def _load_deploy_config(path: Path) -> dict[str, Any]:
     return {
         "checkpoint": _resolve_path(data["checkpoint"], base=VA_ROOT),
         "config": train_cfg_path,
-        "teleop_yaml": _resolve_path(data["teleop_yaml"], base=SCRIPT_DIR),
+        "teleop_yaml": _resolve_path(data["teleop_yaml"], base=VA_ROOT),
         "max_steps": int(data["max_steps"]),
         "obs_mode": obs_mode,
         "obs_fps": obs_fps,

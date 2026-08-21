@@ -17,7 +17,7 @@
 
 安全设计：
 - 限位 clamp（deploy joint_limits + follower 限位）；
-- 100Hz 一阶平滑 + 速度/单拍 delta 限幅；
+- 100Hz 可选一阶平滑（tau=0 关闭）+ 独立速度/单拍 delta 限幅；
 - 推理看门狗：主线程超时未提交新 chunk 时，下发线程保持最后目标并告警；
 - 首帧插值从当前物理关节角过渡到 chunk[0]，避免跳变。
 
@@ -39,16 +39,12 @@ import numpy as np
 import torch
 import yaml
 
-# ---- 路径：优先本机 teleop；casbot 路径作回退 ----
 VA_ROOT = Path(__file__).resolve().parents[1]
 SCRIPT_DIR = Path(__file__).resolve().parent
 DEFAULT_DEPLOY_YAML = SCRIPT_DIR / "servo_deploy_a2a_depth_left.yaml"
-_TELEOP_CANDIDATES = (
-    Path("/home/a/Code/teleop_project"),
-    Path("/home/a/ct/va/teleop_project"),
-    Path("/home/casbot/ct/teleop_project"),
-)
-TELEOP_ROOT = next((p for p in _TELEOP_CANDIDATES if p.is_dir()), _TELEOP_CANDIDATES[0])
+TELEOP_ROOT = VA_ROOT / "teleop_project"
+if not TELEOP_ROOT.is_dir():
+    raise FileNotFoundError(f"找不到 in-repo teleop_project: {TELEOP_ROOT}")
 
 for p in (TELEOP_ROOT, VA_ROOT):
     s = str(p)
@@ -334,15 +330,16 @@ class ServoOutputThread:
                 desired, self._last_sent, self._max_delta_deg
             )
             desired = np.asarray(clamped, dtype=np.float64)
-            if self._tau_s <= 0.0 or self._cur_cmd is None:
-                cmd = desired
-            else:
+            # 滤波可选；限速始终相对上一拍已发指令，不随 tau=0 关掉
+            if self._tau_s > 0.0 and self._cur_cmd is not None:
                 alpha = dt / (self._tau_s + dt)
                 cmd = self._cur_cmd + alpha * (desired - self._cur_cmd)
-                max_step = self._max_vel_deg_s * dt
-                cmd = self._last_sent + np.clip(
-                    cmd - self._last_sent, -max_step, max_step
-                )
+            else:
+                cmd = desired
+            max_step = self._max_vel_deg_s * dt
+            cmd = self._last_sent + np.clip(
+                cmd - self._last_sent, -max_step, max_step
+            )
         if self._lo is not None:
             cmd = np.clip(cmd, self._lo, self._hi)
         cmd = np.clip(cmd, self._follow_lo, self._follow_hi)
@@ -448,15 +445,14 @@ def _load_servo_section(deploy_path: Path) -> dict[str, Any]:
 
 
 def _resolve_teleop_yaml(deploy: dict[str, Any]) -> Path:
-    """deploy.yaml 里的 teleop_yaml 可能是旧机器路径；缺失时回退到本机 SDK 根。"""
+    """优先用 deploy.yaml 的 teleop_yaml；缺失时回退到 in-repo teleop_project。"""
     p = Path(deploy["teleop_yaml"])
     if p.is_file():
         return p
-    for root in (TELEOP_ROOT, *_TELEOP_CANDIDATES):
-        cand = root / "teleop.yaml"
-        if cand.is_file():
-            print(f"[INFO] deploy teleop_yaml 不存在 {p}，回退到 {cand}", flush=True)
-            return cand
+    cand = TELEOP_ROOT / "teleop.yaml"
+    if cand.is_file():
+        print(f"[INFO] deploy teleop_yaml 不存在 {p}，回退到 {cand}", flush=True)
+        return cand
     raise FileNotFoundError(f"找不到 teleop.yaml: {p}")
 
 

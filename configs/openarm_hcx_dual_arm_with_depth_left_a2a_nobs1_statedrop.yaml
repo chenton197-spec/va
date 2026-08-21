@@ -1,0 +1,111 @@
+# 离线 BC：A2A + limits（min/max → [-1, 1]），左臂 7 关节 + left_gripper → 8-D；双相机
+# 与 openarm_hcx_dual_arm_with_depth_left_a2a_nobs1.yaml 相同，仅加训练期 state_dropout
+# 硬件：RTX 5060 Ti 16GB + i5-13500 20T + 31GB RAM
+# 数据：openarm_hcx_dual_arm_with_depth_train / _val（seed=43；缺 ep4 parquet）
+#   train 30 ep / 87873 帧；val 1 ep [1] / 2193 帧
+# → floor(N/128)=686 steps/epoch → 100 epoch = 68600
+# 图像：1280×720 中心裁 720 → resize 256；uint8_cache + GPU color_jitter
+# 光照/曝光：brightness=0.3 → 因子 [0.7, 1.3]；contrast=0.2 → [0.8, 1.2]
+# 吞吐（n_obs=1，2026-08-20 compile fp32 uint8_cache）：
+#   bs128 w4 264 samp/s 7.4GB；bs176 261 / 10.1GB；bs224 267 / 12.7GB
+#   → 吞吐持平，留 bs=128（70ep 更新更多，显存余量给 val）
+# 注意：train.amp 已知 bug（A2A Euler 在 fp16 溢出会 nan），必须 amp=false
+# 状态遮挡：逼模型用图像。关节组（L0–L6）/ 夹爪组（left_gripper）独立整组置零
+#   （obs_state + A2A obs_history 共用同一 mask）。勿开 camera_dropout。
+#   后期故意保持较高 drop，避免 cosine 尾段把视觉依赖训掉；两组全灭时随机放回一组
+cameras: [head, left_hand]
+state_dim: 8
+action_dim: 8
+state_names:
+  [L0, L1, L2, L3, L4, L5, L6, left_gripper]
+action_names:
+  [L0, L1, L2, L3, L4, L5, L6, left_gripper]
+fps: 15
+data_root: data
+output_dir: outputs/a2a_noise_limits_openarm_hcx_dual_arm_with_depth_left_nobs1_statedrop
+
+dataset:
+  n_obs_steps: 1
+  horizon: 8
+  run_name: openarm_hcx_dual_arm_with_depth_train
+  val_run_name: openarm_hcx_dual_arm_with_depth_val  # 1 ep holdout；训练中开环 MAE
+  pre_crop_size: 720
+  resize_size: 256
+  crop_size: null
+  eval_fixed_crop: true
+  # gaussian | gaussian_2std | limits([-1,1]) | limits_01([0,1])
+  norm_mode: limits
+  color_jitter_brightness: 0.3   # 曝光：因子均匀采样 [0.7, 1.3]
+  color_jitter_contrast: 0.2     # 光照对比度：[0.8, 1.2]
+  color_jitter_saturation: 0.1   # 轻微色温
+  color_jitter_hue: 0.02         # 轻微色相偏移
+  uint8_cache: true
+  gpu_augment: true
+  state_dropout:
+    enabled: true
+    keep_at_least_one: true
+    # 日程长度；续训把 train.steps 调大时保持此值，超出后固定 late_prob
+    schedule_steps: 68600
+    early_frac: 0.30
+    mid_frac: 0.40
+    joint_early_prob: 0.25
+    joint_mid_prob: 0.40
+    joint_late_prob: 0.50
+    gripper_early_prob: 0.25
+    gripper_mid_prob: 0.40
+    gripper_late_prob: 0.50
+
+policy:
+  type: a2a
+  vision_backbone: resnet18
+  hidden_dim: 256
+  num_inference_steps: 6
+  n_action_steps: 8
+  pretrained_encoder: true
+  use_frame_diff: false
+  share_image_encoder: false
+  latent_dim: 512
+  consistency_weight: 1.0
+  enc_recon_weight: 0.5
+  flow_recon_weight: 0.5
+  enc_contrastive_weight: 0.0
+  flow_contrastive_weight: 0.0
+  history_noise_std: 0.0
+  use_ot_matcher: false
+  decode_flow_latents: true
+  predict_joint_delta: false
+  flow_hidden_dim: 512
+  flow_num_layers: 4
+  flow_mlp_ratio: 4.0
+  flow_dropout: 0.0
+  ae_enc_hidden_dim: 512
+  ae_dec_hidden_dim: 512
+  ae_num_layers: 4
+  ae_dropout: 0.0
+  rtc:
+    enabled: false
+    execution_horizon: 8
+    max_guidance_weight: 10.0
+    prefix_attention_schedule: exp
+    inference_delay: 2
+    debug: false
+
+train:
+  # 100ep；本机最快稳（n_obs=1）：bs=128 + workers=4 + compile（~264 samp/s，VRAM~7.4G）
+  batch_size: 128
+  steps: 68600               # 100 * 686
+  lr: 0.0001
+  weight_decay: 0.000001
+  log_freq: 100
+  save_freq: 3430            # 编号 ckpt：每 5 epoch
+  latest_save_freq: 686      # latest：每 1 epoch 覆盖
+  val_freq: 1372             # 验证集 loss + 开环 MAE/MSE：每 2 epoch
+  keep_last_ckpts: 20        # 100ep / 5 = 20 个编号 ckpt
+  device: cuda
+  num_workers: 4
+  cosine_lr: true
+  warmup_steps: 500
+  encoder_lr_scale: 0.1
+  max_grad_norm: 1.0
+  amp: false                 # 已知 bug：amp 训练易 nan
+  compile: true

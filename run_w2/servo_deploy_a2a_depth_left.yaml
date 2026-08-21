@@ -11,10 +11,8 @@ checkpoint: outputs/a2a_noise_openarm_hcx_dual_arm_with_depth_left_260819212600/
 # 训练配置可选；不设或 null 时回退到 checkpoint 内嵌 config
 config: outputs/a2a_noise_openarm_hcx_dual_arm_with_depth_left_260819212600/config.yaml
 
-# teleop 部署 YAML（HCX、Orbbec、Gloria-M）
-# 注意：run.py 里旧路径 /home/a/Code/teleop_project 已失效，SDK 实际在
-# /home/casbot/ct/teleop_project；servo_deploy.py 找不到时会回退到该路径
-teleop_yaml: /home/casbot/ct/teleop_project/teleop.yaml
+# teleop 部署 YAML（HCX、Orbbec、Gloria-M）；相对路径相对于 ct/va/
+teleop_yaml: teleop_project/teleop.yaml
 
 # 观测模式：fps = 后台按训练 fps（cfg.fps=15）采图
 # （servo_deploy.py 固定使用训练 config 的 fps 做推理节拍，忽略 deploy 的 obs_fps）
@@ -42,9 +40,9 @@ servo:
   # 推理看门狗（s）：主线程超过该时长未提交新 chunk 时，
   # 100Hz 下发线程保持最后目标（SDK 500Hz 线程继续消费批次）
   watchdog_s: 0.5
-  # 100Hz 源点一阶平滑时间常数（秒）；0 表示不平滑
-  command_filter_tau_s: 0.05
-  # 100Hz 平滑后再限速（deg/s）
+  # 100Hz 源点一阶平滑时间常数（秒）；0 表示不平滑（限速仍生效）
+  command_filter_tau_s: 0
+  # 100Hz 每拍限速（deg/s），与上面滤波独立
   max_joint_vel_deg_s: 90.0
   # SDK 1s 窗口 observed_rate_hz 低于该值则停机
   servo_fault_hz_warn: 450.0

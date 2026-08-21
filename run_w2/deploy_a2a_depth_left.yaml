@@ -8,9 +8,9 @@ checkpoint: outputs/a2a_noise_openarm_hcx_dual_arm_with_depth_left_260819212600/
 # 训练配置可选；不设或 null 时回退到 checkpoint 内嵌 config
 config: outputs/a2a_noise_openarm_hcx_dual_arm_with_depth_left_260819212600/config.yaml
 
-# teleop 部署 YAML（HCX、Orbbec、Gloria-M）
+# teleop 部署 YAML（HCX、Orbbec、Gloria-M）；相对路径相对于 ct/va/
 # 相机从 teleop.yaml 的 hcx_orbbec 段读取；本模型只用 head/left_hand
-teleop_yaml: /home/a/Code/teleop_project/teleop.yaml
+teleop_yaml: teleop_project/teleop.yaml
 
 # 观测模式：
 #   fps          后台按 obs_fps 采图（默认，不改原控制步）
