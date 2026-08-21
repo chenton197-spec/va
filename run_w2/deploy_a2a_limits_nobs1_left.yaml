@@ -1,12 +1,12 @@
 # run_w2/run.py 部署配置（HCX 左臂 8-D；脚本仅支持 --deploy）
-# A2A ResNet18 + 深度数据集左臂：head/left_hand，state/action = L0–L6 + left_gripper
-# a2a_noise_openarm_hcx_dual_arm_with_depth_left_260819212600
-# checkpoint_best_val.pt = step 22256（val 开环 mae_joints≈1.06deg）
+# A2A ResNet18 + limits 归一化 + 单帧观测：head/left_hand，state/action = L0–L6 + left_gripper
+# a2a_noise_limits_openarm_hcx_dual_arm_with_depth_left_nobs1_260820185549
+# checkpoint_best_val.pt = step 53508（val 开环 mae_joints≈0.88deg）；final=68600（mae_joints≈0.95deg）
 
 # 策略 checkpoint；相对路径相对于 ct/va/
-checkpoint: outputs/a2a_noise_openarm_hcx_dual_arm_with_depth_left_260819212600/checkpoint_best_val.pt
+checkpoint: outputs/a2a_noise_limits_openarm_hcx_dual_arm_with_depth_left_nobs1_260820185549/checkpoint_best_val.pt
 # 训练配置可选；不设或 null 时回退到 checkpoint 内嵌 config
-config: outputs/a2a_noise_openarm_hcx_dual_arm_with_depth_left_260819212600/config.yaml
+config: outputs/a2a_noise_limits_openarm_hcx_dual_arm_with_depth_left_nobs1_260820185549/config.yaml
 
 # teleop 部署 YAML（HCX、Orbbec、Gloria-M）；相对路径相对于 ct/va/
 # 相机从 teleop.yaml 的 hcx_orbbec 段读取；本模型只用 head/left_hand
@@ -27,9 +27,8 @@ max_steps: 50000
 # after_action 忽略 obs_fps；exec_action_steps 为每次推理执行的 chunk 步数
 # 不写或 null：after_action 默认 1，fps 默认等于 n_action_steps（本模型为 8）
 # 必须 <= n_action_steps
-# 关键：obs_fps 与训练 fps=15 保持一致；exec_action_steps=1 表示每步重新推理
-# （receding horizon），配合 move_joints.feedback_confirm=false 高频连续下发，
-# 让机械臂 move_joints 插值持续追赶 15Hz 目标，避免"慢速到位"导致的分布失配。
+# 本模型 n_obs_steps=1，单帧观测；obs_fps 与训练 fps=15 保持一致
+# exec_action_steps=4 表示每 4 步重新推理（receding horizon）
 obs_fps: 15
 exec_action_steps: 4
 # RTC 覆盖（可选）；字段为 null 或不写则沿用训练 YAML 的 policy.rtc
