@@ -275,6 +275,7 @@ def _build_a2a_policy(cfg: RobotFMConfig) -> torch.nn.Module:
         ae_dropout=cfg.policy.ae_dropout,
         pretrained_encoder=cfg.policy.pretrained_encoder,
         use_frame_diff=cfg.policy.use_frame_diff,
+        use_coord_conv=cfg.policy.use_coord_conv,
         share_image_encoder=cfg.policy.share_image_encoder,
         vision_backbone=cfg.policy.vision_backbone,
         rtc=rtc if rtc.enabled else None,
@@ -311,6 +312,7 @@ def _build_vita_policy(cfg: RobotFMConfig) -> VITAPolicy:
         ae_dropout=cfg.policy.ae_dropout,
         pretrained_encoder=cfg.policy.pretrained_encoder,
         use_frame_diff=cfg.policy.use_frame_diff,
+        use_coord_conv=cfg.policy.use_coord_conv,
         share_image_encoder=cfg.policy.share_image_encoder,
         vision_backbone=cfg.policy.vision_backbone,
     )
@@ -390,6 +392,7 @@ def build_policy(cfg: RobotFMConfig, stats: dict | None = None) -> PolicyModule:
         n_groups=cfg.policy.n_groups,
         pretrained_encoder=cfg.policy.pretrained_encoder,
         use_frame_diff=cfg.policy.use_frame_diff,
+        use_coord_conv=cfg.policy.use_coord_conv,
         share_image_encoder=cfg.policy.share_image_encoder,
         vision_backbone=cfg.policy.vision_backbone,
         rtc=rtc if rtc.enabled else None,

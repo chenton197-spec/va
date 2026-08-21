@@ -37,11 +37,21 @@ class SpatialSoftmax(nn.Module):
         return expected.reshape(b, k * 2)
 
 
-def _adapt_resnet_first_conv(backbone: nn.Module, in_channels: int) -> nn.Module:
-    """扩展 ResNet stem，支持多帧 / 帧差通道堆叠（deep-operation 配方）。"""
+def _adapt_resnet_first_conv(
+    backbone: nn.Module,
+    in_channels: int,
+    *,
+    zero_init_last: int = 0,
+) -> nn.Module:
+    """扩展 ResNet stem，支持多帧 / 帧差通道堆叠（deep-operation 配方）。
+
+    ``zero_init_last``：末尾若干输入通道权重保持 0（用于 CoordConv xy）。
+    """
     old = backbone.conv1
     if old.in_channels == in_channels:
         return backbone
+    if zero_init_last < 0 or zero_init_last > in_channels:
+        raise ValueError(f"zero_init_last={zero_init_last} invalid for in_channels={in_channels}")
 
     new = nn.Conv2d(
         in_channels,
@@ -51,11 +61,13 @@ def _adapt_resnet_first_conv(backbone: nn.Module, in_channels: int) -> nn.Module
         padding=old.padding,
         bias=old.bias is not None,
     )
+    rgb_channels = in_channels - zero_init_last
     with torch.no_grad():
         new.weight.zero_()
-        for c in range(in_channels):
+        for c in range(rgb_channels):
             new.weight[:, c] = old.weight[:, c % old.in_channels]
-        new.weight *= old.in_channels / float(in_channels)
+        if rgb_channels > 0:
+            new.weight[:, :rgb_channels] *= old.in_channels / float(rgb_channels)
         if old.bias is not None:
             new.bias.copy_(old.bias)
     backbone.conv1 = new
@@ -68,6 +80,7 @@ class ResNet18Encoder(nn.Module):
     - ImageNet 预训练（可关），保留 BatchNorm
     - ImageNet mean/std 归一化
     - 可选 frame diff：``[I0, I1-I0, ...]`` 通道拼接后一次前向
+    - 可选 CoordConv：在 stem 前拼归一化 xy（``use_coord_conv``）
     - SpatialSoftmax keypoints + GAP 外观特征
 
     输入: obs (B, T, 3, H, W)
@@ -81,21 +94,27 @@ class ResNet18Encoder(nn.Module):
         num_kp: int = 32,
         pretrained: bool = True,
         use_frame_diff: bool = True,
+        use_coord_conv: bool = False,
         feature_layer: str = "layer3",
     ) -> None:
         super().__init__()
         self.n_obs_steps = n_obs_steps
         self.use_frame_diff = use_frame_diff and n_obs_steps >= 2
+        self.use_coord_conv = use_coord_conv
         self.feature_layer = feature_layer
         self.pretrained = pretrained
 
-        in_channels = 3 * n_obs_steps
+        in_channels = 3 * n_obs_steps + (2 if use_coord_conv else 0)
         if pretrained:
             backbone = resnet18(weights=ResNet18_Weights.DEFAULT)
         else:
             backbone = resnet18(weights=None)
 
-        backbone = _adapt_resnet_first_conv(backbone, in_channels)
+        backbone = _adapt_resnet_first_conv(
+            backbone,
+            in_channels,
+            zero_init_last=2 if use_coord_conv else 0,
+        )
         backbone.fc = nn.Identity()
         backbone.avgpool = nn.Identity()
         self.backbone = backbone
@@ -123,16 +142,42 @@ class ResNet18Encoder(nn.Module):
             torch.tensor([0.229, 0.224, 0.225], dtype=torch.float32).view(1, 1, 3, 1, 1),
             persistent=False,
         )
+        self._coord_cached_hw: tuple[int, int] | None = None
+        self.register_buffer("_coord_grid", torch.zeros(2, 1, 1), persistent=False)
+
+    def _coord_channels(
+        self, h: int, w: int, device: torch.device, dtype: torch.dtype
+    ) -> torch.Tensor:
+        """归一化 xy 网格 (2, H, W)，范围 [-1, 1]。"""
+        if (
+            self._coord_cached_hw == (h, w)
+            and self._coord_grid.device == device
+            and self._coord_grid.dtype == dtype
+        ):
+            return self._coord_grid
+        ys = torch.linspace(-1.0, 1.0, steps=h, device=device, dtype=dtype)
+        xs = torch.linspace(-1.0, 1.0, steps=w, device=device, dtype=dtype)
+        grid_y, grid_x = torch.meshgrid(ys, xs, indexing="ij")
+        pos = torch.stack([grid_x, grid_y], dim=0)
+        self._coord_grid = pos
+        self._coord_cached_hw = (h, w)
+        return pos
 
     def _prepare_images(self, obs: torch.Tensor) -> torch.Tensor:
-        """obs: (B, T, 3, H, W) in [0,1] -> (B, T*3, H, W)."""
+        """obs: (B, T, 3, H, W) in [0,1] -> (B, T*3[+2], H, W)."""
         obs = (obs - self.img_mean) / self.img_std
         if self.use_frame_diff:
             frames = [obs[:, 0]]
             for t in range(1, obs.shape[1]):
                 frames.append(obs[:, t] - obs[:, t - 1])
-            return torch.cat(frames, dim=1)
-        return obs.flatten(1, 2)
+            x = torch.cat(frames, dim=1)
+        else:
+            x = obs.flatten(1, 2)
+        if self.use_coord_conv:
+            b, _, h, w = x.shape
+            xy = self._coord_channels(h, w, x.device, x.dtype).unsqueeze(0).expand(b, -1, -1, -1)
+            x = torch.cat([x, xy], dim=1)
+        return x
 
     def _extract_feature_map(self, x: torch.Tensor) -> torch.Tensor:
         x = self.backbone.conv1(x)
@@ -195,6 +240,7 @@ class MultiCameraEncoder(nn.Module):
         cond_dim: int = 256,
         pretrained_encoder: bool = True,
         use_frame_diff: bool = True,
+        use_coord_conv: bool = False,
         share_image_encoder: bool = True,
     ) -> None:
         super().__init__()
@@ -208,6 +254,7 @@ class MultiCameraEncoder(nn.Module):
                 out_dim=image_out_dim,
                 pretrained=pretrained_encoder,
                 use_frame_diff=use_frame_diff,
+                use_coord_conv=use_coord_conv,
             )
 
         if share_image_encoder:
@@ -288,11 +335,13 @@ def build_multi_camera_encoder(
     cond_dim: int = 256,
     pretrained_encoder: bool = True,
     use_frame_diff: bool = True,
+    use_coord_conv: bool = False,
     share_image_encoder: bool = True,
 ) -> nn.Module:
     """按 ``vision_backbone`` 构造多相机观测编码器（输出 ``cond``）。
 
     支持：``resnet18`` / ``slowfast_r50`` / ``vit_b_16`` / ``pa2``。
+    ``use_coord_conv`` 仅作用于 ResNet 路径。
     """
     backbone = vision_backbone.lower()
     if backbone in {"resnet18", "resnet"}:
@@ -305,6 +354,7 @@ def build_multi_camera_encoder(
             cond_dim=cond_dim,
             pretrained_encoder=pretrained_encoder,
             use_frame_diff=use_frame_diff,
+            use_coord_conv=use_coord_conv,
             share_image_encoder=share_image_encoder,
         )
     if backbone in {"slowfast_r50", "slowfast"}:

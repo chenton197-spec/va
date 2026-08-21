@@ -19,6 +19,8 @@ teleop_yaml: teleop_project/teleop.yaml
 obs_mode: fps
 
 # 运行时弹出 OpenCV 窗口显示训练用相机（本模型为 head + left_hand）
+# 实测：预览后台拼图 + 主线程 imshow/waitKey 会占 GIL，影响 15Hz 控制节拍；
+# 需要看画面时临时开，稳定闭环建议保持 false。
 display_cameras: false
 
 # 闭环最大步数（按实际执行的动作步计数）
@@ -27,9 +29,12 @@ max_steps: 50000
 # after_action 忽略 obs_fps；exec_action_steps 为每次推理执行的 chunk 步数
 # 不写或 null：after_action 默认 1，fps 默认等于 n_action_steps（本模型为 8）
 # 必须 <= n_action_steps
-# 关键：obs_fps 与训练 fps=15 保持一致；exec_action_steps=1 表示每步重新推理
-# （receding horizon），配合 move_joints.feedback_confirm=false 高频连续下发，
-# 让机械臂 move_joints 插值持续追赶 15Hz 目标，避免"慢速到位"导致的分布失配。
+# 关键：obs_fps 与训练 fps=15 保持一致。
+# exec_action_steps=1（每步重推理）实测每步要串行做 batch 构建 + 推理 +
+# 关节反馈读取 + move_joints 下发 + 全量日志，网络往返+日志 IO 会超过 66.7ms，
+# 控制频率掉到 15Hz 以下。改为分块执行：每次推理执行 chunk 前 4 步再重规划，
+# 推理频率降到 3.75Hz，中间步只做连续下发（move_joints.interrupt=true 追赶最新
+# 目标），跟踪的仍是同一段模型轨迹，15Hz 控制节拍容易达成。
 obs_fps: 15
 exec_action_steps: 4
 # RTC 覆盖（可选）；字段为 null 或不写则沿用训练 YAML 的 policy.rtc

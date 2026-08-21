@@ -123,6 +123,7 @@ class PolicyConfig:
     n_groups: int = 8
     pretrained_encoder: bool = True  # ImageNet / Kinetics 预训练（微调）
     use_frame_diff: bool = True  # ResNet/ViT：[I0, I1-I0, ...] 通道堆叠
+    use_coord_conv: bool = False  # ResNet：stem 前拼归一化 xy（+2）；默认关以兼容旧 ckpt
     share_image_encoder: bool = True  # False: 每相机独立视觉权重（≈×Cams 参数）
     # A2A / N-A2A / VITA（flow_matching 忽略）
     latent_dim: int = 512

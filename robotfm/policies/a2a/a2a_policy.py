@@ -59,6 +59,7 @@ class A2AConfig:
     ae_dropout: float = 0.0
     pretrained_encoder: bool = True
     use_frame_diff: bool = True
+    use_coord_conv: bool = False
     share_image_encoder: bool = True
     vision_backbone: str = "resnet18"  # resnet18 | slowfast_r50 | vit_b_16 | pa2
     rtc: RTCConfig | None = None
@@ -88,6 +89,7 @@ class A2APolicy(nn.Module):
             cond_dim=cfg.hidden_dim,
             pretrained_encoder=cfg.pretrained_encoder,
             use_frame_diff=cfg.use_frame_diff,
+            use_coord_conv=cfg.use_coord_conv,
             share_image_encoder=cfg.share_image_encoder,
         )
         self.obs_projector = nn.Linear(cfg.hidden_dim, cfg.latent_dim)

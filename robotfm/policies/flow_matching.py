@@ -45,6 +45,7 @@ class FlowMatchingConfig:
     n_groups: int = 8
     pretrained_encoder: bool = True
     use_frame_diff: bool = True
+    use_coord_conv: bool = False
     share_image_encoder: bool = True
     vision_backbone: str = "resnet18"
     rtc: RTCConfig | None = None
@@ -88,6 +89,7 @@ class FlowMatchingPolicy(nn.Module):
             cond_dim=cfg.hidden_dim,
             pretrained_encoder=cfg.pretrained_encoder,
             use_frame_diff=cfg.use_frame_diff,
+            use_coord_conv=cfg.use_coord_conv,
             share_image_encoder=cfg.share_image_encoder,
         )
 

@@ -45,6 +45,7 @@ def _build_fm_policy(cfg) -> FlowMatchingPolicy:
         n_groups=cfg.policy.n_groups,
         pretrained_encoder=cfg.policy.pretrained_encoder,
         use_frame_diff=cfg.policy.use_frame_diff,
+        use_coord_conv=cfg.policy.use_coord_conv,
         vision_backbone=cfg.policy.vision_backbone,
         rtc=rtc if rtc.enabled else None,
     )

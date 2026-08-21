@@ -79,7 +79,6 @@ from run import (  # noqa: E402
     _pace_step,
     _ramp_start_grippers,
     _read_gripper,
-    _read_hcx_joints,
     _resolve_train_config,
     _shutdown,
     _validate_runtime_contract,
@@ -709,9 +708,11 @@ def main() -> None:
                 )
             # chunk = 未来 n_action_steps 步绝对关节目标（前 7 维关节）
             chunk_joints = np.asarray(pred_phys[:, :7], dtype=np.float64)
-            # 首帧从当前物理关节角过渡到 chunk[0]，避免跳变
-            q_now = _read_hcx_joints(hw.left_arm, None).astype(np.float64)
+            # 首帧从当前物理关节角过渡到 chunk[0]，避免跳变。
+            # q_now 直接复用 obs-sampler 后台线程采到的最新关节角（obs_history[-1].state），
+            # 不再每步同步读关节（网络往返）——该值只在 step 0 用到。
             if step_i == 0:
+                q_now = np.asarray(obs_history[-1].state, dtype=np.float64)[:7]
                 chunk_joints = np.vstack([q_now[None, :], chunk_joints])
             interp.submit(chunk_joints, t0)
             servo.mark_submit()

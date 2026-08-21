@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import torch
 
-from robotfm.policies.encoders import MultiCameraEncoder
+from robotfm.policies.encoders import MultiCameraEncoder, ResNet18Encoder
 
 
 def _serial_img_feat_shared(enc: MultiCameraEncoder, obs_images: torch.Tensor) -> torch.Tensor:
@@ -101,8 +101,50 @@ def test_separate_encoders_have_independent_weights():
     assert n_vision == 2 * n_shared
 
 
+def test_coord_conv_off_keeps_stem_channels():
+    t = 2
+    enc = ResNet18Encoder(
+        n_obs_steps=t,
+        pretrained=False,
+        use_frame_diff=False,
+        use_coord_conv=False,
+    )
+    assert enc.backbone.conv1.in_channels == 3 * t
+    out = enc(torch.rand(2, t, 3, 64, 64))
+    assert out.shape == (2, 128)
+
+
+def test_coord_conv_on_adds_xy_channels():
+    t = 2
+    enc = ResNet18Encoder(
+        n_obs_steps=t,
+        pretrained=False,
+        use_frame_diff=False,
+        use_coord_conv=True,
+    )
+    assert enc.backbone.conv1.in_channels == 3 * t + 2
+    # RGB slice filled from stem adapt; last two (xy) stay zero-init.
+    assert torch.count_nonzero(enc.backbone.conv1.weight[:, -2:]).item() == 0
+    out = enc(torch.rand(2, t, 3, 64, 64))
+    assert out.shape == (2, 128)
+
+    multi = MultiCameraEncoder(
+        num_cameras=2,
+        state_dim=7,
+        n_obs_steps=t,
+        pretrained_encoder=False,
+        use_coord_conv=True,
+        share_image_encoder=True,
+    )
+    assert multi.image_encoder.backbone.conv1.in_channels == 3 * t + 2
+    out_m = multi(torch.rand(2, 2, t, 3, 32, 32), torch.randn(2, t, 7))
+    assert out_m.shape == (2, 256)
+
+
 if __name__ == "__main__":
     test_eval_batched_cameras_match_serial()
     test_train_still_uses_per_camera_forward()
     test_separate_encoders_have_independent_weights()
+    test_coord_conv_off_keeps_stem_channels()
+    test_coord_conv_on_adds_xy_channels()
     print("ok")
