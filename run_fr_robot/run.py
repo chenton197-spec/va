@@ -1176,9 +1176,11 @@ def main() -> None:
     horizon = int(cfg.dataset.horizon)
     fps = int(cfg.fps)
     max_steps = deploy["max_steps"]
-    policy_type = str(cfg.policy.type).lower()
+    policy_type = str(cfg.policy.type).lower().replace("-", "_")
+    if policy_type == "a2au":
+        policy_type = "a2a_u"
 
-    if rtc_enabled and policy_type in {"a2a", "n_a2a"} and n_action_steps != horizon:
+    if rtc_enabled and policy_type in {"a2a", "n_a2a", "a2a_u"} and n_action_steps != horizon:
         raise ValueError(
             "A2A RTC requires n_action_steps == horizon "
             f"(got n_action_steps={n_action_steps}, horizon={horizon})"

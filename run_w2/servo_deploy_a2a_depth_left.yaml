@@ -1,8 +1,6 @@
 # run_w2/servo_deploy.py 伺服部署配置（HCX 左臂 8-D）
-# 与 deploy_a2a_depth_left.yaml（move_joints 规划模式）不同：
-# 本配置由 servo_deploy.py 使用：15Hz 推理 → 100Hz 源点下发（teleop.rate_hz）
-# → SDK HcxDirectServoConfig linear/limited 插值 → 500Hz 原生 PluseToServo
-# （对齐 run_left_arm_depth_direct_threaded.py，不在 Python 里硬打 500Hz）
+# 架构：推理线程（15Hz 动作 → 插值 500Hz 入队）+ 伺服线程（只下发）
+# + 容量 500 的动作队列（空则重发上一拍）
 # A2A ResNet18 + 深度数据集左臂：head/left_hand，state/action = L0–L6 + left_gripper
 # a2a_noise_openarm_hcx_dual_arm_with_depth_left_260819212600
 
@@ -15,7 +13,6 @@ config: outputs/a2a_noise_openarm_hcx_dual_arm_with_depth_left_260819212600/conf
 teleop_yaml: teleop_project/teleop.yaml
 
 # 观测模式：fps = 后台按训练 fps（cfg.fps=15）采图
-# （servo_deploy.py 固定使用训练 config 的 fps 做推理节拍，忽略 deploy 的 obs_fps）
 obs_mode: fps
 
 # 运行时弹出 OpenCV 窗口显示训练用相机（本模型为 head + left_hand）
@@ -24,32 +21,25 @@ display_cameras: false
 # 闭环最大推理步数
 max_steps: 50000
 
-# RTC 与伺服模式每步重规划冲突，servo_deploy.py 会强制关闭 policy.rtc，
-# 无需在此配置；此处仅作记录
 rtc:
   enabled: false
 
-# 伺服段（servo_deploy.py 独有，_load_deploy_config 会丢弃未知键，
-# 由脚本直接从本 yaml 读取）：
-# 100Hz 源点频率来自 teleop.yaml 的 teleop.rate_hz；
-# 500Hz 输出频率来自 teleop.yaml 的 hcx.direct_servo_rate_hz（须为 500，
-# 且 interpolation 为 limited/linear，500 % rate_hz == 0）。
+# 伺服段（servo_deploy.py 独有）
 servo:
-  # SDK 输出频率校验；必须与 teleop.yaml hcx.direct_servo_rate_hz 同为 500
+  # 下发频率；须与 teleop.yaml hcx.direct_servo_rate_hz 同为 500
   rate_hz: 500
-  # 推理看门狗（s）：主线程超过该时长未提交新 chunk 时，
-  # 100Hz 下发线程保持最后目标（SDK 500Hz 线程继续消费批次）
+  # 500Hz 动作队列容量（约 1s 缓冲）
+  queue_size: 500
+  # 保留字段（当前由队列背压替代推理看门狗 hold）
   watchdog_s: 0.5
-  # 100Hz 源点一阶平滑时间常数（秒）；0 表示不平滑（限速仍生效）
+  # 下发侧一阶平滑时间常数（秒）；0 表示不平滑
   command_filter_tau_s: 0
-  # 100Hz 每拍限速（deg/s），与上面滤波独立
+  # 每拍限速（deg/s）
   max_joint_vel_deg_s: 90.0
-  # SDK 1s 窗口 observed_rate_hz 低于该值则停机
-  servo_fault_hz_warn: 450.0
+  # 1s 窗口实测下发频率低于该值则停机
+  servo_fault_hz_warn: 490.0
 
 # 启动时 HCX 左臂可选起始位（关节角单位：度，7轴）
-# 左臂取自 data/openarm_hcx_dual_arm_with_depth episode_000007 第一帧
-# 起始位用 move_joints 规划模式到位（安全），到位后再进入伺服闭环
 start_pose:
   # left_joints_deg: [105.848, -64.945, -131.184, -112.439, -34.477, 15.385, -16.704]
   left_joints_deg: null
@@ -65,7 +55,7 @@ joint_limits_deg:
 
 # HCX move_joints 规划参数：仅用于起始位到位，不进伺服循环
 move_joints:
-  speed_ratio: 1.0
+  speed_ratio: 0.1
   acceleration_seconds: 0.1
   deceleration_seconds: 0.1
   feedback_confirm_timeout_s: 30.0

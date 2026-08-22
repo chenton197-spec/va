@@ -144,11 +144,37 @@ def _build_obs_batch(
         predict_joint_delta=bool(cfg.policy.predict_joint_delta),
         action_names=list(cfg.action_names) if cfg.action_names else None,
     )
-    return {
+    batch = {
         "obs_images": obs_images,
         "obs_state": obs_state,
         "obs_history": torch.from_numpy(obs_history_n).unsqueeze(0).to(device),
     }
+    depth_cameras = tuple(getattr(cfg.dataset, "depth_cameras", ()) or ())
+    if depth_cameras:
+        depth_histories = []
+        for cam in depth_cameras:
+            frames = []
+            for obs in obs_history:
+                if not obs.depths or cam not in obs.depths:
+                    raise KeyError(f"Missing depth camera '{cam}' in observation.depths")
+                d = np.asarray(obs.depths[cam], dtype=np.float32)
+                if d.ndim == 2:
+                    d = d[None, ...]
+                elif d.ndim == 3 and d.shape[0] != 1:
+                    d = d[None, ...]
+                frames.append(torch.from_numpy(d))
+            depth_histories.append(torch.stack(frames, dim=0))
+        obs_depth = torch.stack(depth_histories, dim=0)
+        obs_depth = spatial_preprocess_images(
+            obs_depth,
+            pre_crop_size=cfg.dataset.pre_crop_size,
+            resize_size=cfg.dataset.resize_size,
+            crop_size=cfg.dataset.crop_size if cfg.dataset.eval_fixed_crop else None,
+            random_crop=False,
+            resize_mode="nearest",
+        )
+        batch["obs_depth"] = obs_depth.unsqueeze(0).to(device)
+    return batch
 
 
 def evaluate_flow_matching(

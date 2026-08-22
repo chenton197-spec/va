@@ -1,0 +1,83 @@
+# A2A-U：历史状态 pad 为 x0，1D UNet + RGB-D / cross-attn
+# 基于 openarm_hcx_dual_arm_with_depth_left_a2a_nobs1.yaml
+cameras: [head, left_hand]
+state_dim: 8
+action_dim: 8
+state_names:
+  [L0, L1, L2, L3, L4, L5, L6, left_gripper]
+action_names:
+  [L0, L1, L2, L3, L4, L5, L6, left_gripper]
+fps: 15
+data_root: data
+output_dir: outputs/a2a_u_limits_openarm_hcx_dual_arm_with_depth_left_nobs1
+
+dataset:
+  n_obs_steps: 1
+  horizon: 8
+  run_name: openarm_hcx_dual_arm_with_depth_train
+  val_run_name: openarm_hcx_dual_arm_with_depth_val
+  pre_crop_size: 720
+  resize_size: 256
+  crop_size: null
+  eval_fixed_crop: true
+  norm_mode: limits
+  color_jitter_brightness: 0.3
+  color_jitter_contrast: 0.2
+  color_jitter_saturation: 0.1
+  color_jitter_hue: 0.02
+  uint8_cache: true
+  gpu_augment: true
+  depth_cameras: [left_hand]
+  depth_min_mm: 50.0
+  depth_max_mm: 500.0
+
+policy:
+  type: a2a_u
+  vision_backbone: resnet18
+  hidden_dim: 256
+  num_inference_steps: 6
+  n_action_steps: 8
+  pretrained_encoder: true
+  use_frame_diff: false
+  share_image_encoder: false
+  arm_aware: true
+  token_grid: 8
+  use_temporal_attn: true
+  use_cross_attn: true
+  down_dims: [128, 256, 512]
+  latent_dim: 512
+  consistency_weight: 0.0
+  enc_recon_weight: 0.0
+  flow_recon_weight: 0.0
+  enc_contrastive_weight: 0.0
+  flow_contrastive_weight: 0.0
+  history_noise_std: 0.0
+  use_ot_matcher: false
+  decode_flow_latents: false
+  predict_joint_delta: false
+  rtc:
+    enabled: false
+    execution_horizon: 8
+    max_guidance_weight: 10.0
+    prefix_attention_schedule: exp
+    inference_delay: 2
+    debug: false
+
+train:
+  batch_size: 128
+  steps: 68600
+  lr: 0.0001
+  weight_decay: 0.000001
+  log_freq: 100
+  save_freq: 3430
+  latest_save_freq: 686
+  val_freq: 1372
+  keep_last_ckpts: 20
+  device: cuda
+  num_workers: 4
+  cosine_lr: true
+  warmup_steps: 500
+  encoder_lr_scale: 0.1
+  max_grad_norm: 1.0
+  amp: false
+  compile: true

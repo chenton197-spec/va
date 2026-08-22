@@ -49,6 +49,16 @@ def _resolve_path(value: str | Path, *, base: Path) -> Path:
     return path
 
 
+def _resolve_teleop_yaml(value: str | Path) -> Path:
+    """相对路径里的 teleop.yaml 指向仓库内 teleop_project。"""
+    path = Path(value)
+    if path.is_absolute():
+        return path
+    if path.name == "teleop.yaml":
+        return TELEOP_ROOT / "teleop.yaml"
+    return _resolve_path(path, base=VA_ROOT)
+
+
 def _parse_optional_gripper(value: Any, *, field: str) -> float | None:
     if value is None:
         return None
@@ -227,7 +237,7 @@ def _load_deploy_config(path: Path) -> dict[str, Any]:
     return {
         "checkpoint": _resolve_path(data["checkpoint"], base=VA_ROOT),
         "config": train_cfg_path,
-        "teleop_yaml": _resolve_path(data["teleop_yaml"], base=VA_ROOT),
+        "teleop_yaml": _resolve_teleop_yaml(data["teleop_yaml"]),
         "max_steps": int(data["max_steps"]),
         "obs_mode": obs_mode,
         "obs_fps": obs_fps,
@@ -1555,6 +1565,8 @@ def main() -> None:
         raise FileNotFoundError(f"找不到训练配置: {train_cfg_path}")
 
     print(f"[INFO] 部署配置: {deploy_path}")
+    print(f"[INFO] teleop SDK: {TELEOP_ROOT}")
+    print(f"[INFO] teleop.yaml: {teleop_yaml}")
     print(
         "[INFO] 关节限位 min="
         f"{[round(float(v), 1) for v in deploy['joint_limits_min_deg']]} "
@@ -1608,8 +1620,10 @@ def main() -> None:
             "obs_mode=after_action 与 rtc.enabled=true 互斥："
             "到位采观测按 exec_action_steps 执行后立刻再推理，不能走 RTC leftover"
         )
-    policy_type = str(cfg.policy.type).lower()
-    if rtc_enabled and policy_type in {"a2a", "n_a2a"} and n_action_steps != horizon:
+    policy_type = str(cfg.policy.type).lower().replace("-", "_")
+    if policy_type == "a2au":
+        policy_type = "a2a_u"
+    if rtc_enabled and policy_type in {"a2a", "n_a2a", "a2a_u"} and n_action_steps != horizon:
         raise ValueError(
             "A2A RTC 要求 n_action_steps == horizon "
             f"(got n_action_steps={n_action_steps}, horizon={horizon})"

@@ -19,7 +19,7 @@ teleop_yaml: teleop_project/teleop.yaml
 obs_mode: fps
 
 # 运行时弹出 OpenCV 窗口显示训练用相机（本模型为 head + left_hand）
-display_cameras: false
+display_cameras: true
 
 # 闭环最大步数（按实际执行的动作步计数）
 max_steps: 50000
@@ -30,12 +30,12 @@ max_steps: 50000
 # 本模型 n_obs_steps=1，单帧观测；obs_fps 与训练 fps=15 保持一致
 # exec_action_steps=4 表示每 4 步重新推理（receding horizon）
 obs_fps: 15
-exec_action_steps: 4
+exec_action_steps: 8
 # RTC 覆盖（可选）；字段为 null 或不写则沿用训练 YAML 的 policy.rtc
 # 训练 config 里 rtc.enabled=false 且 execution_horizon=8（等于 n_action_steps）
 # 若打开 RTC，execution_horizon 必须 < 8，否则 leftover 为空无法做 prefix 引导
 rtc:
-  enabled: false
+  enabled: true
   guidance_enabled: true
   inference_delay: 2
   execution_horizon: 4
@@ -63,8 +63,8 @@ move_joints:
   acceleration_seconds: 0.1
   deceleration_seconds: 0.1
   feedback_confirm_timeout_s: 30.0
-  feedback_confirm_poll_interval_s: 0.05
-  angle_tolerance_deg: 0.2
+  feedback_confirm_poll_interval_s: 0.001
+  angle_tolerance_deg: 0.1
   # 关键：false = 不再阻塞等待关节到位（move_joints 本身 wait=False 非阻塞），
   # 由主循环按 15Hz 节拍连续下发绝对目标，机械臂插值追赶。
   # true = 保留旧行为：每步阻塞到 ±angle_tolerance_deg 内才继续。

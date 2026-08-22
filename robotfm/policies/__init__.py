@@ -34,6 +34,8 @@ from robotfm.policies.vita import VITAConfig, VITAPolicy
 __all__ = [
     "A2AConfig",
     "A2APolicy",
+    "A2AUConfig",
+    "A2AUPolicy",
     "ACTConfig",
     "ACTPolicy",
     "ActionQueue",
@@ -52,4 +54,8 @@ def __getattr__(name: str) -> Any:
         from robotfm.policies.a2a import A2AConfig, A2APolicy
 
         return A2AConfig if name == "A2AConfig" else A2APolicy
+    if name in {"A2AUConfig", "A2AUPolicy"}:
+        from robotfm.policies.a2a.a2a_u_policy import A2AUConfig, A2AUPolicy
+
+        return A2AUConfig if name == "A2AUConfig" else A2AUPolicy
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

@@ -40,7 +40,7 @@ fr3:
 # HCX 双七轴部署。只读状态示例不会使用下列自动操作开关；遥操从臂适配器
 # 只有在现场确认安全后才会使用明确设为 true 的状态修改操作。
 hcx:
-  local_ip: "172.16.0.111" # 本机与 HCX 控制器通信的网卡地址。
+  local_ip: "172.16.0.110" # 本机与 HCX 控制器通信的网卡地址。
   remote_ip: "172.16.0.89" # HCX 控制器地址。
   port: 12345
   connect_timeout_s: 10.0
@@ -114,14 +114,14 @@ gloria_m_dual:
   left:
     enabled: true
     # 请按实际枚举结果修改。左侧 OpenArm 已使用 /dev/ttyACM1。
-    port: "/dev/serial/by-path/pci-0000:00:14.0-usb-0:6.1:1.0"
+    port: "/dev/serial/by-path/pci-0000:00:14.0-usb-0:6:1.0"
     baudrate: 921600
     command_id: 1
     feedback_id: 257
   right:
     enabled: true
     # 请按实际枚举结果修改。右侧 OpenArm 已使用 /dev/ttyACM0。
-    port: "/dev/serial/by-path/pci-0000:00:14.0-usb-0:3.1:1.0"
+    port: "/dev/serial/by-path/pci-0000:00:14.0-usb-0:3:1.0"
     baudrate: 921600
     command_id: 1
     feedback_id: 257
@@ -158,9 +158,10 @@ recording:
   # 仅 image_storage: jpg 时生效，范围 1-100；75 为 Pillow 默认质量。
   quality: 75
 
-# OpenArm Mini -> HCX 双臂正式采集的三路 RGB 相机。
+# OpenArm Mini -> HCX 双臂正式采集相机及可用的 RGB/深度 profile。
 # 请将三个 serial_number 改为现场实际序列号；名称不能改，因为采集程序以
 # head 为主相机事件源，并将 left_hand/right_hand 因果配对到同一条记录。
+# 正式采集时的有效模式由 hcx_recording.depth_enabled 统一决定。
 hcx_orbbec:
   cameras:
     - name: "head"
@@ -171,13 +172,13 @@ hcx_orbbec:
       fps: 15
     - name: "left_hand"
       serial_number: "CV2R1610007N"
-      mode: "rgb"
+      mode: "rgbd"
       rgb_resolution: [1280, 720]
       depth_resolution: [848, 480]
       fps: 15
     - name: "right_hand"
       serial_number: "CV2R46P0002W"
-      mode: "rgb"
+      mode: "rgbd"
       rgb_resolution: [1280, 720]
       depth_resolution: [848, 480]
       fps: 15
@@ -185,8 +186,12 @@ hcx_orbbec:
 # OpenArm Mini -> HCX 双臂采集输出。每张头部相机新帧才会触发一条数据集
 # 记录及一次真实双臂/双夹爪反馈读取；这里不使用 numeric_sample_fps。
 hcx_recording:
-  root: "datasets/openarm_hcx_dual_arm"
+  root: "datasets/openarm_hcx_dual_arm_with_depth"
   enabled_cameras: ["head", "left_hand", "right_hand"]
+  # 单窗口显示三路 RGB；拖动窗口时保持 16:9 动态缩放，不影响保存的原始帧。
+  preview_enabled: true
+  # true：左右手采集 RGB-D 并保存深度 PNG；false：三路只采集 RGB。
+  depth_enabled: true
   fps: 15
   master_camera: "head"
   min_free_disk_gb: 60

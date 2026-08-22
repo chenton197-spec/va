@@ -99,15 +99,17 @@ class DatasetConfig:
     gpu_augment: bool = False
     camera_dropout: CameraDropoutConfig = field(default_factory=CameraDropoutConfig)
     state_dropout: StateDropoutConfig = field(default_factory=StateDropoutConfig)
-    # 训练中离线验证集 run 名（data_root / val_run_name）；空/None = 不评估
     val_run_name: str | None = None
+    depth_cameras: list[str] = field(default_factory=list)
+    depth_min_mm: float = 50.0
+    depth_max_mm: float = 500.0
 
 
 @dataclass
 class PolicyConfig:
-    """策略结构与采样超参数（flow_matching / a2a / n_a2a / vita / act）。"""
+    """策略结构与采样超参数（flow_matching / a2a / n_a2a / a2a_u / vita / act）。"""
 
-    type: str = "flow_matching"  # flow_matching | a2a | n_a2a | vita | act
+    type: str = "flow_matching"  # flow_matching | a2a | n_a2a | a2a_u | vita | act
     vision_backbone: str = "resnet18"  # resnet18 | slowfast_r50 | vit_b_16 | pa2
     hidden_dim: int = 256           # 条件向量 / 全局 cond 维度
     num_layers: int = 4               # 旧 DiT 字段，保留兼容
@@ -146,6 +148,10 @@ class PolicyConfig:
     ae_num_layers: int = 4
     ae_dropout: float = 0.0
     decode_flow_latents: bool = True
+    arm_aware: bool = False
+    token_grid: int = 8
+    use_temporal_attn: bool = True
+    use_cross_attn: bool = True
     # ACT（对齐 LeRobot ACTConfig；其它策略忽略）
     dim_model: int = 512
     dim_feedforward: int = 3200

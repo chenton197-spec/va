@@ -96,6 +96,9 @@ class ResNet18Encoder(nn.Module):
         use_frame_diff: bool = True,
         use_coord_conv: bool = False,
         feature_layer: str = "layer3",
+        extra_channels: int = 0,
+        token_grid: int = 0,
+        token_dim: int | None = None,
     ) -> None:
         super().__init__()
         self.n_obs_steps = n_obs_steps
@@ -103,8 +106,11 @@ class ResNet18Encoder(nn.Module):
         self.use_coord_conv = use_coord_conv
         self.feature_layer = feature_layer
         self.pretrained = pretrained
+        self.extra_channels = int(extra_channels)
+        self.token_grid = int(token_grid)
+        self.channels_per_frame = 3 + self.extra_channels
 
-        in_channels = 3 * n_obs_steps + (2 if use_coord_conv else 0)
+        in_channels = self.channels_per_frame * n_obs_steps + (2 if use_coord_conv else 0)
         if pretrained:
             backbone = resnet18(weights=ResNet18_Weights.DEFAULT)
         else:
@@ -131,6 +137,15 @@ class ResNet18Encoder(nn.Module):
             nn.SiLU(),
             nn.Linear(out_dim, out_dim),
         )
+        tok_dim = int(token_dim) if token_dim is not None else out_dim
+        if self.token_grid > 0:
+            self.token_proj = nn.Sequential(
+                nn.Conv2d(feat_channels, tok_dim, kernel_size=1, bias=False),
+                nn.GroupNorm(8, tok_dim),
+                nn.SiLU(),
+            )
+        else:
+            self.token_proj = None
 
         self.register_buffer(
             "img_mean",
@@ -164,8 +179,15 @@ class ResNet18Encoder(nn.Module):
         return pos
 
     def _prepare_images(self, obs: torch.Tensor) -> torch.Tensor:
-        """obs: (B, T, 3, H, W) in [0,1] -> (B, T*3[+2], H, W)."""
-        obs = (obs - self.img_mean) / self.img_std
+        """obs: (B, T, 3[+extra], H, W) in [0,1] -> (B, T*C[+2], H, W)."""
+        if self.extra_channels > 0:
+            rgb = obs[:, :, :3]
+            extra = obs[:, :, 3:]
+            rgb = (rgb - self.img_mean) / self.img_std
+            extra = (extra - 0.5) / 0.5
+            obs = torch.cat([rgb, extra], dim=2)
+        else:
+            obs = (obs - self.img_mean) / self.img_std
         if self.use_frame_diff:
             frames = [obs[:, 0]]
             for t in range(1, obs.shape[1]):
@@ -193,16 +215,23 @@ class ResNet18Encoder(nn.Module):
             return x
         return self.backbone.layer4(x)
 
-    def forward(self, obs: torch.Tensor) -> torch.Tensor:
-        """
-        obs: (B, T, 3, H, W)
-        returns: (B, out_dim)
-        """
+    def encode(self, obs: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor | None]:
         x = self._prepare_images(obs)
         feats = self._extract_feature_map(x)
         keypoints = self.spatial_softmax(feats)
         appearance = feats.mean(dim=(2, 3))
-        return self.proj(torch.cat([keypoints, appearance], dim=-1))
+        global_emb = self.proj(torch.cat([keypoints, appearance], dim=-1))
+        tokens = None
+        if self.token_proj is not None:
+            pooled = F.adaptive_avg_pool2d(
+                feats, output_size=(self.token_grid, self.token_grid)
+            )
+            tokens = self.token_proj(pooled).flatten(2).transpose(1, 2).contiguous()
+        return global_emb, tokens
+
+    def forward(self, obs: torch.Tensor) -> torch.Tensor:
+        global_emb, _ = self.encode(obs)
+        return global_emb
 
 
 class StateEncoder(nn.Module):
@@ -221,6 +250,20 @@ class StateEncoder(nn.Module):
         return self.net(x)
 
 
+class ProprioEncoder(nn.Module):
+    def __init__(self, proprio_dim: int, n_obs_steps: int, cond_dim: int) -> None:
+        super().__init__()
+        self.mlp = nn.Sequential(
+            nn.Linear(proprio_dim * n_obs_steps, cond_dim),
+            nn.LayerNorm(cond_dim),
+            nn.SiLU(),
+            nn.Linear(cond_dim, cond_dim),
+        )
+
+    def forward(self, proprio: torch.Tensor) -> torch.Tensor:
+        return self.mlp(proprio.reshape(proprio.shape[0], -1))
+
+
 class MultiCameraEncoder(nn.Module):
     """多相机 + 多步状态编码器。
 
@@ -228,6 +271,7 @@ class MultiCameraEncoder(nn.Module):
 
     ``share_image_encoder=True``（默认）：所有相机共用一份 ResNet 权重。
     ``share_image_encoder=False``：每相机独立一份权重（参数量约 ×Cams）。
+    ``depth_cameras`` 非空时禁止共享编码器（RGB-D stem 与 RGB 不同）。
     """
 
     def __init__(
@@ -242,36 +286,132 @@ class MultiCameraEncoder(nn.Module):
         use_frame_diff: bool = True,
         use_coord_conv: bool = False,
         share_image_encoder: bool = True,
+        cameras: tuple[str, ...] | list[str] | None = None,
+        depth_cameras: tuple[str, ...] | list[str] = (),
+        arm_aware: bool = False,
+        token_grid: int = 0,
     ) -> None:
         super().__init__()
         self.num_cameras = num_cameras
         self.n_obs_steps = n_obs_steps
+        self.cond_dim = cond_dim
+        self.token_grid = int(token_grid)
+        self.cameras = tuple(
+            cameras if cameras is not None else [f"cam{i}" for i in range(num_cameras)]
+        )
+        if len(self.cameras) != num_cameras:
+            raise ValueError(
+                f"cameras length {len(self.cameras)} != num_cameras {num_cameras}"
+            )
+        self.depth_cameras = tuple(depth_cameras)
+        self.depth_camera_set = set(self.depth_cameras)
+        if self.depth_cameras and share_image_encoder:
+            raise ValueError(
+                "share_image_encoder=True is incompatible with depth_cameras"
+            )
         self.share_image_encoder = share_image_encoder
+        cam_set = set(self.cameras)
+        self.dual_arm_aware = bool(
+            arm_aware
+            and state_dim == 16
+            and cam_set >= {"left_hand", "right_hand", "head"}
+        )
+        self.left_arm_aware = bool(
+            arm_aware
+            and not self.dual_arm_aware
+            and state_dim == 8
+            and cam_set >= {"left_hand", "head"}
+            and "right_hand" not in cam_set
+        )
+        self.arm_aware = self.dual_arm_aware or self.left_arm_aware
+        img_dim = cond_dim if self.arm_aware else image_out_dim
 
-        def _make_image_encoder() -> ResNet18Encoder:
+        def _make_image_encoder(name: str) -> ResNet18Encoder:
             return ResNet18Encoder(
                 n_obs_steps=n_obs_steps,
-                out_dim=image_out_dim,
+                out_dim=img_dim,
                 pretrained=pretrained_encoder,
                 use_frame_diff=use_frame_diff,
                 use_coord_conv=use_coord_conv,
+                extra_channels=1 if name in self.depth_camera_set else 0,
+                token_grid=self.token_grid,
+                token_dim=cond_dim if self.token_grid > 0 else None,
             )
 
         if share_image_encoder:
-            self.image_encoder = _make_image_encoder()
+            self.image_encoder = _make_image_encoder(self.cameras[0] if self.cameras else "cam0")
         else:
             self.image_encoders = nn.ModuleList(
-                [_make_image_encoder() for _ in range(num_cameras)]
+                [_make_image_encoder(name) for name in self.cameras]
             )
-        self.state_encoder = StateEncoder(state_dim=state_dim, out_dim=state_out_dim)
+        if self.token_grid > 0:
+            self.camera_embed = nn.Parameter(torch.zeros(len(self.cameras), cond_dim))
+            nn.init.normal_(self.camera_embed, std=0.02)
+        else:
+            self.camera_embed = None
 
-        fused_dim = num_cameras * image_out_dim + state_out_dim * n_obs_steps
-        self.proj = nn.Sequential(
-            nn.Linear(fused_dim, cond_dim),
-            nn.ReLU(inplace=True),
-            nn.Linear(cond_dim, cond_dim),
-            nn.ReLU(inplace=True),
-        )
+        if self.dual_arm_aware:
+            half = state_dim // 2
+            self.left_proprio = ProprioEncoder(half, n_obs_steps, cond_dim)
+            self.right_proprio = ProprioEncoder(half, n_obs_steps, cond_dim)
+            self.arm_fuse = nn.ModuleDict(
+                {
+                    "left": nn.Sequential(
+                        nn.Linear(cond_dim * 2, cond_dim),
+                        nn.LayerNorm(cond_dim),
+                        nn.SiLU(),
+                        nn.Linear(cond_dim, cond_dim),
+                    ),
+                    "right": nn.Sequential(
+                        nn.Linear(cond_dim * 2, cond_dim),
+                        nn.LayerNorm(cond_dim),
+                        nn.SiLU(),
+                        nn.Linear(cond_dim, cond_dim),
+                    ),
+                }
+            )
+            self.fuse = nn.Sequential(
+                nn.Linear(cond_dim * 3, cond_dim * 2),
+                nn.LayerNorm(cond_dim * 2),
+                nn.SiLU(),
+                nn.Linear(cond_dim * 2, cond_dim),
+            )
+            self.state_encoder = None
+            self.proj = None
+        elif self.left_arm_aware:
+            self.left_proprio = ProprioEncoder(state_dim, n_obs_steps, cond_dim)
+            self.right_proprio = None
+            self.arm_fuse = nn.ModuleDict(
+                {
+                    "left": nn.Sequential(
+                        nn.Linear(cond_dim * 2, cond_dim),
+                        nn.LayerNorm(cond_dim),
+                        nn.SiLU(),
+                        nn.Linear(cond_dim, cond_dim),
+                    ),
+                }
+            )
+            self.fuse = nn.Sequential(
+                nn.Linear(cond_dim * 2, cond_dim * 2),
+                nn.LayerNorm(cond_dim * 2),
+                nn.SiLU(),
+                nn.Linear(cond_dim * 2, cond_dim),
+            )
+            self.state_encoder = None
+            self.proj = None
+        else:
+            self.left_proprio = None
+            self.right_proprio = None
+            self.arm_fuse = None
+            self.fuse = None
+            self.state_encoder = StateEncoder(state_dim=state_dim, out_dim=state_out_dim)
+            fused_dim = num_cameras * img_dim + state_out_dim * n_obs_steps
+            self.proj = nn.Sequential(
+                nn.Linear(fused_dim, cond_dim),
+                nn.ReLU(inplace=True),
+                nn.Linear(cond_dim, cond_dim),
+                nn.ReLU(inplace=True),
+            )
 
     def vision_parameters(self):
         """Yield visual backbone parameters（供 optimizer 分组）。"""
@@ -280,48 +420,91 @@ class MultiCameraEncoder(nn.Module):
         else:
             yield from self.image_encoders.parameters()
 
-    def _encode_images(self, obs_images: torch.Tensor) -> torch.Tensor:
-        """obs_images (B, Cams, T, 3, H, W) -> (B, Cams * image_out_dim)."""
+    def _encoder_for(self, name: str) -> ResNet18Encoder:
+        if self.share_image_encoder:
+            return self.image_encoder
+        return self.image_encoders[self.cameras.index(name)]
+
+    def _camera_input(
+        self,
+        obs_images: torch.Tensor,
+        cam_idx: int,
+        name: str,
+        obs_depth: torch.Tensor | None,
+    ) -> torch.Tensor:
+        rgb = obs_images[:, cam_idx]
+        if name not in self.depth_camera_set:
+            return rgb
+        if obs_depth is None:
+            raise KeyError(f"Missing obs_depth for depth camera {name!r}")
+        d_idx = self.depth_cameras.index(name)
+        return torch.cat([rgb, obs_depth[:, d_idx]], dim=2)
+
+    def encode_obs(
+        self,
+        obs_images: torch.Tensor,
+        obs_state: torch.Tensor,
+        obs_depth: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
         b, cams, t, _, _, _ = obs_images.shape
         if cams != self.num_cameras:
-            raise ValueError(
-                f"Expected {self.num_cameras} cameras, got {cams}"
-            )
+            raise ValueError(f"Expected {self.num_cameras} cameras, got {cams}")
 
-        if not self.share_image_encoder:
-            cam_feats = [
-                self.image_encoders[c](obs_images[:, c]) for c in range(cams)
-            ]
-            return torch.cat(cam_feats, dim=-1)
+        cam_globals: list[torch.Tensor] = []
+        cam_tokens: list[torch.Tensor] = []
+        use_tokens = self.token_grid > 0
+        can_batch = (
+            self.share_image_encoder
+            and not self.training
+            and not self.depth_camera_set
+        )
+        if can_batch:
+            flat = obs_images.reshape(b * cams, t, *obs_images.shape[3:])
+            g, tok = self.image_encoder.encode(flat)
+            g = g.reshape(b, cams, -1)
+            for i in range(cams):
+                cam_globals.append(g[:, i])
+                if use_tokens and tok is not None:
+                    n_tok = tok.shape[1]
+                    cam_tok = tok.reshape(b, cams, n_tok, tok.shape[-1])[:, i]
+                    cam_tokens.append(cam_tok + self.camera_embed[i].view(1, 1, -1))
+        else:
+            for i, name in enumerate(self.cameras):
+                inp = self._camera_input(obs_images, i, name, obs_depth)
+                g, tok = self._encoder_for(name).encode(inp)
+                cam_globals.append(g)
+                if use_tokens and tok is not None:
+                    cam_tokens.append(tok + self.camera_embed[i].view(1, 1, -1))
 
-        if self.training:
-            # 串行按相机 forward：5060 Ti 上比 B*Cams 一次过更快（激活更贴合 L2），
-            # 且 BN 统计按 batch=B，不混相机。eval 仍用下方 batched 路径。
-            cam_feats = [self.image_encoder(obs_images[:, c]) for c in range(cams)]
-            return torch.cat(cam_feats, dim=-1)
+        vision_tokens = torch.cat(cam_tokens, dim=1) if cam_tokens else None
 
-        # Shared + eval: (B, Cams, ...) -> (B*Cams, ...) for one ResNet pass.
-        flat = obs_images.reshape(b * cams, t, *obs_images.shape[3:])
-        cam_feats = self.image_encoder(flat)
-        return cam_feats.reshape(b, cams, -1).flatten(1)
+        if self.dual_arm_aware:
+            by_name = {name: g for name, g in zip(self.cameras, cam_globals)}
+            left_p = self.left_proprio(obs_state[:, :, :8])
+            right_p = self.right_proprio(obs_state[:, :, 8:])
+            left = self.arm_fuse["left"](torch.cat([by_name["left_hand"], left_p], dim=-1))
+            right = self.arm_fuse["right"](torch.cat([by_name["right_hand"], right_p], dim=-1))
+            global_emb = self.fuse(torch.cat([by_name["head"], left, right], dim=-1))
+        elif self.left_arm_aware:
+            by_name = {name: g for name, g in zip(self.cameras, cam_globals)}
+            left_p = self.left_proprio(obs_state)
+            left = self.arm_fuse["left"](torch.cat([by_name["left_hand"], left_p], dim=-1))
+            global_emb = self.fuse(torch.cat([by_name["head"], left], dim=-1))
+        else:
+            img_feat = torch.cat(cam_globals, dim=-1)
+            state = obs_state.reshape(b * t, -1)
+            state_feat = self.state_encoder(state).reshape(b, -1)
+            global_emb = self.proj(torch.cat([img_feat, state_feat], dim=-1))
+        return global_emb, vision_tokens
 
-    def forward(self, obs_images: torch.Tensor, obs_state: torch.Tensor) -> torch.Tensor:
-        """
-        obs_images: (B, Cams, T, 3, H, W)
-        obs_state: (B, T, state_dim)
-        returns: cond (B, cond_dim)
-
-        Shared encoder — train: per-camera serial (BN batch = B);
-        eval: cameras stacked on batch (B*Cams). Separate encoders always serial.
-        """
-        b, _, t, _, _, _ = obs_images.shape
-        img_feat = self._encode_images(obs_images)
-
-        state = obs_state.reshape(b * t, -1)
-        state_feat = self.state_encoder(state).reshape(b, -1)
-
-        fused = torch.cat([img_feat, state_feat], dim=-1)
-        return self.proj(fused)
+    def forward(
+        self,
+        obs_images: torch.Tensor,
+        obs_state: torch.Tensor,
+        obs_depth: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        global_emb, _ = self.encode_obs(obs_images, obs_state, obs_depth)
+        return global_emb
 
 
 def build_multi_camera_encoder(
@@ -337,13 +520,20 @@ def build_multi_camera_encoder(
     use_frame_diff: bool = True,
     use_coord_conv: bool = False,
     share_image_encoder: bool = True,
+    cameras: tuple[str, ...] | list[str] | None = None,
+    depth_cameras: tuple[str, ...] | list[str] = (),
+    arm_aware: bool = False,
+    token_grid: int = 0,
 ) -> nn.Module:
     """按 ``vision_backbone`` 构造多相机观测编码器（输出 ``cond``）。
 
     支持：``resnet18`` / ``slowfast_r50`` / ``vit_b_16`` / ``pa2``。
-    ``use_coord_conv`` 仅作用于 ResNet 路径。
+    ``use_coord_conv`` / RGB-D / arm_aware / tokens 仅作用于 ResNet 路径。
     """
     backbone = vision_backbone.lower()
+    depth_cameras = tuple(depth_cameras)
+    if depth_cameras and backbone not in {"resnet18", "resnet"}:
+        raise ValueError("RGB-D early fusion is only supported for vision_backbone=resnet18")
     if backbone in {"resnet18", "resnet"}:
         return MultiCameraEncoder(
             num_cameras=num_cameras,
@@ -356,6 +546,10 @@ def build_multi_camera_encoder(
             use_frame_diff=use_frame_diff,
             use_coord_conv=use_coord_conv,
             share_image_encoder=share_image_encoder,
+            cameras=cameras,
+            depth_cameras=depth_cameras,
+            arm_aware=arm_aware,
+            token_grid=token_grid,
         )
     if backbone in {"slowfast_r50", "slowfast"}:
         from robotfm.policies.video_encoders import MultiCameraSlowFastEncoder

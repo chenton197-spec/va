@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import numpy as np
 import torch
-import torchcfm.conditional_flow_matching as cfm
 
 
 class BaseFlowMatcher:
@@ -67,14 +66,24 @@ class TorchFlowMatcher(BaseFlowMatcher):
         return x
 
 
+def _torchcfm():
+    try:
+        import torchcfm.conditional_flow_matching as cfm
+    except ImportError as exc:
+        raise ImportError(
+            "a2a/n_a2a mlp and OT-CFM require torchcfm; pip install torchcfm"
+        ) from exc
+    return cfm
+
+
 class ConditionalFlowMatcher(TorchFlowMatcher):
     def __init__(self, num_sampling_steps=6, **kwargs):
-        super().__init__(cfm.ConditionalFlowMatcher(**kwargs), num_sampling_steps)
+        super().__init__(_torchcfm().ConditionalFlowMatcher(**kwargs), num_sampling_steps)
 
 
 class ExactOptimalTransportConditionalFlowMatcher(TorchFlowMatcher):
     def __init__(self, num_sampling_steps=6, **kwargs):
         super().__init__(
-            cfm.ExactOptimalTransportConditionalFlowMatcher(**kwargs),
+            _torchcfm().ExactOptimalTransportConditionalFlowMatcher(**kwargs),
             num_sampling_steps,
         )

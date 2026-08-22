@@ -1,0 +1,40 @@
+checkpoint: outputs/a2a_noise_limits_openarm_hcx_dual_arm_with_depth_left_nobs1_statedrop_260821101615/checkpoint_final2A.pt
+config: outputs/a2a_noise_limits_openarm_hcx_dual_arm_with_depth_left_nobs1_statedrop_260821101615/config.yaml
+
+teleop_yaml: teleop_project/teleop.yaml
+
+obs_mode: after_action
+
+display_cameras: false
+
+max_steps: 50000
+
+obs_fps: 15
+exec_action_steps: 4
+rtc:
+  enabled: false
+  guidance_enabled: true
+  inference_delay: 2
+  execution_horizon: 4
+
+start_pose:
+  left_joints_deg: null
+  right_joints_deg: null
+  left_gripper: 0.923
+  right_gripper: 1.0
+  gripper_ramp_s: 0.9
+
+joint_limits_deg:
+  min: [-169.0, -100.0, -169.0, -139.0, -169.0, -54.0, -59.0]
+  max: [169.0, 100.0, 169.0, 54.0, 169.0, 54.0, 59.0]
+
+move_joints:
+  speed_ratio: 0.9
+  acceleration_seconds: 0.1
+  deceleration_seconds: 0.1
+  feedback_confirm_timeout_s: 30.0
+  feedback_confirm_poll_interval_s: 0.005
+  angle_tolerance_deg: 0.2
+  feedback_confirm: true
+  interrupt: false
+  max_delta_deg: 12.0

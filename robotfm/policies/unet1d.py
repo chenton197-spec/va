@@ -115,6 +115,74 @@ class ConditionalResidualBlock1D(nn.Module):
         return out + self.residual_conv(x)
 
 
+class TemporalTransformerBlock(nn.Module):
+    def __init__(self, dim: int, num_heads: int = 4, dropout: float = 0.0) -> None:
+        super().__init__()
+        self.norm1 = nn.LayerNorm(dim)
+        self.attn = nn.MultiheadAttention(
+            embed_dim=dim, num_heads=num_heads, dropout=dropout, batch_first=True
+        )
+        self.norm2 = nn.LayerNorm(dim)
+        self.ff = nn.Sequential(
+            nn.Linear(dim, dim * 4),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(dim * 4, dim),
+            nn.Dropout(dropout),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        h = x.permute(0, 2, 1).contiguous()
+        n = self.norm1(h)
+        attn_out, _ = self.attn(n, n, n, need_weights=False)
+        h = h + attn_out
+        h = h + self.ff(self.norm2(h))
+        return h.permute(0, 2, 1).contiguous()
+
+
+class ActionVisionCrossAttention(nn.Module):
+    def __init__(
+        self,
+        action_dim: int,
+        vision_dim: int,
+        num_heads: int = 8,
+        dropout: float = 0.0,
+    ) -> None:
+        super().__init__()
+        if action_dim % num_heads != 0:
+            raise ValueError(
+                f"action_dim={action_dim} must be divisible by num_heads={num_heads}"
+            )
+        self.norm_q = nn.LayerNorm(action_dim)
+        self.norm_kv = nn.LayerNorm(vision_dim)
+        self.kv_proj = (
+            nn.Identity() if vision_dim == action_dim else nn.Linear(vision_dim, action_dim)
+        )
+        self.attn = nn.MultiheadAttention(
+            embed_dim=action_dim,
+            num_heads=num_heads,
+            dropout=dropout,
+            batch_first=True,
+        )
+        self.norm_ff = nn.LayerNorm(action_dim)
+        self.ff = nn.Sequential(
+            nn.Linear(action_dim, action_dim * 4),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(action_dim * 4, action_dim),
+            nn.Dropout(dropout),
+        )
+
+    def forward(self, action_feat: torch.Tensor, vision_tokens: torch.Tensor) -> torch.Tensor:
+        h = action_feat.permute(0, 2, 1).contiguous()
+        q = self.norm_q(h)
+        kv = self.kv_proj(self.norm_kv(vision_tokens))
+        attn_out, _ = self.attn(q, kv, kv, need_weights=False)
+        h = h + attn_out
+        h = h + self.ff(self.norm_ff(h))
+        return h.permute(0, 2, 1).contiguous()
+
+
 class ConditionalUnet1D(nn.Module):
     """条件 1D UNet：预测 action chunk 上的速度场。
 
@@ -136,6 +204,11 @@ class ConditionalUnet1D(nn.Module):
         kernel_size: int = 5,
         n_groups: int = 8,
         cond_predict_scale: bool = True,
+        use_temporal_attn: bool = False,
+        use_cross_attn: bool = False,
+        vision_dim: int | None = None,
+        attn_dropout: float = 0.0,
+        cross_attn_heads: int = 8,
     ) -> None:
         super().__init__()
         all_dims = [input_dim, *list(down_dims)]
@@ -228,6 +301,26 @@ class ConditionalUnet1D(nn.Module):
             )
         self.up_modules = nn.ModuleList(up_modules)
 
+        bottleneck = down_dims[-1]
+        self.temporal_attn = (
+            TemporalTransformerBlock(bottleneck, num_heads=4, dropout=attn_dropout)
+            if use_temporal_attn
+            else None
+        )
+        if use_cross_attn:
+            vdim = int(vision_dim) if vision_dim is not None else global_cond_dim
+            heads = min(int(cross_attn_heads), max(1, bottleneck // 64))
+            while heads > 1 and bottleneck % heads != 0:
+                heads -= 1
+            self.cross_attn = ActionVisionCrossAttention(
+                action_dim=bottleneck,
+                vision_dim=vdim,
+                num_heads=max(1, heads),
+                dropout=attn_dropout,
+            )
+        else:
+            self.cross_attn = None
+
         self.final_conv = nn.Sequential(
             Conv1dBlock(start_dim, start_dim, kernel_size=kernel_size),
             nn.Conv1d(start_dim, input_dim, 1),
@@ -238,6 +331,7 @@ class ConditionalUnet1D(nn.Module):
         sample: torch.Tensor,
         timestep: torch.Tensor,
         global_cond: torch.Tensor,
+        vision_tokens: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """前向：对噪声动作序列预测速度场（或噪声残差）。
 
@@ -288,6 +382,10 @@ class ConditionalUnet1D(nn.Module):
         # ------------------------------------------------------------------
         for mid in self.mid_modules:
             x = mid(x, cond)
+        if self.temporal_attn is not None:
+            x = self.temporal_attn(x)
+        if self.cross_attn is not None and vision_tokens is not None:
+            x = self.cross_attn(x, vision_tokens)
 
         # ------------------------------------------------------------------
         # 5) Decoder（上采样路径）

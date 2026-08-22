@@ -28,6 +28,7 @@ class Observation:
     images: dict[str, np.ndarray]
     state: np.ndarray
     timestamp: float | None = None
+    depths: dict[str, np.ndarray] | None = None
 
     def validate(self, camera_names: list[str], state_dim: int) -> None:
         """校验观测是否符合 meta.json 中声明的相机和状态维度。"""

@@ -43,12 +43,12 @@ def build_episode_dataset(run_dir: Path, **kwargs):
     return EpisodeDataset(run_dir=run_dir, **kwargs)
 
 
-def resize_images(images: torch.Tensor, size: int | None) -> torch.Tensor:
-    """双线性缩放到 ``size×size``。
+def resize_images(images: torch.Tensor, size: int | None, mode: str = "bilinear") -> torch.Tensor:
+    """缩放到 ``size×size``。
 
     支持形状:
-      - (T, 3, H, W)
-      - (Cams, T, 3, H, W)
+      - (T, C, H, W)
+      - (Cams, T, C, H, W)
     """
     if size is None:
         return images
@@ -56,9 +56,12 @@ def resize_images(images: torch.Tensor, size: int | None) -> torch.Tensor:
     if h == size and w == size:
         return images
     flat = images.reshape(-1, c, h, w)
-    flat = torch.nn.functional.interpolate(
-        flat, size=(size, size), mode="bilinear", align_corners=False
-    )
+    if mode == "nearest":
+        flat = torch.nn.functional.interpolate(flat, size=(size, size), mode="nearest")
+    else:
+        flat = torch.nn.functional.interpolate(
+            flat, size=(size, size), mode="bilinear", align_corners=False
+        )
     return flat.reshape(*lead, c, size, size)
 
 
@@ -69,6 +72,7 @@ def spatial_preprocess_images(
     resize_size: int | None = None,
     crop_size: int | None = None,
     random_crop: bool = False,
+    resize_mode: str = "bilinear",
 ) -> torch.Tensor:
     """统一空间预处理：中心 pre_crop → resize → 可选 crop。
 
@@ -77,18 +81,34 @@ def spatial_preprocess_images(
     """
     if pre_crop_size is not None:
         images = crop_images(images, pre_crop_size, random=False)
-    images = resize_images(images, resize_size)
+    images = resize_images(images, resize_size, mode=resize_mode)
     if crop_size is not None:
         images = crop_images(images, crop_size, random=random_crop)
     return images
+
+
+def crop_hw_box(h: int, w: int, crop_size: int, random: bool) -> tuple[int, int]:
+    if h < crop_size or w < crop_size:
+        raise ValueError(f"Cannot crop {h}x{w} to {crop_size}")
+    if random:
+        top = int(torch.randint(0, h - crop_size + 1, (1,)).item())
+        left = int(torch.randint(0, w - crop_size + 1, (1,)).item())
+    else:
+        top = (h - crop_size) // 2
+        left = (w - crop_size) // 2
+    return top, left
+
+
+def apply_hw_crop(images: torch.Tensor, top: int, left: int, crop_size: int) -> torch.Tensor:
+    return images[..., top : top + crop_size, left : left + crop_size]
 
 
 def crop_images(images: torch.Tensor, crop_size: int | None, random: bool) -> torch.Tensor:
     """对 CHW 图像张量做空间裁剪。
 
     支持形状:
-      - (T, 3, H, W)
-      - (Cams, T, 3, H, W)
+      - (T, C, H, W)
+      - (Cams, T, C, H, W)
 
     ``crop_size is None`` 或等于 H/W 时原样返回。
     """
@@ -97,19 +117,8 @@ def crop_images(images: torch.Tensor, crop_size: int | None, random: bool) -> to
     *lead, c, h, w = images.shape
     if h == crop_size and w == crop_size:
         return images
-    if h < crop_size or w < crop_size:
-        raise ValueError(f"Cannot crop {h}x{w} to {crop_size}")
-
-    if random:
-        # 训练：随机裁剪做数据增强
-        top = int(torch.randint(0, h - crop_size + 1, (1,)).item())
-        left = int(torch.randint(0, w - crop_size + 1, (1,)).item())
-    else:
-        # 评估：中心裁剪，保证可复现
-        top = (h - crop_size) // 2
-        left = (w - crop_size) // 2
-
-    return images[..., top : top + crop_size, left : left + crop_size]
+    top, left = crop_hw_box(h, w, crop_size, random)
+    return apply_hw_crop(images, top, left, crop_size)
 
 
 def color_jitter_images(
@@ -153,40 +162,53 @@ def color_jitter_images(
     return flat.clamp(0.0, 1.0).reshape(*lead, c, h, w)
 
 
+def crop_offsets_batch(
+    batch_size: int,
+    h: int,
+    w: int,
+    crop_size: int,
+    random: bool,
+    device: torch.device,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    if h < crop_size or w < crop_size:
+        raise ValueError(f"Cannot crop {h}x{w} to {crop_size}")
+    if random:
+        tops = torch.randint(0, h - crop_size + 1, (batch_size,), device=device)
+        lefts = torch.randint(0, w - crop_size + 1, (batch_size,), device=device)
+    else:
+        tops = torch.full((batch_size,), (h - crop_size) // 2, device=device, dtype=torch.long)
+        lefts = torch.full((batch_size,), (w - crop_size) // 2, device=device, dtype=torch.long)
+    return tops, lefts
+
+
+def apply_crop_offsets_batch(
+    images: torch.Tensor, tops: torch.Tensor, lefts: torch.Tensor, crop_size: int
+) -> torch.Tensor:
+    b = images.shape[0]
+    out = images.new_empty(*images.shape[:-2], crop_size, crop_size)
+    for i in range(b):
+        top = int(tops[i])
+        left = int(lefts[i])
+        out[i] = images[i, ..., top : top + crop_size, left : left + crop_size]
+    return out
+
+
 def crop_images_batch(
     images: torch.Tensor, crop_size: int | None, random: bool
 ) -> torch.Tensor:
-    """Batched spatial crop for ``(B, Cams, T, 3, H, W)``.
+    """Batched spatial crop for ``(B, Cams, T, C, H, W)``.
 
     Each batch item gets its own crop window; cams/T within an item share it.
     """
     if crop_size is None:
         return images
     if images.ndim != 6:
-        raise ValueError(f"Expected (B,Cams,T,3,H,W), got shape {tuple(images.shape)}")
-    b, cams, t, c, h, w = images.shape
+        raise ValueError(f"Expected (B,Cams,T,C,H,W), got shape {tuple(images.shape)}")
+    b, _cams, _t, _c, h, w = images.shape
     if h == crop_size and w == crop_size:
         return images
-    if h < crop_size or w < crop_size:
-        raise ValueError(f"Cannot crop {h}x{w} to {crop_size}")
-
-    if random:
-        tops = torch.randint(0, h - crop_size + 1, (b,), device=images.device)
-        lefts = torch.randint(0, w - crop_size + 1, (b,), device=images.device)
-    else:
-        tops = torch.full(
-            (b,), (h - crop_size) // 2, device=images.device, dtype=torch.long
-        )
-        lefts = torch.full(
-            (b,), (w - crop_size) // 2, device=images.device, dtype=torch.long
-        )
-
-    out = images.new_empty(b, cams, t, c, crop_size, crop_size)
-    for i in range(b):
-        top = int(tops[i])
-        left = int(lefts[i])
-        out[i] = images[i, ..., top : top + crop_size, left : left + crop_size]
-    return out
+    tops, lefts = crop_offsets_batch(b, h, w, crop_size, random, images.device)
+    return apply_crop_offsets_batch(images, tops, lefts, crop_size)
 
 
 _LUMA_WEIGHTS = (0.2989, 0.5870, 0.1140)
@@ -322,9 +344,30 @@ def apply_image_augments_batch(
     contrast: float = 0.0,
     saturation: float = 0.0,
     hue: float = 0.0,
-) -> torch.Tensor:
-    """GPU/CPU batch crop (+ optional color jitter when ``random_crop``)."""
-    images = crop_images_batch(images, crop_size, random=random_crop)
+    depths: torch.Tensor | None = None,
+) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+    """GPU/CPU batch crop (+ optional color jitter when ``random_crop``).
+
+    If ``depths`` is given, it is cropped with the same per-sample window and
+    returned as the second value (no color jitter).
+    """
+    if crop_size is not None and images.ndim == 6:
+        h, w = images.shape[-2], images.shape[-1]
+        if h != crop_size or w != crop_size:
+            tops, lefts = crop_offsets_batch(
+                images.shape[0], h, w, crop_size, random_crop, images.device
+            )
+            images = apply_crop_offsets_batch(images, tops, lefts, crop_size)
+            if depths is not None:
+                depths = apply_crop_offsets_batch(depths, tops, lefts, crop_size)
+        elif depths is not None and (
+            depths.shape[-2] != crop_size or depths.shape[-1] != crop_size
+        ):
+            depths = crop_images_batch(depths, crop_size, random=False)
+    else:
+        images = crop_images_batch(images, crop_size, random=random_crop)
+        if depths is not None:
+            depths = crop_images_batch(depths, crop_size, random=False)
     if random_crop:
         images = color_jitter_images_batch(
             images,
@@ -333,7 +376,9 @@ def apply_image_augments_batch(
             saturation=saturation,
             hue=hue,
         )
-    return images
+    if depths is None:
+        return images
+    return images, depths
 
 
 def camera_dropout_prob(
@@ -515,6 +560,9 @@ class EpisodeDataset(Dataset):
         uint8_cache: bool = False,
         uint8_cache_dir: str | Path | None = None,
         predict_joint_delta: bool = False,
+        depth_cameras: tuple[str, ...] | list[str] = (),
+        depth_min_mm: float = 50.0,
+        depth_max_mm: float = 500.0,
     ) -> None:
         self.run_dir = Path(run_dir)
         self.meta = load_meta(self.run_dir)
@@ -545,6 +593,9 @@ class EpisodeDataset(Dataset):
         self.color_jitter_hue = color_jitter_hue
         self.defer_augment = bool(defer_augment)
         self.predict_joint_delta = bool(predict_joint_delta)
+        _ = depth_cameras
+        _ = depth_min_mm
+        _ = depth_max_mm
         self._joint_mask = joint_mask_from_names(self.meta.action_names, self.meta.action_dim)
         if self.predict_joint_delta and self.meta.state_dim != self.meta.action_dim:
             raise ValueError(

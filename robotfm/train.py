@@ -233,6 +233,13 @@ def _load_resume_checkpoint(
     return start_step, stats if stats is not None else None
 
 
+def _norm_policy_type(ptype: str) -> str:
+    t = str(ptype).lower().replace("-", "_")
+    if t == "a2au":
+        return "a2a_u"
+    return t
+
+
 def _build_a2a_policy(cfg: RobotFMConfig) -> torch.nn.Module:
     try:
         from robotfm.policies.a2a import A2AConfig, A2APolicy
@@ -241,7 +248,7 @@ def _build_a2a_policy(cfg: RobotFMConfig) -> torch.nn.Module:
             "policy.type a2a/n_a2a requires torchcfm; pip install torchcfm"
         ) from exc
 
-    ptype = cfg.policy.type.lower()
+    ptype = _norm_policy_type(cfg.policy.type)
     history_noise_std = cfg.policy.history_noise_std
     use_ot = ptype == "n_a2a"
     if ptype == "n_a2a" and history_noise_std <= 0:
@@ -281,6 +288,42 @@ def _build_a2a_policy(cfg: RobotFMConfig) -> torch.nn.Module:
         rtc=rtc if rtc.enabled else None,
     )
     return A2APolicy(a2a_cfg)
+
+
+def _build_a2a_u_policy(cfg: RobotFMConfig) -> torch.nn.Module:
+    from robotfm.policies.a2a.a2a_u_policy import A2AUConfig, A2AUPolicy
+
+    rtc = _normalize_rtc_config(cfg.policy.rtc)
+    a2a_u_cfg = A2AUConfig(
+        num_cameras=len(cfg.cameras),
+        state_dim=cfg.state_dim,
+        action_dim=cfg.action_dim,
+        horizon=cfg.dataset.horizon,
+        n_obs_steps=cfg.dataset.n_obs_steps,
+        n_action_steps=cfg.policy.n_action_steps,
+        hidden_dim=cfg.policy.hidden_dim,
+        num_inference_steps=cfg.policy.num_inference_steps,
+        history_noise_std=cfg.policy.history_noise_std,
+        use_ot_matcher=cfg.policy.use_ot_matcher,
+        pretrained_encoder=cfg.policy.pretrained_encoder,
+        use_frame_diff=cfg.policy.use_frame_diff,
+        use_coord_conv=cfg.policy.use_coord_conv,
+        share_image_encoder=cfg.policy.share_image_encoder,
+        vision_backbone=cfg.policy.vision_backbone,
+        rtc=rtc if rtc.enabled else None,
+        cameras=tuple(cfg.cameras),
+        depth_cameras=tuple(cfg.dataset.depth_cameras),
+        arm_aware=cfg.policy.arm_aware,
+        token_grid=cfg.policy.token_grid,
+        use_temporal_attn=cfg.policy.use_temporal_attn,
+        use_cross_attn=cfg.policy.use_cross_attn,
+        down_dims=tuple(cfg.policy.down_dims),
+        diffusion_step_embed_dim=cfg.policy.diffusion_step_embed_dim,
+        kernel_size=cfg.policy.kernel_size,
+        n_groups=cfg.policy.n_groups,
+        action_names=tuple(cfg.action_names) if cfg.action_names else None,
+    )
+    return A2AUPolicy(a2a_u_cfg)
 
 
 def _build_vita_policy(cfg: RobotFMConfig) -> VITAPolicy:
@@ -361,9 +404,11 @@ def build_policy(cfg: RobotFMConfig, stats: dict | None = None) -> PolicyModule:
 
     ``stats`` 在 ACT + ``image_norm_mode=dataset`` 时必需（提供 image_mean/std）。
     """
-    ptype = cfg.policy.type.lower()
+    ptype = _norm_policy_type(cfg.policy.type)
     if ptype in {"a2a", "n_a2a"}:
         return _build_a2a_policy(cfg)
+    if ptype == "a2a_u":
+        return _build_a2a_u_policy(cfg)
     if ptype == "vita":
         return _build_vita_policy(cfg)
     if ptype == "act":
@@ -425,6 +470,33 @@ def _build_optimizer(policy: PolicyModule, cfg: RobotFMConfig) -> torch.optim.Op
 
 
 _LOSS_TERM_KEYS = ("flow", "consistency", "enc_recon", "flow_recon")
+
+
+def _apply_obs_augments(
+    batch: dict[str, torch.Tensor],
+    *,
+    crop_size: int | None,
+    random_crop: bool,
+    brightness: float = 0.0,
+    contrast: float = 0.0,
+    saturation: float = 0.0,
+    hue: float = 0.0,
+) -> None:
+    depths = batch.get("obs_depth")
+    out = apply_image_augments_batch(
+        batch["obs_images"],
+        crop_size=crop_size,
+        random_crop=random_crop,
+        brightness=brightness,
+        contrast=contrast,
+        saturation=saturation,
+        hue=hue,
+        depths=depths,
+    )
+    if depths is None:
+        batch["obs_images"] = out
+    else:
+        batch["obs_images"], batch["obs_depth"] = out
 
 
 def _unpack_policy_loss(
@@ -495,6 +567,9 @@ def _build_val_loader(
         uint8_cache=False,
         uint8_cache_dir=None,
         predict_joint_delta=bool(cfg.policy.predict_joint_delta),
+        depth_cameras=tuple(cfg.dataset.depth_cameras),
+        depth_min_mm=cfg.dataset.depth_min_mm,
+        depth_max_mm=cfg.dataset.depth_max_mm,
     )
     loader_kwargs: dict = {
         "batch_size": cfg.train.batch_size,
@@ -558,14 +633,10 @@ def _evaluate_val_mae(
             batch = {k: v.to(device, non_blocking=True) for k, v in batch.items()}
             batch["obs_images"] = images_to_float01(batch["obs_images"])
             if gpu_augment and cfg.dataset.crop_size is not None and cfg.dataset.eval_fixed_crop:
-                batch["obs_images"] = apply_image_augments_batch(
-                    batch["obs_images"],
+                _apply_obs_augments(
+                    batch,
                     crop_size=cfg.dataset.crop_size,
                     random_crop=False,
-                    brightness=0.0,
-                    contrast=0.0,
-                    saturation=0.0,
-                    hue=0.0,
                 )
             with torch.amp.autocast("cuda", enabled=use_amp):
                 loss, terms = _unpack_policy_loss(raw.compute_loss(batch))
@@ -812,6 +883,9 @@ def train_flow_matching(
             uint8_cache=bool(cfg.dataset.uint8_cache),
             uint8_cache_dir=cfg.dataset.uint8_cache_dir,
             predict_joint_delta=bool(cfg.policy.predict_joint_delta),
+            depth_cameras=tuple(cfg.dataset.depth_cameras),
+            depth_min_mm=cfg.dataset.depth_min_mm,
+            depth_max_mm=cfg.dataset.depth_max_mm,
         )
         logger.log(f"dataset: run_dir={run_dir} num_samples={len(dataset)}")
         probe = dataset[0]
@@ -987,8 +1061,8 @@ def train_flow_matching(
                 batch = {k: v.to(device, non_blocking=True) for k, v in batch.items()}
                 batch["obs_images"] = images_to_float01(batch["obs_images"])
                 if gpu_augment:
-                    batch["obs_images"] = apply_image_augments_batch(
-                        batch["obs_images"],
+                    _apply_obs_augments(
+                        batch,
                         crop_size=cfg.dataset.crop_size,
                         random_crop=True,
                         brightness=cfg.dataset.color_jitter_brightness,
