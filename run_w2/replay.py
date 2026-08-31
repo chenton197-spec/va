@@ -23,7 +23,7 @@ import yaml
 VA_ROOT = Path(__file__).resolve().parents[1]
 SCRIPT_DIR = Path(__file__).resolve().parent
 DEFAULT_REPLAY_YAML = SCRIPT_DIR / "replay.yaml"
-TELEOP_ROOT = VA_ROOT / "teleop_project"
+TELEOP_ROOT = VA_ROOT.parent / "teleop_project"
 
 CAMERA_COLUMNS = (
     "observation.images.head",
@@ -37,7 +37,7 @@ CAMERA_WINDOWS = {
 }
 
 if not TELEOP_ROOT.is_dir():
-    raise FileNotFoundError(f"找不到 in-repo teleop_project: {TELEOP_ROOT}")
+    raise FileNotFoundError(f"找不到 teleop_project: {TELEOP_ROOT}")
 if str(TELEOP_ROOT) not in sys.path:
     sys.path.insert(0, str(TELEOP_ROOT))
 
@@ -122,7 +122,11 @@ class BackgroundGripperLoop:
 def _resolve_path(value: str | Path, *, base: Path) -> Path:
     path = Path(value)
     if not path.is_absolute():
-        path = base / path
+        parts = path.parts
+        if parts and parts[0] == "teleop_project":
+            path = TELEOP_ROOT.joinpath(*parts[1:])
+        else:
+            path = base / path
     return path.expanduser().resolve()
 
 

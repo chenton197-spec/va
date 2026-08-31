@@ -42,9 +42,9 @@ import yaml
 VA_ROOT = Path(__file__).resolve().parents[1]
 SCRIPT_DIR = Path(__file__).resolve().parent
 DEFAULT_DEPLOY_YAML = SCRIPT_DIR / "servo_deploy_a2a_depth_left.yaml"
-TELEOP_ROOT = VA_ROOT / "teleop_project"
+TELEOP_ROOT = VA_ROOT.parent / "teleop_project"
 if not TELEOP_ROOT.is_dir():
-    raise FileNotFoundError(f"找不到 in-repo teleop_project: {TELEOP_ROOT}")
+    raise FileNotFoundError(f"找不到 teleop_project: {TELEOP_ROOT}")
 
 for p in (TELEOP_ROOT, VA_ROOT):
     s = str(p)
@@ -444,7 +444,7 @@ def _load_servo_section(deploy_path: Path) -> dict[str, Any]:
 
 
 def _resolve_teleop_yaml(deploy: dict[str, Any]) -> Path:
-    """优先用 deploy.yaml 的 teleop_yaml；缺失时回退到 in-repo teleop_project。"""
+    """优先用 deploy.yaml 的 teleop_yaml；缺失时回退到 TELEOP_ROOT/teleop.yaml。"""
     p = Path(deploy["teleop_yaml"])
     if p.is_file():
         return p

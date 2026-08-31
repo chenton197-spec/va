@@ -1,4 +1,0 @@
-# Alicia-D leader adapter.
--r requirements.txt
-
-alicia_d_sdk

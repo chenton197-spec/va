@@ -19,11 +19,11 @@ import torch
 import yaml
 
 VA_ROOT = Path(__file__).resolve().parents[1]
-TELEOP_ROOT = VA_ROOT / "teleop_project"
+TELEOP_ROOT = VA_ROOT.parent / "teleop_project"
 SCRIPT_DIR = Path(__file__).resolve().parent
 DEPLOY_YAML = SCRIPT_DIR / "deploy.yaml"
 if not TELEOP_ROOT.is_dir():
-    raise FileNotFoundError(f"找不到 in-repo teleop_project: {TELEOP_ROOT}")
+    raise FileNotFoundError(f"找不到 teleop_project: {TELEOP_ROOT}")
 
 if str(TELEOP_ROOT) not in sys.path:
     sys.path.insert(0, str(TELEOP_ROOT))
@@ -50,7 +50,7 @@ def _resolve_path(value: str | Path, *, base: Path) -> Path:
 
 
 def _resolve_teleop_yaml(value: str | Path) -> Path:
-    """相对路径里的 teleop.yaml 指向仓库内 teleop_project。"""
+    """相对路径里的 teleop.yaml 指向 TELEOP_ROOT。"""
     path = Path(value)
     if path.is_absolute():
         return path

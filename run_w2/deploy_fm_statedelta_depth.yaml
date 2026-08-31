@@ -1,0 +1,36 @@
+checkpoint: outputs/fm_openarm_hcx_dual_arm_with_out_room_s_depth_nobs1_h60_nact16_statedelta_260830124458/checkpoint_final.pt
+config: outputs/fm_openarm_hcx_dual_arm_with_out_room_s_depth_nobs1_h60_nact16_statedelta_260830124458/config.yaml
+
+teleop_yaml: teleop_project/teleop.yaml
+
+obs_mode: after_action
+display_cameras: false
+max_steps: 50000
+exec_action_steps: 1
+rtc:
+  enabled: false
+  guidance_enabled: false
+  inference_delay: 2
+  execution_horizon: 8
+
+start_pose:
+  left_joints_deg: null
+  right_joints_deg: null
+  left_gripper: 1.0
+  right_gripper: 1.0
+  gripper_ramp_s: 0.9
+
+joint_limits_deg:
+  min: [-169.0, -100.0, -169.0, -139.0, -169.0, -54.0, -59.0]
+  max: [169.0, 100.0, 169.0, 54.0, 169.0, 54.0, 59.0]
+
+move_joints:
+  speed_ratio: 0.1
+  acceleration_seconds: 0.3
+  deceleration_seconds: 0.3
+  feedback_confirm_timeout_s: 30.0
+  feedback_confirm_poll_interval_s: 0.05
+  angle_tolerance_deg: 0.02
+  feedback_confirm: true
+  interrupt: false
+  max_delta_deg: 12.0

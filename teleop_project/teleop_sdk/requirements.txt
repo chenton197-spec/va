@@ -1,2 +1,0 @@
-alicia_d_sdk
-PyYAML
