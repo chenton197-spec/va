@@ -5,7 +5,7 @@ import argparse
 import math
 import sys
 import time
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 
@@ -462,36 +462,214 @@ class DualStepObservationQueue(StepObservationQueue):
         )
 
 
-def main() -> None:
-    args = _parse_args()
-    deploy_path = Path(args.deploy)
-    if not deploy_path.is_absolute():
-        deploy_path = _resolve_path(deploy_path, base=VA_ROOT)
-    deploy = _load_deploy_config(deploy_path)
+@dataclass
+class PolicyStack:
+    policy: Any
+    cfg: Any
+    stats: dict
+    device: torch.device
+    cameras: list[str]
+    layout: str
+    norm_mode: str
+    n_obs: int
+    n_action_steps: int
+    predict_joint_delta: bool
+    joint_mask: np.ndarray
+    depth_cameras: list[str]
+    expected_scale_mm: dict[str, float]
+    depth_min_mm: float
+    depth_max_mm: float
+    image_size: int | list[int] | None
+    source_id: tuple[Any, ...]
+    ckpt_path: Path
+    train_cfg_path: Path | None
+    train_history_noise: float
 
+
+_RUNTIME_DEPLOY_KEYS = (
+    "exec_action_steps",
+    "max_steps",
+    "move_speed_ratio",
+    "move_acceleration_seconds",
+    "move_deceleration_seconds",
+    "move_feedback_confirm_timeout_s",
+    "move_feedback_confirm_poll_interval_s",
+    "move_angle_tolerance_deg",
+    "move_max_delta_deg",
+    "move_feedback_confirm",
+    "move_interrupt",
+    "joint_limits_min_deg",
+    "joint_limits_max_deg",
+    "checkpoint",
+    "config",
+    "rtc",
+)
+
+_STICKY_DEPLOY_KEYS = (
+    ("teleop_yaml", "teleop_yaml"),
+    ("display_cameras", "display_cameras"),
+    ("obs_mode", "obs_mode"),
+    ("left_start_joints_deg", "start_pose.left_joints_deg"),
+    ("right_start_joints_deg", "start_pose.right_joints_deg"),
+    ("left_start_gripper", "start_pose.left_gripper"),
+    ("right_start_gripper", "start_pose.right_gripper"),
+    ("start_gripper_ramp_s", "start_pose.gripper_ramp_s"),
+)
+
+
+def _file_identity(path: Path | None) -> tuple[Any, ...]:
+    if path is None:
+        return (None, None, None)
+    try:
+        st = path.stat()
+    except OSError:
+        return (str(path), None, None)
+    return (str(path.resolve()), int(st.st_mtime_ns), int(st.st_size))
+
+
+def _policy_source_id(deploy: dict[str, Any]) -> tuple[Any, ...]:
     ckpt_path = deploy["checkpoint"]
-    teleop_yaml = deploy["teleop_yaml"]
+    train_cfg_path = _resolve_train_config(ckpt_path, deploy["config"])
+    return (_file_identity(ckpt_path), _file_identity(train_cfg_path))
+
+
+def _refresh_deploy(path: Path, previous: dict[str, Any]) -> dict[str, Any]:
+    try:
+        return _load_deploy_config(path)
+    except Exception as exc:
+        print(f"[WARN] 部署配置刷新失败，沿用上次: {exc}", flush=True)
+        return previous
+
+
+def _values_equal(a: Any, b: Any) -> bool:
+    if isinstance(a, np.ndarray) or isinstance(b, np.ndarray):
+        try:
+            return bool(np.array_equal(np.asarray(a), np.asarray(b)))
+        except Exception:
+            return False
+    if isinstance(a, Path) or isinstance(b, Path):
+        return a == b
+    if isinstance(a, dict) and isinstance(b, dict):
+        if a.keys() != b.keys():
+            return False
+        return all(_values_equal(a[k], b[k]) for k in a)
+    if isinstance(a, (list, tuple)) and isinstance(b, (list, tuple)):
+        if len(a) != len(b):
+            return False
+        return all(_values_equal(x, y) for x, y in zip(a, b))
+    return a == b
+
+
+def _fmt_deploy_val(value: Any) -> str:
+    if isinstance(value, np.ndarray):
+        return _fmt_deploy_val(value.tolist())
+    if isinstance(value, Path):
+        return str(value)
+    if isinstance(value, float):
+        return f"{value:g}"
+    if isinstance(value, dict):
+        inner = ", ".join(f"{k}={_fmt_deploy_val(v)}" for k, v in value.items())
+        return "{" + inner + "}"
+    if isinstance(value, (list, tuple)):
+        inner = ", ".join(_fmt_deploy_val(v) for v in value)
+        return f"[{inner}]"
+    return str(value)
+
+
+def _log_deploy_refresh(
+    previous: dict[str, Any], current: dict[str, Any]
+) -> None:
+    changed = [
+        key
+        for key in _RUNTIME_DEPLOY_KEYS
+        if not _values_equal(previous.get(key), current.get(key))
+    ]
+    if changed:
+        detail = ", ".join(
+            f"{key}={_fmt_deploy_val(current.get(key))}" for key in changed
+        )
+        print(f"[INFO] 已刷新 deploy.yaml: {detail}", flush=True)
+    for key, label in _STICKY_DEPLOY_KEYS:
+        if not _values_equal(previous.get(key), current.get(key)):
+            print(f"[WARN] {label} 变更需重启才生效，本轮忽略", flush=True)
+    rtc = current.get("rtc") or {}
+    prev_rtc = previous.get("rtc") or {}
+    if rtc.get("enabled") and not prev_rtc.get("enabled"):
+        print("[WARN] rtc.enabled=true 本脚本不支持，保持关闭", flush=True)
+
+
+def _resolve_exec_action_steps(
+    requested: int | None,
+    n_action_steps: int,
+    *,
+    strict: bool,
+    warn_key: tuple[Any, ...] | None = None,
+    last_warn_key: list[tuple[Any, ...] | None] | None = None,
+) -> int:
+    exec_action_steps = 1 if requested is None else int(requested)
+    if exec_action_steps <= n_action_steps:
+        return exec_action_steps
+    msg = (
+        f"deploy.yaml exec_action_steps={exec_action_steps} 不能大于 "
+        f"policy.n_action_steps={n_action_steps}"
+    )
+    if strict:
+        raise ValueError(msg)
+    if last_warn_key is None or warn_key != last_warn_key[0]:
+        print(f"[WARN] {msg}，夹到 {n_action_steps}", flush=True)
+        if last_warn_key is not None:
+            last_warn_key[0] = warn_key
+    return int(n_action_steps)
+
+
+def _obs_preprocess_signature(stack: PolicyStack) -> tuple[Any, ...]:
+    image_size = stack.image_size
+    if isinstance(image_size, (list, tuple)):
+        image_size_key: Any = tuple(image_size)
+    else:
+        image_size_key = image_size
+    scale = tuple(
+        sorted((str(k), float(v)) for k, v in stack.expected_scale_mm.items())
+    )
+    return (
+        int(stack.n_obs),
+        image_size_key,
+        float(stack.depth_min_mm),
+        float(stack.depth_max_mm),
+        scale,
+        int(stack.cfg.state_dim),
+        tuple(stack.cameras),
+        tuple(stack.depth_cameras),
+    )
+
+
+def _assert_hot_reload_contract(old: PolicyStack, new: PolicyStack) -> None:
+    if new.layout != "dual" or tuple(new.cameras) != DUAL_ARM_CAMERAS:
+        raise ValueError(
+            f"本脚本仅支持双臂 cameras={list(DUAL_ARM_CAMERAS)} 16D，"
+            f"实际 cameras={new.cameras} layout={new.layout}"
+        )
+    if tuple(new.cameras) != tuple(old.cameras):
+        raise ValueError(f"cameras 变更需重启: {old.cameras} -> {new.cameras}")
+    if list(new.depth_cameras) != list(old.depth_cameras):
+        raise ValueError(
+            f"depth_cameras 变更需重启: {old.depth_cameras} -> {new.depth_cameras}"
+        )
+    if int(new.cfg.state_dim) != int(old.cfg.state_dim):
+        raise ValueError(
+            f"state_dim 变更需重启: {old.cfg.state_dim} -> {new.cfg.state_dim}"
+        )
+
+
+def _load_policy_stack(deploy: dict[str, Any], *, strict: bool) -> PolicyStack:
+    ckpt_path = deploy["checkpoint"]
     if not ckpt_path.is_file():
         raise FileNotFoundError(f"找不到 checkpoint: {ckpt_path}")
-    if not teleop_yaml.is_file():
-        raise FileNotFoundError(f"找不到 teleop.yaml: {teleop_yaml}")
-
     train_cfg_path = _resolve_train_config(ckpt_path, deploy["config"])
     if train_cfg_path is not None and not train_cfg_path.is_file():
         raise FileNotFoundError(f"找不到训练配置: {train_cfg_path}")
 
-    print(f"[INFO] 部署配置: {deploy_path}")
-    print("[INFO] 控制: HCX 双臂 MoveJ（到位后采图）")
-    print(f"[INFO] teleop SDK: {TELEOP_ROOT}")
-    print(f"[INFO] teleop.yaml: {teleop_yaml}")
-    print(
-        "[INFO] 关节限位 min="
-        f"{[round(float(v), 1) for v in deploy['joint_limits_min_deg']]} "
-        "max="
-        f"{[round(float(v), 1) for v in deploy['joint_limits_max_deg']]}"
-    )
     print(f"[INFO] 加载 checkpoint: {ckpt_path}")
-
     ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
     if train_cfg_path is not None:
         cfg = load_config(train_cfg_path)
@@ -508,7 +686,11 @@ def main() -> None:
             f"实际 cameras={cameras} layout={layout}"
         )
 
-    _apply_rtc_overrides(cfg, deploy.get("rtc") or {})
+    rtc_override = dict(deploy.get("rtc") or {})
+    if rtc_override.get("enabled") and not strict:
+        print("[WARN] rtc.enabled=true 本脚本不支持，热加载时保持关闭", flush=True)
+        rtc_override = {**rtc_override, "enabled": False}
+    _apply_rtc_overrides(cfg, rtc_override)
     rtc_cfg = _normalize_rtc_config(cfg.policy.rtc)
     if bool(rtc_cfg.enabled):
         raise ValueError("本脚本仅支持到位采图，不能开 RTC")
@@ -516,20 +698,13 @@ def main() -> None:
     train_history_noise = float(getattr(cfg.policy, "history_noise_std", 0.0) or 0.0)
     cfg.policy.history_noise_std = 0.0
 
-    norm_mode = cfg.dataset.norm_mode
-    n_obs = int(cfg.dataset.n_obs_steps)
-    n_action_steps = int(cfg.policy.n_action_steps)
-    exec_action_steps = deploy["exec_action_steps"]
-    if exec_action_steps is None:
-        exec_action_steps = 1
-    if exec_action_steps > n_action_steps:
-        raise ValueError(
-            f"deploy.yaml exec_action_steps={exec_action_steps} 不能大于 "
-            f"policy.n_action_steps={n_action_steps}"
-        )
-    max_steps = deploy["max_steps"]
-    predict_joint_delta = bool(cfg.policy.predict_joint_delta)
-    joint_mask = joint_mask_from_names(cfg.action_names, cfg.action_dim)
+    depth_cameras = list(getattr(cfg.dataset, "depth_cameras", ()) or ())
+    expected_scale_mm = dict(getattr(cfg.dataset, "scale_mm_per_raw_unit", None) or {})
+    if not depth_cameras:
+        raise ValueError("本脚本需要 dataset.depth_cameras")
+    for cam in depth_cameras:
+        if cam not in expected_scale_mm:
+            raise ValueError(f"训练配置缺少 dataset.scale_mm_per_raw_unit[{cam}]")
 
     device = torch.device(cfg.train.device if torch.cuda.is_available() else "cpu")
     policy = build_policy(cfg, stats)
@@ -539,23 +714,131 @@ def main() -> None:
     policy_cfg = getattr(policy, "cfg", None)
     if hasattr(policy_cfg, "history_noise_std"):
         policy_cfg.history_noise_std = 0.0
-    print(
-        f"[INFO] 策略已就绪 layout=dual device={device} cameras={cameras} "
-        f"norm={norm_mode} n_obs={n_obs} n_action_steps={n_action_steps} "
-        f"exec_action_steps={exec_action_steps} "
-        f"obs_mode=after_action history_noise_std=0 (train={train_history_noise:g})",
-        flush=True,
+
+    return PolicyStack(
+        policy=policy,
+        cfg=cfg,
+        stats=stats,
+        device=device,
+        cameras=cameras,
+        layout=layout,
+        norm_mode=cfg.dataset.norm_mode,
+        n_obs=int(cfg.dataset.n_obs_steps),
+        n_action_steps=int(cfg.policy.n_action_steps),
+        predict_joint_delta=bool(cfg.policy.predict_joint_delta),
+        joint_mask=joint_mask_from_names(cfg.action_names, cfg.action_dim),
+        depth_cameras=depth_cameras,
+        expected_scale_mm=expected_scale_mm,
+        depth_min_mm=float(cfg.dataset.depth_min_mm),
+        depth_max_mm=float(cfg.dataset.depth_max_mm),
+        image_size=cfg.dataset.image_size,
+        source_id=_policy_source_id(deploy),
+        ckpt_path=ckpt_path,
+        train_cfg_path=train_cfg_path,
+        train_history_noise=train_history_noise,
     )
 
-    depth_cameras = list(getattr(cfg.dataset, "depth_cameras", ()) or ())
-    expected_scale_mm = dict(getattr(cfg.dataset, "scale_mm_per_raw_unit", None) or {})
-    if not depth_cameras:
-        raise ValueError("本脚本需要 dataset.depth_cameras")
-    for cam in depth_cameras:
-        if cam not in expected_scale_mm:
-            raise ValueError(f"训练配置缺少 dataset.scale_mm_per_raw_unit[{cam}]")
-    depth_min_mm = float(cfg.dataset.depth_min_mm)
-    depth_max_mm = float(cfg.dataset.depth_max_mm)
+
+def _maybe_reload_policy_stack(
+    deploy: dict[str, Any],
+    stack: PolicyStack,
+    hw: HardwareBundle,
+    obs_queue: DualStepObservationQueue,
+    *,
+    failed_source_id: list[tuple[Any, ...] | None],
+) -> tuple[PolicyStack, DualStepObservationQueue]:
+    new_id = _policy_source_id(deploy)
+    if new_id == stack.source_id or new_id == failed_source_id[0]:
+        return stack, obs_queue
+    new_stack: PolicyStack | None = None
+    try:
+        new_stack = _load_policy_stack(deploy, strict=False)
+        _assert_hot_reload_contract(stack, new_stack)
+    except Exception as exc:
+        failed_source_id[0] = new_id
+        print(f"[WARN] checkpoint 热加载失败，沿用旧模型: {exc}", flush=True)
+        del new_stack
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        return stack, obs_queue
+
+    failed_source_id[0] = None
+    assert new_stack is not None
+    old_sig = _obs_preprocess_signature(stack)
+    new_sig = _obs_preprocess_signature(new_stack)
+    old_policy = stack.policy
+    stack = new_stack
+    del old_policy
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+    if old_sig != new_sig:
+        if hw.camera_manager is not None:
+            hw.camera_capture = HeadTriggeredCapture(
+                hw.camera_manager,
+                depth_cameras=stack.depth_cameras,
+                expected_scale_mm=stack.expected_scale_mm,
+            )
+        obs_queue = DualStepObservationQueue(
+            hw,
+            list(stack.cameras),
+            n_obs_steps=stack.n_obs,
+            state_dim=int(stack.cfg.state_dim),
+            image_size=stack.image_size,
+            depth_cameras=stack.depth_cameras,
+            depth_min_mm=stack.depth_min_mm,
+            depth_max_mm=stack.depth_max_mm,
+            expected_scale_mm=stack.expected_scale_mm,
+        )
+        obs_queue.fill_initial()
+        print(
+            f"[INFO] 观测队列已按新配置重建 n_obs={stack.n_obs} "
+            f"image_size={stack.image_size}",
+            flush=True,
+        )
+    print(
+        f"[INFO] 已热加载 checkpoint={stack.ckpt_path} "
+        f"n_action_steps={stack.n_action_steps} n_obs={stack.n_obs}",
+        flush=True,
+    )
+    return stack, obs_queue
+
+
+def main() -> None:
+    args = _parse_args()
+    deploy_path = Path(args.deploy)
+    if not deploy_path.is_absolute():
+        deploy_path = _resolve_path(deploy_path, base=VA_ROOT)
+    deploy = _load_deploy_config(deploy_path)
+
+    teleop_yaml = deploy["teleop_yaml"]
+    if not teleop_yaml.is_file():
+        raise FileNotFoundError(f"找不到 teleop.yaml: {teleop_yaml}")
+
+    print(f"[INFO] 部署配置: {deploy_path}")
+    print("[INFO] 控制: HCX 双臂 MoveJ（到位后采图）")
+    print("[INFO] 每次推理前重读 deploy.yaml（checkpoint/config 仅在文件变更时重载）")
+    print(f"[INFO] teleop SDK: {TELEOP_ROOT}")
+    print(f"[INFO] teleop.yaml: {teleop_yaml}")
+    print(
+        "[INFO] 关节限位 min="
+        f"{[round(float(v), 1) for v in deploy['joint_limits_min_deg']]} "
+        "max="
+        f"{[round(float(v), 1) for v in deploy['joint_limits_max_deg']]}"
+    )
+
+    stack = _load_policy_stack(deploy, strict=True)
+    exec_action_steps = _resolve_exec_action_steps(
+        deploy["exec_action_steps"], stack.n_action_steps, strict=True
+    )
+    print(
+        f"[INFO] 策略已就绪 layout=dual device={stack.device} cameras={stack.cameras} "
+        f"norm={stack.norm_mode} n_obs={stack.n_obs} n_action_steps={stack.n_action_steps} "
+        f"exec_action_steps={exec_action_steps} "
+        f"obs_mode=after_action history_noise_std=0 "
+        f"(train={stack.train_history_noise:g})",
+        flush=True,
+    )
 
     hw = HardwareBundle(
         left_start_joints_deg=deploy["left_start_joints_deg"],
@@ -581,8 +864,8 @@ def main() -> None:
         hw.camera_manager = _connect_record_cameras(teleop_yaml)
         hw.camera_capture = HeadTriggeredCapture(
             hw.camera_manager,
-            depth_cameras=depth_cameras,
-            expected_scale_mm=expected_scale_mm,
+            depth_cameras=stack.depth_cameras,
+            expected_scale_mm=stack.expected_scale_mm,
         )
         print(
             "[INFO] 采图: head 新帧驱动，left_hand/right_hand RGB-D at_or_before",
@@ -590,12 +873,13 @@ def main() -> None:
         )
         if deploy["display_cameras"]:
             hw.camera_preview = CameraPreviewLoop(
-                hw.camera_manager, list(cameras), fps=PREVIEW_FPS
+                hw.camera_manager, list(stack.cameras), fps=PREVIEW_FPS
             )
             hw.camera_preview.start()
             if hw.camera_preview is not None and hw.camera_preview.is_active:
                 print(
-                    f"[INFO] 相机预览窗口已启动 fps={int(PREVIEW_FPS)} cameras={list(cameras)}"
+                    f"[INFO] 相机预览窗口已启动 fps={int(PREVIEW_FPS)} "
+                    f"cameras={list(stack.cameras)}"
                 )
             else:
                 hw.camera_preview = None
@@ -655,60 +939,81 @@ def main() -> None:
             rate_hz=gripper_rate_hz,
         )
 
-        image_size = cfg.dataset.image_size
         obs_queue = DualStepObservationQueue(
             hw,
-            list(cameras),
-            n_obs_steps=n_obs,
-            state_dim=int(cfg.state_dim),
-            image_size=image_size,
-            depth_cameras=depth_cameras,
-            depth_min_mm=depth_min_mm,
-            depth_max_mm=depth_max_mm,
-            expected_scale_mm=expected_scale_mm,
+            list(stack.cameras),
+            n_obs_steps=stack.n_obs,
+            state_dim=int(stack.cfg.state_dim),
+            image_size=stack.image_size,
+            depth_cameras=stack.depth_cameras,
+            depth_min_mm=stack.depth_min_mm,
+            depth_max_mm=stack.depth_max_mm,
+            expected_scale_mm=stack.expected_scale_mm,
         )
         obs_queue.fill_initial()
         print(
-            f"[INFO] 到位观测队列已就绪 n_obs={n_obs} image_size={image_size}",
+            f"[INFO] 到位观测队列已就绪 n_obs={stack.n_obs} "
+            f"image_size={stack.image_size}",
             flush=True,
         )
         print(
-            f"[INFO] 开始闭环：每次推理执行 chunk 前 {exec_action_steps}/{n_action_steps} 步，"
-            f"每步到位后等新帧，最多 {max_steps} 步",
+            f"[INFO] 开始闭环：每次推理执行 chunk 前 "
+            f"{exec_action_steps}/{stack.n_action_steps} 步，"
+            f"每步到位后等新帧，最多 {deploy['max_steps']} 步",
             flush=True,
         )
 
         step_i = 0
-        while step_i < max_steps:
+        last_deploy = dict(deploy)
+        last_exec_warn_key: list[tuple[Any, ...] | None] = [None]
+        failed_source_id: list[tuple[Any, ...] | None] = [None]
+        while step_i < int(deploy["max_steps"]):
             _pump_camera_preview(hw)
+            refreshed = _refresh_deploy(deploy_path, deploy)
+            _log_deploy_refresh(last_deploy, refreshed)
+            deploy = refreshed
+            last_deploy = dict(deploy)
+            stack, obs_queue = _maybe_reload_policy_stack(
+                deploy, stack, hw, obs_queue, failed_source_id=failed_source_id
+            )
+            exec_action_steps = _resolve_exec_action_steps(
+                deploy["exec_action_steps"],
+                stack.n_action_steps,
+                strict=False,
+                warn_key=(deploy["exec_action_steps"], stack.n_action_steps),
+                last_warn_key=last_exec_warn_key,
+            )
+            max_steps = int(deploy["max_steps"])
+            if step_i >= max_steps:
+                break
             obs_history = obs_queue.snapshot()
             batch = _build_obs_batch(
                 obs_history,
-                cameras=list(cameras),
-                n_obs_steps=n_obs,
-                stats=stats,
-                norm_mode=norm_mode,
-                device=device,
-                depth_cameras=depth_cameras,
-                predict_joint_delta=predict_joint_delta,
-                joint_mask=joint_mask,
+                cameras=list(stack.cameras),
+                n_obs_steps=stack.n_obs,
+                stats=stack.stats,
+                norm_mode=stack.norm_mode,
+                device=stack.device,
+                depth_cameras=stack.depth_cameras,
+                predict_joint_delta=stack.predict_joint_delta,
+                joint_mask=stack.joint_mask,
             )
             _log_inference_state_input(
                 step_i=step_i,
                 obs_history=obs_history,
-                n_obs_steps=n_obs,
+                n_obs_steps=stack.n_obs,
                 batch=batch,
             )
             with torch.no_grad():
-                pred = policy.sample_actions(batch)[0, :n_action_steps].cpu()
+                pred = stack.policy.sample_actions(batch)[0, : stack.n_action_steps].cpu()
             pred_phys = np.asarray(
                 denormalize_predicted_action(
                     pred,
-                    stats,
-                    norm_mode,
+                    stack.stats,
+                    stack.norm_mode,
                     q_now_phys=np.asarray(obs_history[-1].state, dtype=np.float32),
-                    predict_joint_delta=predict_joint_delta,
-                    joint_mask=joint_mask,
+                    predict_joint_delta=stack.predict_joint_delta,
+                    joint_mask=stack.joint_mask,
                 )
             )
             _log_inference_result(step_i=step_i, pred_norm=pred, pred_phys=pred_phys)
