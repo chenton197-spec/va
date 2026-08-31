@@ -37,13 +37,13 @@ def _action_names_from_cfg(cfg: Any) -> list[str]:
 
 
 def _resolve_train_config(ckpt_path: Path, config_arg: str | None, base_dir: Path) -> Path | None:
-    """Resolve training YAML: CLI > config_source.yaml > config.yaml beside ckpt."""
+    """Resolve training YAML: CLI > config.yaml > config_source.yaml beside ckpt."""
     if config_arg:
         p = Path(config_arg)
         if not p.is_absolute():
             p = base_dir / p
         return p.resolve()
-    for name in ("config_source.yaml", "config.yaml"):
+    for name in ("config.yaml", "config_source.yaml"):
         cand = ckpt_path.parent / name
         if cand.is_file():
             return cand
@@ -158,9 +158,7 @@ def evaluate_one_checkpoint(
                 cameras=cameras,
                 t=t,
                 n_obs_steps=n_obs,
-                pre_crop_size=cfg.dataset.pre_crop_size,
-                resize_size=cfg.dataset.resize_size,
-                crop_size=cfg.dataset.crop_size,
+                image_size=cfg.dataset.image_size,
                 stats=stats,
                 norm_mode=norm_mode,
                 device=device,

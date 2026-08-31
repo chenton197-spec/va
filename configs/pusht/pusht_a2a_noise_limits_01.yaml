@@ -19,8 +19,6 @@ dataset:
   n_obs_steps: 8
   horizon: 8
   run_name: pusht_merged_cchi_teleop10fps
-  crop_size: 84
-  eval_fixed_crop: true
   # gaussian | limits([-1,1]) | limits_01([0,1])
   norm_mode: limits_01
 

@@ -28,7 +28,7 @@ from robotfm.data.action_delta import (
     denormalize_predicted_action,
     joint_mask_from_names,
 )
-from robotfm.data.dataset import build_episode_dataset, images_to_float01
+from robotfm.data.dataset import build_episode_dataset, images_to_float01, parse_image_hw
 from robotfm.data.stats import denormalize
 from robotfm.train import build_policy
 
@@ -39,7 +39,7 @@ def _resolve_train_config(ckpt_path: Path, config_arg: str | None, base_dir: Pat
         if not p.is_absolute():
             p = base_dir / p
         return p.resolve()
-    for name in ("config_source.yaml", "config.yaml"):
+    for name in ("config.yaml", "config_source.yaml"):
         cand = ckpt_path.parent / name
         if cand.is_file():
             return cand
@@ -180,7 +180,8 @@ def main() -> None:
     joint_mask, grip_mask = _masks(names)
     n_obs = int(cfg.dataset.n_obs_steps)
     n_act = int(cfg.policy.n_action_steps)
-    h = int(cfg.dataset.resize_size or 512)
+    hw = parse_image_hw(cfg.dataset.image_size) or (512, 512)
+    h, w = hw
     n_cam = len(cfg.cameras)
     predict_joint_delta = bool(cfg.policy.predict_joint_delta)
     delta_joint_mask = joint_mask_from_names(names, int(cfg.action_dim))
@@ -237,7 +238,7 @@ def main() -> None:
     run_dir = get_run_dir(cfg, base_dir)
     print(f"\ncheckpoint: {ckpt_path}")
     print(f"run_dir: {run_dir}")
-    print(f"step={ckpt.get('step')} device={device} n_obs={n_obs} n_act={n_act} resize={h} predict_joint_delta={predict_joint_delta}")
+    print(f"step={ckpt.get('step')} device={device} n_obs={n_obs} n_act={n_act} image_size={h}x{w} predict_joint_delta={predict_joint_delta}")
 
     t0 = time.time()
     dataset = build_episode_dataset(
@@ -249,10 +250,7 @@ def main() -> None:
         stats=stats,
         normalize=True,
         norm_mode=cfg.dataset.norm_mode,
-        resize_size=cfg.dataset.resize_size,
-        pre_crop_size=cfg.dataset.pre_crop_size,
-        crop_size=None,
-        random_crop=False,
+        image_size=cfg.dataset.image_size,
         color_jitter_brightness=0.0,
         color_jitter_contrast=0.0,
         color_jitter_saturation=0.0,
@@ -261,6 +259,7 @@ def main() -> None:
         uint8_cache=True,
         uint8_cache_dir=cfg.dataset.uint8_cache_dir,
         predict_joint_delta=bool(cfg.policy.predict_joint_delta),
+        predict_state_delta=bool(cfg.policy.predict_state_delta),
     )
     print(f"dataset: n={len(dataset)}  load={time.time() - t0:.1f}s")
 
@@ -270,7 +269,7 @@ def main() -> None:
     state_idx = rng.choice(len(dataset), size=n_state, replace=False).tolist()
     image_idx = rng.choice(len(dataset), size=n_image, replace=False).tolist()
 
-    zeros = torch.zeros(1, n_cam, n_obs, 3, h, h, device=device)
+    zeros = torch.zeros(1, n_cam, n_obs, 3, h, w, device=device)
     t1 = time.time()
     img_feat_zero = _img_feat(policy, zeros)
     print(f"encoded zero images: shape={tuple(img_feat_zero.shape)}  {time.time() - t1:.1f}s")

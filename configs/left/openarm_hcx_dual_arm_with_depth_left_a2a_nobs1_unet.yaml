@@ -16,10 +16,7 @@ dataset:
   horizon: 8
   run_name: openarm_hcx_dual_arm_with_depth_train
   val_run_name: openarm_hcx_dual_arm_with_depth_val
-  pre_crop_size: 720
-  resize_size: 256
-  crop_size: null
-  eval_fixed_crop: true
+  image_size: [256, 455]
   norm_mode: limits
   color_jitter_brightness: 0.3
   color_jitter_contrast: 0.2

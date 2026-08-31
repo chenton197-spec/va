@@ -99,7 +99,6 @@ def _build_obs_batch(
     """将观测历史列表转为策略输入 batch（batch_size=1）。
 
     注意 obs_images 形状为 (1, Cams, T_obs, 3, H, W)，与 Dataset 单样本一致。
-    评估使用固定中心裁剪（``eval_fixed_crop``）。
     历史不足时重复最早一帧（与训练 / 原版 A2A 的 state pad 一致）。
     A2A / N-A2A 的 flow 起点是 ``obs_state``（agent_pos），不再需要 action history。
     """
@@ -126,10 +125,7 @@ def _build_obs_batch(
     obs_images = torch.stack(camera_histories, dim=0)
     obs_images = spatial_preprocess_images(
         obs_images,
-        pre_crop_size=cfg.dataset.pre_crop_size,
-        resize_size=cfg.dataset.resize_size,
-        crop_size=cfg.dataset.crop_size if cfg.dataset.eval_fixed_crop else None,
-        random_crop=False,
+        image_size=cfg.dataset.image_size,
     )
 
     obs_images = obs_images.unsqueeze(0).to(device)
@@ -167,10 +163,7 @@ def _build_obs_batch(
         obs_depth = torch.stack(depth_histories, dim=0)
         obs_depth = spatial_preprocess_images(
             obs_depth,
-            pre_crop_size=cfg.dataset.pre_crop_size,
-            resize_size=cfg.dataset.resize_size,
-            crop_size=cfg.dataset.crop_size if cfg.dataset.eval_fixed_crop else None,
-            random_crop=False,
+            image_size=cfg.dataset.image_size,
             resize_mode="nearest",
         )
         batch["obs_depth"] = obs_depth.unsqueeze(0).to(device)

@@ -22,7 +22,9 @@ from robotfm.data.action_delta import (
     flow_history_from_phys,
     joint_mask_from_names,
     overlay_joint_delta_action_stats,
+    reach_open_action_loss_w,
     subtract_joint_pose,
+    target_chunk_from_t,
 )
 from robotfm.data.stats import is_limits_mode, normalize, validate_norm_mode
 
@@ -39,8 +41,35 @@ def build_episode_dataset(run_dir: Path, **kwargs):
 
     run_dir = Path(run_dir)
     if is_lerobot_image_sequence_root(run_dir):
+        kwargs.pop("resize_size", None)
         return LeRobotImageSequenceDataset(run_dir=run_dir, **kwargs)
+    kwargs.pop("image_size", None)
+    kwargs.pop("episode_ids", None)
     return EpisodeDataset(run_dir=run_dir, **kwargs)
+
+
+def parse_image_hw(
+    image_size: int | tuple[int, int] | list[int] | None,
+) -> tuple[int, int] | None:
+    if image_size is None:
+        return None
+    if isinstance(image_size, int):
+        s = int(image_size)
+        if s <= 0:
+            raise ValueError(f"image_size must be > 0, got {image_size}")
+        return (s, s)
+    if isinstance(image_size, (list, tuple)):
+        if len(image_size) == 1:
+            s = int(image_size[0])
+            if s <= 0:
+                raise ValueError(f"image_size must be > 0, got {image_size}")
+            return (s, s)
+        if len(image_size) == 2:
+            h, w = int(image_size[0]), int(image_size[1])
+            if h <= 0 or w <= 0:
+                raise ValueError(f"image_size must be > 0, got {image_size}")
+            return (h, w)
+    raise ValueError(f"invalid image_size: {image_size!r}")
 
 
 def resize_images(images: torch.Tensor, size: int | None, mode: str = "bilinear") -> torch.Tensor:
@@ -68,57 +97,10 @@ def resize_images(images: torch.Tensor, size: int | None, mode: str = "bilinear"
 def spatial_preprocess_images(
     images: torch.Tensor,
     *,
-    pre_crop_size: int | None = None,
     resize_size: int | None = None,
-    crop_size: int | None = None,
-    random_crop: bool = False,
     resize_mode: str = "bilinear",
 ) -> torch.Tensor:
-    """统一空间预处理：中心 pre_crop → resize → 可选 crop。
-
-    ``pre_crop_size`` 始终中心裁（保比例方裁，如 1280×720 → 720×720）。
-    ``crop_size`` 在 resize 之后；``random_crop=True`` 时随机裁，否则中心裁。
-    """
-    if pre_crop_size is not None:
-        images = crop_images(images, pre_crop_size, random=False)
-    images = resize_images(images, resize_size, mode=resize_mode)
-    if crop_size is not None:
-        images = crop_images(images, crop_size, random=random_crop)
-    return images
-
-
-def crop_hw_box(h: int, w: int, crop_size: int, random: bool) -> tuple[int, int]:
-    if h < crop_size or w < crop_size:
-        raise ValueError(f"Cannot crop {h}x{w} to {crop_size}")
-    if random:
-        top = int(torch.randint(0, h - crop_size + 1, (1,)).item())
-        left = int(torch.randint(0, w - crop_size + 1, (1,)).item())
-    else:
-        top = (h - crop_size) // 2
-        left = (w - crop_size) // 2
-    return top, left
-
-
-def apply_hw_crop(images: torch.Tensor, top: int, left: int, crop_size: int) -> torch.Tensor:
-    return images[..., top : top + crop_size, left : left + crop_size]
-
-
-def crop_images(images: torch.Tensor, crop_size: int | None, random: bool) -> torch.Tensor:
-    """对 CHW 图像张量做空间裁剪。
-
-    支持形状:
-      - (T, C, H, W)
-      - (Cams, T, C, H, W)
-
-    ``crop_size is None`` 或等于 H/W 时原样返回。
-    """
-    if crop_size is None:
-        return images
-    *lead, c, h, w = images.shape
-    if h == crop_size and w == crop_size:
-        return images
-    top, left = crop_hw_box(h, w, crop_size, random)
-    return apply_hw_crop(images, top, left, crop_size)
+    return resize_images(images, resize_size, mode=resize_mode)
 
 
 def color_jitter_images(
@@ -160,55 +142,6 @@ def color_jitter_images(
         flat = TF.adjust_hue(flat, max(-0.5, min(0.5, factor)))
 
     return flat.clamp(0.0, 1.0).reshape(*lead, c, h, w)
-
-
-def crop_offsets_batch(
-    batch_size: int,
-    h: int,
-    w: int,
-    crop_size: int,
-    random: bool,
-    device: torch.device,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    if h < crop_size or w < crop_size:
-        raise ValueError(f"Cannot crop {h}x{w} to {crop_size}")
-    if random:
-        tops = torch.randint(0, h - crop_size + 1, (batch_size,), device=device)
-        lefts = torch.randint(0, w - crop_size + 1, (batch_size,), device=device)
-    else:
-        tops = torch.full((batch_size,), (h - crop_size) // 2, device=device, dtype=torch.long)
-        lefts = torch.full((batch_size,), (w - crop_size) // 2, device=device, dtype=torch.long)
-    return tops, lefts
-
-
-def apply_crop_offsets_batch(
-    images: torch.Tensor, tops: torch.Tensor, lefts: torch.Tensor, crop_size: int
-) -> torch.Tensor:
-    b = images.shape[0]
-    out = images.new_empty(*images.shape[:-2], crop_size, crop_size)
-    for i in range(b):
-        top = int(tops[i])
-        left = int(lefts[i])
-        out[i] = images[i, ..., top : top + crop_size, left : left + crop_size]
-    return out
-
-
-def crop_images_batch(
-    images: torch.Tensor, crop_size: int | None, random: bool
-) -> torch.Tensor:
-    """Batched spatial crop for ``(B, Cams, T, C, H, W)``.
-
-    Each batch item gets its own crop window; cams/T within an item share it.
-    """
-    if crop_size is None:
-        return images
-    if images.ndim != 6:
-        raise ValueError(f"Expected (B,Cams,T,C,H,W), got shape {tuple(images.shape)}")
-    b, _cams, _t, _c, h, w = images.shape
-    if h == crop_size and w == crop_size:
-        return images
-    tops, lefts = crop_offsets_batch(b, h, w, crop_size, random, images.device)
-    return apply_crop_offsets_batch(images, tops, lefts, crop_size)
 
 
 _LUMA_WEIGHTS = (0.2989, 0.5870, 0.1140)
@@ -338,44 +271,19 @@ def images_to_float01(images: torch.Tensor) -> torch.Tensor:
 def apply_image_augments_batch(
     images: torch.Tensor,
     *,
-    crop_size: int | None,
-    random_crop: bool,
     brightness: float = 0.0,
     contrast: float = 0.0,
     saturation: float = 0.0,
     hue: float = 0.0,
     depths: torch.Tensor | None = None,
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
-    """GPU/CPU batch crop (+ optional color jitter when ``random_crop``).
-
-    If ``depths`` is given, it is cropped with the same per-sample window and
-    returned as the second value (no color jitter).
-    """
-    if crop_size is not None and images.ndim == 6:
-        h, w = images.shape[-2], images.shape[-1]
-        if h != crop_size or w != crop_size:
-            tops, lefts = crop_offsets_batch(
-                images.shape[0], h, w, crop_size, random_crop, images.device
-            )
-            images = apply_crop_offsets_batch(images, tops, lefts, crop_size)
-            if depths is not None:
-                depths = apply_crop_offsets_batch(depths, tops, lefts, crop_size)
-        elif depths is not None and (
-            depths.shape[-2] != crop_size or depths.shape[-1] != crop_size
-        ):
-            depths = crop_images_batch(depths, crop_size, random=False)
-    else:
-        images = crop_images_batch(images, crop_size, random=random_crop)
-        if depths is not None:
-            depths = crop_images_batch(depths, crop_size, random=False)
-    if random_crop:
-        images = color_jitter_images_batch(
-            images,
-            brightness=brightness,
-            contrast=contrast,
-            saturation=saturation,
-            hue=hue,
-        )
+    images = color_jitter_images_batch(
+        images,
+        brightness=brightness,
+        contrast=contrast,
+        saturation=saturation,
+        hue=hue,
+    )
     if depths is None:
         return images
     return images, depths
@@ -473,60 +381,65 @@ def apply_state_dropout(
     whole_p: float,
     joint_p: float,
     gripper_p: float,
-    joint_mask: torch.Tensor,
-    gripper_mask: torch.Tensor,
+    joint_mask: torch.Tensor | None = None,
+    gripper_mask: torch.Tensor | None = None,
     keep_at_least_one: bool = True,
 ) -> torch.Tensor:
-    """全状态 / 关节组 / 夹爪组按样本 Bernoulli 置零。
+    drop_prob = max(float(whole_p), float(joint_p), float(gripper_p))
+    return apply_arm_segment_dropout(state, drop_prob=drop_prob)
 
-    ``state``: (B, T, D)。同一组对所有历史帧一起遮挡。所有概率都 ``<=0`` 时原样返回。
-    若 ``keep_at_least_one`` 且某样本两组都被抽中，随机放回一组。
-    ``whole_p`` 抽中的样本始终全部置零，不受 ``keep_at_least_one`` 影响。
-    """
-    if whole_p <= 0.0 and joint_p <= 0.0 and gripper_p <= 0.0:
+
+def arm_segment_masks(
+    state_names: list[str] | None,
+    state_dim: int,
+) -> list[torch.Tensor]:
+    dim = int(state_dim)
+    names = list(state_names or [])
+    if len(names) != dim:
+        names = [f"s{i}" for i in range(dim)]
+    gripper = torch.tensor(
+        ["gripper" in name.lower() for name in names],
+        dtype=torch.bool,
+    )
+    if dim > 0 and not bool(gripper.any()) and dim >= 7:
+        gripper[-1] = True
+    left = torch.zeros(dim, dtype=torch.bool)
+    right = torch.zeros(dim, dtype=torch.bool)
+    for i, name in enumerate(names):
+        if gripper[i]:
+            continue
+        lower = name.lower()
+        if lower.startswith("l") or "left" in lower:
+            left[i] = True
+        elif lower.startswith("r") or "right" in lower:
+            right[i] = True
+    if not bool(left.any()) and not bool(right.any()):
+        left = ~gripper
+    masks: list[torch.Tensor] = []
+    for mask in (left, right, gripper):
+        if bool(mask.any()):
+            masks.append(mask)
+    return masks
+
+
+def apply_arm_segment_dropout(
+    state: torch.Tensor,
+    *,
+    drop_prob: float,
+    masks: list[torch.Tensor] | None = None,
+) -> torch.Tensor:
+    if drop_prob <= 0.0:
         return state
     if state.ndim != 3:
         raise ValueError(
-            f"apply_state_dropout expects (B, T, D), got {tuple(state.shape)}"
+            f"apply_arm_segment_dropout expects (B, T, D), got {tuple(state.shape)}"
         )
-    batch, _time, dim = state.shape
-    device = state.device
-    joint_mask = joint_mask.to(device=device, dtype=torch.bool).reshape(-1)
-    gripper_mask = gripper_mask.to(device=device, dtype=torch.bool).reshape(-1)
-    if joint_mask.numel() != dim or gripper_mask.numel() != dim:
-        raise ValueError(
-            f"state_dropout masks must have length {dim}, got "
-            f"joint={tuple(joint_mask.shape)} gripper={tuple(gripper_mask.shape)}"
-        )
-
-    groups: list[tuple[torch.Tensor, torch.Tensor]] = []
-    if joint_p > 0.0 and bool(joint_mask.any()):
-        groups.append((torch.rand(batch, device=device) < float(joint_p), joint_mask))
-    if gripper_p > 0.0 and bool(gripper_mask.any()):
-        groups.append((torch.rand(batch, device=device) < float(gripper_p), gripper_mask))
-    group_drop_mask = torch.zeros(batch, dim, device=device, dtype=torch.bool)
-    for group_drop, group_mask in groups:
-        group_drop_mask = group_drop_mask | (
-            group_drop.unsqueeze(1) & group_mask.unsqueeze(0)
-        )
-
-    if keep_at_least_one and groups:
-        stacked = torch.stack([group_drop for group_drop, _ in groups], dim=1)
-        all_dropped = stacked.all(dim=1)
-        if bool(all_dropped.any()):
-            n_restore = int(all_dropped.sum().item())
-            keep_group = torch.randint(0, len(groups), (n_restore,), device=device)
-            for group_idx, (_group_drop, group_mask) in enumerate(groups):
-                restore = all_dropped.clone()
-                restore[all_dropped] = keep_group == group_idx
-                if bool(restore.any()):
-                    group_drop_mask[restore] = group_drop_mask[restore] & ~group_mask
-
-    whole_drop = torch.rand(batch, device=device) < float(whole_p)
-    drop = group_drop_mask | whole_drop.unsqueeze(1)
-
-    mask = (~drop).to(dtype=state.dtype).view(batch, 1, dim)
-    return state * mask
+    drop = torch.rand(state.shape[0], device=state.device) < float(drop_prob)
+    if not bool(drop.any()):
+        return state
+    state = state.clone()
+    state[drop] = 0
+    return state
 
 
 class EpisodeDataset(Dataset):
@@ -548,10 +461,7 @@ class EpisodeDataset(Dataset):
         stats: dict[str, np.ndarray] | None = None,
         normalize: bool = True,
         norm_mode: str = "gaussian",
-        pre_crop_size: int | None = None,
         resize_size: int | None = None,
-        crop_size: int | None = 84,
-        random_crop: bool = True,
         color_jitter_brightness: float = 0.0,
         color_jitter_contrast: float = 0.0,
         color_jitter_saturation: float = 0.0,
@@ -560,9 +470,14 @@ class EpisodeDataset(Dataset):
         uint8_cache: bool = False,
         uint8_cache_dir: str | Path | None = None,
         predict_joint_delta: bool = False,
+        predict_state_delta: bool = False,
         depth_cameras: tuple[str, ...] | list[str] = (),
         depth_min_mm: float = 50.0,
         depth_max_mm: float = 500.0,
+        reach_open_joint_weight: float = 1.0,
+        reach_gripper_open_thr: float = 0.5,
+        reach_move_deg_per_frame: float = 0.35,
+        action_names: list[str] | None = None,
     ) -> None:
         self.run_dir = Path(run_dir)
         self.meta = load_meta(self.run_dir)
@@ -583,16 +498,20 @@ class EpisodeDataset(Dataset):
                     "delete stats.json and recompute, or call ensure_stats(..., "
                     f"{self.norm_mode!r})"
                 )
-        self.pre_crop_size = pre_crop_size
         self.resize_size = resize_size
-        self.crop_size = crop_size
-        self.random_crop = random_crop
         self.color_jitter_brightness = color_jitter_brightness
         self.color_jitter_contrast = color_jitter_contrast
         self.color_jitter_saturation = color_jitter_saturation
         self.color_jitter_hue = color_jitter_hue
         self.defer_augment = bool(defer_augment)
         self.predict_joint_delta = bool(predict_joint_delta)
+        self.predict_state_delta = bool(predict_state_delta)
+        if self.predict_state_delta and not self.predict_joint_delta:
+            raise ValueError("predict_state_delta requires predict_joint_delta")
+        self.reach_open_joint_weight = float(reach_open_joint_weight)
+        self.reach_gripper_open_thr = float(reach_gripper_open_thr)
+        self.reach_move_deg_per_frame = float(reach_move_deg_per_frame)
+        self._weight_names = list(action_names) if action_names else list(self.meta.action_names)
         _ = depth_cameras
         _ = depth_min_mm
         _ = depth_max_mm
@@ -629,6 +548,8 @@ class EpisodeDataset(Dataset):
             length = payload["arrays"]["state"].shape[0]
             self._episode_lengths.append(length)
             usable = length - self.drop_n_last_frames
+            if self.predict_state_delta:
+                usable = min(usable, length - 1)
             if usable <= 0:
                 continue
             for t in range(usable):
@@ -653,6 +574,7 @@ class EpisodeDataset(Dataset):
                 ep_actions,
                 horizon=self.horizon,
                 joint_mask=self._joint_mask,
+                predict_state_delta=self.predict_state_delta,
             )
 
     def __len__(self) -> int:
@@ -672,7 +594,7 @@ class EpisodeDataset(Dataset):
         """返回一个训练样本。
 
         返回张量:
-            obs_images:      (Cams, T_obs, 3, H', W')  float32 [0,1]（可选裁剪）
+            obs_images:      (Cams, T_obs, 3, H', W')  float32 [0,1]
             obs_state:       (T_obs, state_dim)
             action:          (horizon, action_dim)  已归一化；末尾不足则重复最后一帧
             action_mask:     (horizon, 1)  真实步为 1，末尾重复补齐为 0
@@ -691,7 +613,7 @@ class EpisodeDataset(Dataset):
         while len(obs_indices) < self.n_obs_steps:
             obs_indices.insert(0, obs_indices[0])  # 开头重复第一帧
 
-        # ---- 3) 读多相机图像，归一化到 [0,1]，再做空间裁剪 ----
+        # ---- 3) 读多相机图像，归一化到 [0,1] ----
         images = []
         for cam in self.meta.camera_names:
             cam_frames = arrays[image_key(cam)][obs_indices]
@@ -700,31 +622,18 @@ class EpisodeDataset(Dataset):
             images.append(torch.from_numpy(cam_frames))
 
         obs_images = torch.stack(images, dim=0)  # (Cams, T_obs, 3, H, W)
-        # pre_crop（中心）→ resize；post-crop / color_jitter 可 defer 到 GPU
-        if self.defer_augment:
-            obs_images = spatial_preprocess_images(
+        obs_images = spatial_preprocess_images(
+            obs_images,
+            resize_size=self.resize_size,
+        )
+        if not self.defer_augment:
+            obs_images = color_jitter_images(
                 obs_images,
-                pre_crop_size=self.pre_crop_size,
-                resize_size=self.resize_size,
-                crop_size=None,
-                random_crop=False,
+                brightness=self.color_jitter_brightness,
+                contrast=self.color_jitter_contrast,
+                saturation=self.color_jitter_saturation,
+                hue=self.color_jitter_hue,
             )
-        else:
-            obs_images = spatial_preprocess_images(
-                obs_images,
-                pre_crop_size=self.pre_crop_size,
-                resize_size=self.resize_size,
-                crop_size=self.crop_size,
-                random_crop=self.random_crop,
-            )
-            if self.random_crop:
-                obs_images = color_jitter_images(
-                    obs_images,
-                    brightness=self.color_jitter_brightness,
-                    contrast=self.color_jitter_contrast,
-                    saturation=self.color_jitter_saturation,
-                    hue=self.color_jitter_hue,
-                )
 
         # ---- 4) 状态取 obs_indices，并用 stats 归一化 ----
         state_phys = arrays["state"][obs_indices].astype(np.float32)
@@ -747,9 +656,13 @@ class EpisodeDataset(Dataset):
         #
         # 例 length=100, horizon=8, t=95:
         #   action[95:100] → valid_len=5，后 3 步 = a99，mask=[1,1,1,1,1,0,0,0]
-        action_end = min(t + self.horizon, length)
-        valid_len = action_end - t  # 本样本里「真实动作」有几步
-        actions = arrays["action"][t:action_end].astype(np.float32)
+        actions, valid_len = target_chunk_from_t(
+            arrays["state"],
+            arrays["action"],
+            t,
+            self.horizon,
+            predict_state_delta=self.predict_state_delta,
+        )
         if self.predict_joint_delta:
             q_now = arrays["state"][t].astype(np.float32)
             actions = subtract_joint_pose(actions, q_now, self._joint_mask)
@@ -764,10 +677,23 @@ class EpisodeDataset(Dataset):
             actions = np.concatenate([actions, pad], axis=0)
         actions = self._normalize_action(actions)
 
-        return {
+        out = {
             "obs_images": obs_images,
             "obs_state": torch.from_numpy(state),
             "obs_history": torch.from_numpy(np.asarray(flow_hist, dtype=np.float32)),
             "action": torch.from_numpy(actions),
             "action_mask": torch.from_numpy(mask),
         }
+        if self.reach_open_joint_weight > 1.0:
+            out["action_loss_w"] = torch.from_numpy(
+                reach_open_action_loss_w(
+                    arrays["state"],
+                    t,
+                    self.horizon,
+                    self._weight_names,
+                    weight=self.reach_open_joint_weight,
+                    gripper_open_thr=self.reach_gripper_open_thr,
+                    move_deg_per_frame=self.reach_move_deg_per_frame,
+                )
+            )
+        return out

@@ -37,10 +37,7 @@ dataset:
   horizon: 32
   run_name: openarm_hcx_dual_arm_train
   val_run_name: openarm_hcx_dual_arm_val  # 10 ep holdout；训练中开环 MAE
-  pre_crop_size: 720
-  resize_size: 360
-  crop_size: null
-  eval_fixed_crop: true
+  image_size: [360, 640]
   color_jitter_brightness: 0.2
   color_jitter_contrast: 0.2
   color_jitter_saturation: 0.1

@@ -75,12 +75,10 @@ class DatasetConfig:
     n_obs_steps: int = 2    # 策略输入的历史观测帧数
     horizon: int = 16       # 每次预测的未来动作步数（action chunk 长度）
     run_name: str = "pusht_demos"  # 数据子目录名，完整路径 = data_root / run_name
-    # 空间预处理顺序：可选 pre_crop（中心方裁）→ resize → 可选 crop（训练 random / 评估中心）
-    # 例 1280×720：pre_crop_size=720, resize_size=512 → 先中心 720² 再缩到 512²（保比例）
-    pre_crop_size: int | None = None  # 缩放前中心裁成该边长；None 表示不预裁
     resize_size: int | None = None  # 双线性缩放到该边长；None 表示不缩放
-    crop_size: int | None = 84  # resize 后再裁边长；None 表示不裁剪
-    eval_fixed_crop: bool = True  # 评估时用中心裁剪（训练用 random crop）
+    image_size: int | tuple[int, int] | list[int] | None = None
+    obs_image_shape: list[int] | None = None
+    obs_depth_shape: list[int] | None = None
     # 训练光度增强（评估不加）。0 表示关闭该项。同一条样本对所有相机/历史帧共用一组随机因子。
     color_jitter_brightness: float = 0.0
     color_jitter_contrast: float = 0.0
@@ -95,14 +93,17 @@ class DatasetConfig:
     # LeRobot: 使用 {run_dir}/cache/uint8_rgb_{H}x{W} 跳过 JPEG decode
     uint8_cache: bool = False
     uint8_cache_dir: str | None = None  # 可选显式缓存目录
-    # True: Dataset 不裁剪/不抖动，由训练循环在 GPU 上做（需配合 train）
+    # True: Dataset 不抖动，由训练循环在 GPU 上做（需配合 train）
     gpu_augment: bool = False
     camera_dropout: CameraDropoutConfig = field(default_factory=CameraDropoutConfig)
     state_dropout: StateDropoutConfig = field(default_factory=StateDropoutConfig)
     val_run_name: str | None = None
+    val_ratio: float = 0.0
+    split_seed: int = 42
     depth_cameras: list[str] = field(default_factory=list)
     depth_min_mm: float = 50.0
     depth_max_mm: float = 500.0
+    scale_mm_per_raw_unit: dict[str, float] | None = None
 
 
 @dataclass
@@ -138,6 +139,7 @@ class PolicyConfig:
     # True: 关节目标为 Δq = action − q_now（当前观测姿态），夹爪仍用绝对值。
     # 训练会按增量重算 action mean/std；推理 denormalize 后再加回 q_now。需重训。
     predict_joint_delta: bool = False
+    predict_state_delta: bool = False
     use_ot_matcher: bool = False  # True: OT-CFM；VITA 默认在 builder 中开
     flow_hidden_dim: int = 512
     flow_num_layers: int = 4
@@ -149,6 +151,7 @@ class PolicyConfig:
     ae_dropout: float = 0.0
     decode_flow_latents: bool = True
     arm_aware: bool = False
+    split_arm_unet: bool = False
     token_grid: int = 8
     use_temporal_attn: bool = True
     use_cross_attn: bool = True
@@ -189,14 +192,21 @@ class TrainConfig:
     cosine_lr: bool = True    # cosine 衰减（含短 warmup）
     warmup_steps: int = 500
     encoder_lr_scale: float = 0.1  # 视觉 backbone lr = lr * scale
+    proprio_lr_scale: float = 0.05
     max_grad_norm: float = 1.0
     # CUDA AMP（fp16 + GradScaler）；默认 False。已知 bug：训练中途易 loss=nan，勿开。
     amp: bool = False
     # torch.compile 整策略（mode=default）；CPU 上自动忽略。首步会编译变慢。
     compile: bool = False
+    ema_decay: float = 0.999
+    arm_segment_drop_prob: float = 0.5
+    reach_open_joint_weight: float = 1.0
+    reach_gripper_open_thr: float = 0.5
+    reach_move_deg_per_frame: float = 0.35
     # 每隔多少步在验证集上做训练 loss + 开环物理 MAE/MSE；
-    # 0 = 若设了 val_run_name 则跟 save_freq，否则关闭
+    # 0 = 若 val 已启用则跟 latest_save_freq（否则 save_freq）
     val_freq: int = 0
+    val_samples: int = 64
 
 
 @dataclass

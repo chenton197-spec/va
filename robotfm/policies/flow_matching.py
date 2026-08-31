@@ -4,37 +4,23 @@ from dataclasses import dataclass
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 from torch.distributions import Beta
 
-from robotfm.policies.encoders import build_multi_camera_encoder
+from robotfm.policies.encoders import arm_dim_indices, build_multi_camera_encoder
 from robotfm.policies.rtc import RTCConfig, RTCProcessor
 from robotfm.policies.unet1d import ConditionalUnet1D
 
 
 @dataclass
 class FlowMatchingConfig:
-    """Flow Matching 策略的关键超参数。
-
-    说明：
-    - `num_cameras` / `state_dim` / `action_dim` 决定输入输出维度；
-    - `horizon` / `n_obs_steps` 决定动作 chunk 和观测历史长度；
-    - `hidden_dim` 同时作为条件向量维度；
-    - `down_dims` 控制 ConditionalUnet1D 容量；
-    - `vision_backbone`: ``resnet18`` / ``slowfast_r50`` / ``vit_b_16`` / ``pa2``；
-    - `num_inference_steps` 决定推理时 Euler 积分步数；
-    - `beta_alpha` / `beta_beta` / `noise_s` 控制训练时采样的时间分布；
-    - `rtc` 为可选 RTC 推理配置（训练不受影响）。
-    """
-
     num_cameras: int
     state_dim: int
     action_dim: int
     horizon: int
     n_obs_steps: int
     hidden_dim: int = 256
-    num_layers: int = 4  # 保留字段以兼容旧配置；UNet 不再使用
-    num_heads: int = 4  # 保留字段以兼容旧配置；UNet 不再使用
+    num_layers: int = 4
+    num_heads: int = 4
     num_inference_steps: int = 10
     beta_alpha: float = 1.5
     beta_beta: float = 1.0
@@ -49,38 +35,24 @@ class FlowMatchingConfig:
     share_image_encoder: bool = True
     vision_backbone: str = "resnet18"
     rtc: RTCConfig | None = None
+    cameras: tuple[str, ...] | list[str] | None = None
+    depth_cameras: tuple[str, ...] | list[str] = ()
+    arm_aware: bool = False
+    token_grid: int = 8
+    use_temporal_attn: bool = True
+    use_cross_attn: bool = True
+    action_names: tuple[str, ...] | list[str] | None = None
+    state_names: tuple[str, ...] | list[str] | None = None
+    split_arm_unet: bool = False
 
 
 class FlowMatchingPolicy(nn.Module):
-    """基于 Flow Matching 的动作生成策略。
-
-    架构拆分为两部分：
-    1. `encoder`:
-       把多相机图像 + 历史状态编码成条件向量 `cond`
-       （ResNet18 / SlowFast-R50 / ViT-B/16 / PA2 YOLO，由 ``vision_backbone`` 选择）
-    2. `unet`:
-       在给定 `cond` 和时间 `t` 的前提下，对 noised action chunk
-       预测速度场 `v_theta`（ConditionalUnet1D + FiLM）
-    训练目标：
-        给定真实动作 `x1` 和高斯噪声 `x0`
-        构造插值:
-            x_t = (1 - t) * x0 + t * x1
-        目标速度:
-            v* = x1 - x0
-        网络学习:
-            v_theta(x_t, t, cond) ~= v*
-
-    推理过程：
-        从纯噪声 x0 出发，利用 Euler 积分逐步更新：
-            x <- x + dt * v_theta(x, t, cond)
-        若启用 RTC，则每步速度场经 `RTCProcessor.denoise_step` 做前缀引导。
-        最终得到未来 horizon 步动作序列。
-    """
-
     def __init__(self, cfg: FlowMatchingConfig) -> None:
         super().__init__()
         self.cfg = cfg
-
+        self.split_arm_unet = bool(cfg.split_arm_unet)
+        token_grid = int(cfg.token_grid) if cfg.use_cross_attn else 0
+        state_names = cfg.state_names if cfg.state_names is not None else cfg.action_names
         self.encoder = build_multi_camera_encoder(
             cfg.vision_backbone,
             num_cameras=cfg.num_cameras,
@@ -91,18 +63,36 @@ class FlowMatchingPolicy(nn.Module):
             use_frame_diff=cfg.use_frame_diff,
             use_coord_conv=cfg.use_coord_conv,
             share_image_encoder=cfg.share_image_encoder,
+            cameras=cfg.cameras,
+            depth_cameras=tuple(cfg.depth_cameras),
+            arm_aware=bool(cfg.arm_aware),
+            token_grid=token_grid,
+            split_arm_unet=self.split_arm_unet,
+            state_names=state_names,
         )
-
-        self.unet = ConditionalUnet1D(
-            input_dim=cfg.action_dim,
+        unet_kwargs = dict(
             global_cond_dim=cfg.hidden_dim,
             diffusion_step_embed_dim=cfg.diffusion_step_embed_dim,
-            down_dims=cfg.down_dims,
+            down_dims=tuple(cfg.down_dims),
             kernel_size=cfg.kernel_size,
             n_groups=cfg.n_groups,
             cond_predict_scale=True,
+            use_temporal_attn=cfg.use_temporal_attn,
+            use_cross_attn=cfg.use_cross_attn,
+            vision_dim=cfg.hidden_dim,
         )
-
+        if self.split_arm_unet:
+            left_idx, right_idx = arm_dim_indices(cfg.action_names, cfg.action_dim)
+            self.register_buffer(
+                "left_action_index", torch.tensor(left_idx, dtype=torch.long)
+            )
+            self.register_buffer(
+                "right_action_index", torch.tensor(right_idx, dtype=torch.long)
+            )
+            self.unet_left = ConditionalUnet1D(input_dim=len(left_idx), **unet_kwargs)
+            self.unet_right = ConditionalUnet1D(input_dim=len(right_idx), **unet_kwargs)
+        else:
+            self.unet = ConditionalUnet1D(input_dim=cfg.action_dim, **unet_kwargs)
         self._beta = Beta(cfg.beta_alpha, cfg.beta_beta)
         self.rtc_processor: RTCProcessor | None = None
         if cfg.rtc is not None and cfg.rtc.enabled:
@@ -114,40 +104,85 @@ class FlowMatchingPolicy(nn.Module):
     def _rtc_guidance_enabled(self) -> bool:
         return self._rtc_enabled() and bool(self.cfg.rtc.guidance_enabled)
 
-    def sample_time(self, batch_size: int, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
-        """采样训练时间 t。
+    def _merge_arm_actions(
+        self, left: torch.Tensor, right: torch.Tensor, like: torch.Tensor
+    ) -> torch.Tensor:
+        out = torch.zeros_like(like)
+        out[..., self.left_action_index] = left
+        out[..., self.right_action_index] = right
+        return out
 
-        先从 Beta 分布采样，再按 `noise_s` 缩放，避免极端端点数值问题。
-        """
+    def _unet_forward(
+        self,
+        x: torch.Tensor,
+        t: torch.Tensor,
+        cond: torch.Tensor | tuple[torch.Tensor, torch.Tensor],
+        tokens: torch.Tensor | tuple[torch.Tensor | None, torch.Tensor | None] | None,
+    ) -> torch.Tensor:
+        if not self.split_arm_unet:
+            return self.unet(x, t, cond, vision_tokens=tokens)
+        left_cond, right_cond = cond
+        left_tok, right_tok = tokens if tokens is not None else (None, None)
+        pred_l = self.unet_left(
+            x.index_select(-1, self.left_action_index),
+            t,
+            left_cond,
+            vision_tokens=left_tok,
+        )
+        pred_r = self.unet_right(
+            x.index_select(-1, self.right_action_index),
+            t,
+            right_cond,
+            vision_tokens=right_tok,
+        )
+        return self._merge_arm_actions(pred_l, pred_r, x)
+
+    def _obs_cond(self, batch: dict[str, torch.Tensor]):
+        depth = batch.get("obs_depth")
+        if self.split_arm_unet:
+            left_cond, right_cond, left_tok, right_tok = self.encoder.encode_arm_obs(
+                batch["obs_images"], batch["obs_state"], depth
+            )
+            return (left_cond, right_cond), (left_tok, right_tok)
+        if hasattr(self.encoder, "encode_obs"):
+            return self.encoder.encode_obs(batch["obs_images"], batch["obs_state"], depth)
+        cond = self.encoder(batch["obs_images"], batch["obs_state"])
+        return cond, None
+
+    def sample_time(self, batch_size: int, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
         sample = self._beta.sample((batch_size,)).to(device=device, dtype=dtype)
         return (self.cfg.noise_s - sample) / self.cfg.noise_s
 
-    def compute_loss(self, batch: dict[str, torch.Tensor]) -> torch.Tensor:
-        """计算 Flow Matching 训练损失。
+    def _cfm_weight(
+        self, horizon: int, act_dim: int, device: torch.device, dtype: torch.dtype
+    ) -> torch.Tensor:
+        t = torch.linspace(1.0, 0.35, horizon, device=device, dtype=dtype)
+        w = t[:, None].expand(horizon, act_dim).clone()
+        names = list(self.cfg.action_names or [])
+        grip = [i for i, n in enumerate(names) if "gripper" in str(n).lower()]
+        if not grip and act_dim >= 2:
+            grip = [act_dim - 1]
+        for i in grip:
+            if i < act_dim:
+                w[:, i] = w[:, i] * 2.0
+        return w
 
-        batch 约定：
-            obs_images:  (B, Cams, T_obs, 3, H, W)
-            obs_state:   (B, T_obs, state_dim)
-            action:      (B, horizon, action_dim)
-            action_mask: (B, horizon, 1)
-        """
+    def compute_loss(self, batch: dict[str, torch.Tensor]) -> torch.Tensor:
         actions = batch["action"]
         mask = batch["action_mask"]
-
-        cond = self.encoder(batch["obs_images"], batch["obs_state"])
-
+        cond, tokens = self._obs_cond(batch)
         noise = torch.randn_like(actions)
         t = self.sample_time(actions.shape[0], actions.device, actions.dtype)
         t_view = t[:, None, None]
-
         x_t = (1.0 - t_view) * noise + t_view * actions
         target_v = actions - noise
-        pred_v = self.unet(x_t, t, cond)
-
-        # action_mask：有效动作步=1，episode 末尾 padding 步=0
-        # 乘上 mask 后，末尾 pad 不进 loss；真实短 chunk 动作仍会训练到
-        loss = F.mse_loss(pred_v, target_v, reduction="none") * mask
-        return loss.sum() / mask.expand_as(loss).sum().clamp_min(1.0)
+        pred_v = self._unet_forward(x_t, t, cond, tokens)
+        weight = self._cfm_weight(actions.shape[1], actions.shape[2], actions.device, actions.dtype)
+        per = (pred_v.float() - target_v.float()) ** 2 * weight * mask
+        phase_w = batch.get("action_loss_w")
+        if phase_w is not None:
+            per = per * phase_w.to(device=per.device, dtype=per.dtype)
+        return per.sum() / mask.expand_as(pred_v).sum().clamp_min(1.0)
 
     @torch.no_grad()
     def sample_actions(
@@ -158,37 +193,31 @@ class FlowMatchingPolicy(nn.Module):
         inference_delay: int | None = None,
         execution_horizon: int | None = None,
     ) -> torch.Tensor:
-        """推理生成动作 chunk（Euler 积分，可选 RTC 前缀引导）。
-
-        RTC 参数与 LeRobot ``euler_integrate`` 钩子对齐：
-        - ``prev_chunk_left_over``: 上一 chunk 未执行尾部
-        - ``inference_delay``: 前缀硬约束步数
-        - ``execution_horizon``: soft blend 区域终点
-
-        ``rtc.guidance_enabled=False`` 时仍可在外层用 ActionQueue 做 ahead+discard，
-        但本函数不做前缀引导。
-        """
         b = batch["obs_state"].shape[0]
         device = batch["obs_state"].device
         dtype = batch["obs_state"].dtype
-        cond = self.encoder(batch["obs_images"], batch["obs_state"])
-
+        cond, tokens = self._obs_cond(batch)
         x = torch.randn(b, self.cfg.horizon, self.cfg.action_dim, device=device, dtype=dtype)
         steps = self.cfg.num_inference_steps
         dt = 1.0 / steps
-
         use_guidance = self._rtc_guidance_enabled()
         if inference_delay is None and self.cfg.rtc is not None:
             inference_delay = self.cfg.rtc.inference_delay
         if execution_horizon is None and self.cfg.rtc is not None:
             execution_horizon = self.cfg.rtc.execution_horizon
-
         for i in range(steps):
             t_val = i / steps
             t = torch.full((b,), t_val, device=device, dtype=dtype)
 
-            def denoise_step_partial(input_x_t, current_t=t, current_cond=cond):
-                return self.unet(input_x_t, current_t, current_cond)
+            def denoise_step_partial(
+                input_x_t,
+                current_t=t,
+                current_cond=cond,
+                current_tokens=tokens,
+            ):
+                return self._unet_forward(
+                    input_x_t, current_t, current_cond, current_tokens
+                )
 
             if use_guidance:
                 assert self.rtc_processor is not None
@@ -202,10 +231,7 @@ class FlowMatchingPolicy(nn.Module):
                 )
             else:
                 v = denoise_step_partial(x)
-
             x = x + dt * v
-
             if self.rtc_processor is not None and self.rtc_processor.is_debug_enabled():
                 self.rtc_processor.track(time=t_val, x_t=x, v_t=v)
-
         return x

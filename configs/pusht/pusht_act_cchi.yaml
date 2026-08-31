@@ -19,8 +19,6 @@ dataset:
   n_obs_steps: 1
   horizon: 8
   run_name: pusht_merged_cchi_teleop10fps
-  crop_size: 84
-  eval_fixed_crop: true
   norm_mode: gaussian
   # Align LeRobot ACT VISUAL processor (dataset MEAN_STD, not ImageNet constants)
   image_norm_mode: dataset

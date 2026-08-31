@@ -84,19 +84,20 @@ def main() -> None:
         stats=stats,
         normalize=True,
         norm_mode=cfg.dataset.norm_mode,
-        resize_size=cfg.dataset.resize_size,
-        pre_crop_size=cfg.dataset.pre_crop_size,
-        crop_size=cfg.dataset.crop_size,
-        random_crop=True,
+        image_size=cfg.dataset.image_size,
         color_jitter_brightness=cfg.dataset.color_jitter_brightness,
         color_jitter_contrast=cfg.dataset.color_jitter_contrast,
         color_jitter_saturation=cfg.dataset.color_jitter_saturation,
         color_jitter_hue=cfg.dataset.color_jitter_hue,
         defer_augment=gpu_augment,
         uint8_cache=bool(cfg.dataset.uint8_cache),
-            uint8_cache_dir=cfg.dataset.uint8_cache_dir,
-            predict_joint_delta=bool(cfg.policy.predict_joint_delta),
-        )
+        uint8_cache_dir=cfg.dataset.uint8_cache_dir,
+        predict_joint_delta=bool(cfg.policy.predict_joint_delta),
+        predict_state_delta=bool(cfg.policy.predict_state_delta),
+        depth_cameras=tuple(cfg.dataset.depth_cameras),
+        depth_min_mm=cfg.dataset.depth_min_mm,
+        depth_max_mm=cfg.dataset.depth_max_mm,
+    )
 
     loader_kwargs: dict = {
         "batch_size": cfg.train.batch_size,
@@ -124,7 +125,7 @@ def main() -> None:
 
     print(
         f"bench: bs={cfg.train.batch_size} workers={cfg.train.num_workers} "
-        f"amp={use_amp} compile={use_compile} resize={cfg.dataset.resize_size} "
+        f"amp={use_amp} compile={use_compile} image_size={cfg.dataset.image_size} "
         f"horizon={cfg.dataset.horizon} n_action_steps={cfg.policy.n_action_steps} "
         f"N={len(dataset)} warmup={args.warmup} steps={args.steps}"
     )
@@ -147,15 +148,19 @@ def main() -> None:
         batch = {k: v.to(device, non_blocking=True) for k, v in batch.items()}
         batch["obs_images"] = images_to_float01(batch["obs_images"])
         if gpu_augment:
-            batch["obs_images"] = apply_image_augments_batch(
+            depths = batch.get("obs_depth")
+            out = apply_image_augments_batch(
                 batch["obs_images"],
-                crop_size=cfg.dataset.crop_size,
-                random_crop=True,
                 brightness=cfg.dataset.color_jitter_brightness,
                 contrast=cfg.dataset.color_jitter_contrast,
                 saturation=cfg.dataset.color_jitter_saturation,
                 hue=cfg.dataset.color_jitter_hue,
+                depths=depths,
             )
+            if depths is None:
+                batch["obs_images"] = out
+            else:
+                batch["obs_images"], batch["obs_depth"] = out
         optim.zero_grad(set_to_none=True)
         with torch.amp.autocast("cuda", enabled=use_amp):
             out = policy.compute_loss(batch)

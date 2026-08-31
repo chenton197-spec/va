@@ -250,6 +250,27 @@ class StateEncoder(nn.Module):
         return self.net(x)
 
 
+def arm_dim_indices(
+    names: tuple[str, ...] | list[str] | None,
+    dim: int,
+) -> tuple[list[int], list[int]]:
+    raw = list(names or [])
+    if len(raw) != dim:
+        raw = [f"s{i}" for i in range(dim)]
+    left: list[int] = []
+    right: list[int] = []
+    for i, name in enumerate(raw):
+        lower = str(name).lower()
+        if lower.startswith("l") or "left" in lower:
+            left.append(i)
+        elif lower.startswith("r") or "right" in lower:
+            right.append(i)
+    if not left or not right:
+        half = dim // 2
+        return list(range(half)), list(range(half, dim))
+    return left, right
+
+
 class ProprioEncoder(nn.Module):
     def __init__(self, proprio_dim: int, n_obs_steps: int, cond_dim: int) -> None:
         super().__init__()
@@ -290,6 +311,8 @@ class MultiCameraEncoder(nn.Module):
         depth_cameras: tuple[str, ...] | list[str] = (),
         arm_aware: bool = False,
         token_grid: int = 0,
+        split_arm_unet: bool = False,
+        state_names: tuple[str, ...] | list[str] | None = None,
     ) -> None:
         super().__init__()
         self.num_cameras = num_cameras
@@ -324,6 +347,11 @@ class MultiCameraEncoder(nn.Module):
             and "right_hand" not in cam_set
         )
         self.arm_aware = self.dual_arm_aware or self.left_arm_aware
+        self.split_arm_unet = bool(split_arm_unet)
+        if self.split_arm_unet and not self.dual_arm_aware:
+            raise ValueError(
+                "split_arm_unet requires arm_aware dual-arm cameras and state_dim=16"
+            )
         img_dim = cond_dim if self.arm_aware else image_out_dim
 
         def _make_image_encoder(name: str) -> ResNet18Encoder:
@@ -351,9 +379,15 @@ class MultiCameraEncoder(nn.Module):
             self.camera_embed = None
 
         if self.dual_arm_aware:
-            half = state_dim // 2
-            self.left_proprio = ProprioEncoder(half, n_obs_steps, cond_dim)
-            self.right_proprio = ProprioEncoder(half, n_obs_steps, cond_dim)
+            left_idx, right_idx = arm_dim_indices(state_names, state_dim)
+            self.register_buffer(
+                "left_state_index", torch.tensor(left_idx, dtype=torch.long)
+            )
+            self.register_buffer(
+                "right_state_index", torch.tensor(right_idx, dtype=torch.long)
+            )
+            self.left_proprio = ProprioEncoder(len(left_idx), n_obs_steps, cond_dim)
+            self.right_proprio = ProprioEncoder(len(right_idx), n_obs_steps, cond_dim)
             self.arm_fuse = nn.ModuleDict(
                 {
                     "left": nn.Sequential(
@@ -370,12 +404,22 @@ class MultiCameraEncoder(nn.Module):
                     ),
                 }
             )
-            self.fuse = nn.Sequential(
-                nn.Linear(cond_dim * 3, cond_dim * 2),
-                nn.LayerNorm(cond_dim * 2),
-                nn.SiLU(),
-                nn.Linear(cond_dim * 2, cond_dim),
-            )
+            def _make_tri_fuse() -> nn.Sequential:
+                return nn.Sequential(
+                    nn.Linear(cond_dim * 3, cond_dim * 2),
+                    nn.LayerNorm(cond_dim * 2),
+                    nn.SiLU(),
+                    nn.Linear(cond_dim * 2, cond_dim),
+                )
+
+            if self.split_arm_unet:
+                self.fuse = None
+                self.arm_cond_fuse = nn.ModuleDict(
+                    {"left": _make_tri_fuse(), "right": _make_tri_fuse()}
+                )
+            else:
+                self.fuse = _make_tri_fuse()
+                self.arm_cond_fuse = None
             self.state_encoder = None
             self.proj = None
         elif self.left_arm_aware:
@@ -397,6 +441,7 @@ class MultiCameraEncoder(nn.Module):
                 nn.SiLU(),
                 nn.Linear(cond_dim * 2, cond_dim),
             )
+            self.arm_cond_fuse = None
             self.state_encoder = None
             self.proj = None
         else:
@@ -404,6 +449,7 @@ class MultiCameraEncoder(nn.Module):
             self.right_proprio = None
             self.arm_fuse = None
             self.fuse = None
+            self.arm_cond_fuse = None
             self.state_encoder = StateEncoder(state_dim=state_dim, out_dim=state_out_dim)
             fused_dim = num_cameras * img_dim + state_out_dim * n_obs_steps
             self.proj = nn.Sequential(
@@ -440,16 +486,14 @@ class MultiCameraEncoder(nn.Module):
         d_idx = self.depth_cameras.index(name)
         return torch.cat([rgb, obs_depth[:, d_idx]], dim=2)
 
-    def encode_obs(
+    def _encode_cameras(
         self,
         obs_images: torch.Tensor,
-        obs_state: torch.Tensor,
-        obs_depth: torch.Tensor | None = None,
-    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        obs_depth: torch.Tensor | None,
+    ) -> tuple[dict[str, torch.Tensor], dict[str, torch.Tensor]]:
         b, cams, t, _, _, _ = obs_images.shape
         if cams != self.num_cameras:
             raise ValueError(f"Expected {self.num_cameras} cameras, got {cams}")
-
         cam_globals: list[torch.Tensor] = []
         cam_tokens: list[torch.Tensor] = []
         use_tokens = self.token_grid > 0
@@ -475,23 +519,80 @@ class MultiCameraEncoder(nn.Module):
                 cam_globals.append(g)
                 if use_tokens and tok is not None:
                     cam_tokens.append(tok + self.camera_embed[i].view(1, 1, -1))
+        by_name = {name: g for name, g in zip(self.cameras, cam_globals)}
+        tok_by_name = {name: tok for name, tok in zip(self.cameras, cam_tokens)}
+        return by_name, tok_by_name
 
-        vision_tokens = torch.cat(cam_tokens, dim=1) if cam_tokens else None
+    def _dual_arm_features(
+        self,
+        by_name: dict[str, torch.Tensor],
+        obs_state: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        left_p = self.left_proprio(obs_state.index_select(-1, self.left_state_index))
+        right_p = self.right_proprio(obs_state.index_select(-1, self.right_state_index))
+        left = self.arm_fuse["left"](torch.cat([by_name["left_hand"], left_p], dim=-1))
+        right = self.arm_fuse["right"](torch.cat([by_name["right_hand"], right_p], dim=-1))
+        return left_p, right_p, left, right
+
+    def encode_arm_obs(
+        self,
+        obs_images: torch.Tensor,
+        obs_state: torch.Tensor,
+        obs_depth: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
+        if not self.split_arm_unet or self.arm_cond_fuse is None:
+            raise RuntimeError("encode_arm_obs requires split_arm_unet=True")
+        by_name, tok_by_name = self._encode_cameras(obs_images, obs_depth)
+        left_p, right_p, left, right = self._dual_arm_features(by_name, obs_state)
+        left_cond = self.arm_cond_fuse["left"](
+            torch.cat([by_name["head"], left, right_p], dim=-1)
+        )
+        right_cond = self.arm_cond_fuse["right"](
+            torch.cat([by_name["head"], right, left_p], dim=-1)
+        )
+        if tok_by_name:
+            left_tokens = torch.cat([tok_by_name["head"], tok_by_name["left_hand"]], dim=1)
+            right_tokens = torch.cat(
+                [tok_by_name["head"], tok_by_name["right_hand"]], dim=1
+            )
+        else:
+            left_tokens = None
+            right_tokens = None
+        return left_cond, right_cond, left_tokens, right_tokens
+
+    def encode_obs(
+        self,
+        obs_images: torch.Tensor,
+        obs_state: torch.Tensor,
+        obs_depth: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        b, _, t, _, _, _ = obs_images.shape
+        by_name, tok_by_name = self._encode_cameras(obs_images, obs_depth)
+        vision_tokens = (
+            torch.cat([tok_by_name[name] for name in self.cameras], dim=1)
+            if tok_by_name
+            else None
+        )
 
         if self.dual_arm_aware:
-            by_name = {name: g for name, g in zip(self.cameras, cam_globals)}
-            left_p = self.left_proprio(obs_state[:, :, :8])
-            right_p = self.right_proprio(obs_state[:, :, 8:])
-            left = self.arm_fuse["left"](torch.cat([by_name["left_hand"], left_p], dim=-1))
-            right = self.arm_fuse["right"](torch.cat([by_name["right_hand"], right_p], dim=-1))
+            left_p, right_p, left, right = self._dual_arm_features(by_name, obs_state)
+            if self.split_arm_unet:
+                left_cond = self.arm_cond_fuse["left"](
+                    torch.cat([by_name["head"], left, right_p], dim=-1)
+                )
+                left_tokens = (
+                    torch.cat([tok_by_name["head"], tok_by_name["left_hand"]], dim=1)
+                    if tok_by_name
+                    else None
+                )
+                return left_cond, left_tokens
             global_emb = self.fuse(torch.cat([by_name["head"], left, right], dim=-1))
         elif self.left_arm_aware:
-            by_name = {name: g for name, g in zip(self.cameras, cam_globals)}
             left_p = self.left_proprio(obs_state)
             left = self.arm_fuse["left"](torch.cat([by_name["left_hand"], left_p], dim=-1))
             global_emb = self.fuse(torch.cat([by_name["head"], left], dim=-1))
         else:
-            img_feat = torch.cat(cam_globals, dim=-1)
+            img_feat = torch.cat([by_name[name] for name in self.cameras], dim=-1)
             state = obs_state.reshape(b * t, -1)
             state_feat = self.state_encoder(state).reshape(b, -1)
             global_emb = self.proj(torch.cat([img_feat, state_feat], dim=-1))
@@ -524,6 +625,8 @@ def build_multi_camera_encoder(
     depth_cameras: tuple[str, ...] | list[str] = (),
     arm_aware: bool = False,
     token_grid: int = 0,
+    split_arm_unet: bool = False,
+    state_names: tuple[str, ...] | list[str] | None = None,
 ) -> nn.Module:
     """按 ``vision_backbone`` 构造多相机观测编码器（输出 ``cond``）。
 
@@ -550,6 +653,8 @@ def build_multi_camera_encoder(
             depth_cameras=depth_cameras,
             arm_aware=arm_aware,
             token_grid=token_grid,
+            split_arm_unet=split_arm_unet,
+            state_names=state_names,
         )
     if backbone in {"slowfast_r50", "slowfast"}:
         from robotfm.policies.video_encoders import MultiCameraSlowFastEncoder

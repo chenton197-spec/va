@@ -17,7 +17,7 @@ from torch.utils.data import DataLoader
 
 from robotfm.collect.loop import get_run_dir
 from robotfm.config import _normalize_rtc_config, load_config
-from robotfm.data.dataset import build_episode_dataset
+from robotfm.data.dataset import build_episode_dataset, parse_image_hw
 from robotfm.data.lerobot_dataset import (
     LeRobotImageSequenceDataset,
     is_lerobot_image_sequence_root,
@@ -94,9 +94,7 @@ def main() -> int:
         stats=stats,
         normalize=True,
         norm_mode=cfg.dataset.norm_mode,
-        resize_size=cfg.dataset.resize_size,
-        crop_size=cfg.dataset.crop_size,
-        random_crop=True,
+        image_size=cfg.dataset.image_size,
     )
     assert isinstance(dataset, LeRobotImageSequenceDataset)
     assert len(dataset) > 0, "empty dataset"
@@ -109,8 +107,10 @@ def main() -> int:
     sample = dataset[0]
     n_cams = len(cfg.cameras)
     n_obs = cfg.dataset.n_obs_steps
-    crop = cfg.dataset.crop_size
-    assert sample["obs_images"].shape == (n_cams, n_obs, 3, crop, crop), sample[
+    hw = parse_image_hw(cfg.dataset.image_size)
+    assert hw is not None
+    h, w = hw
+    assert sample["obs_images"].shape == (n_cams, n_obs, 3, h, w), sample[
         "obs_images"
     ].shape
     assert sample["obs_state"].shape == (n_obs, 7), sample["obs_state"].shape

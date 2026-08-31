@@ -20,9 +20,7 @@ dataset:
   n_obs_steps: 2
   horizon: 16
   run_name: shine_shoes_fr3_s256_prefix_speedup
-  resize_size: 256
-  crop_size: 224`-
-  eval_fixed_crop: true
+  image_size: [256, 256]
   # 训练光度增强（评估不加）；0=关闭。同一样本共用一组随机因子。
   color_jitter_brightness: 0.2
   color_jitter_contrast: 0.2

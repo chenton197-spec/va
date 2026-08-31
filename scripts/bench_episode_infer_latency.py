@@ -85,9 +85,7 @@ def _build_obs_batch(
     cameras: list[str],
     t: int,
     n_obs_steps: int,
-    pre_crop_size: int | None,
-    resize_size: int | None,
-    crop_size: int | None,
+    image_size: int | list[int] | None,
     stats: dict,
     norm_mode: str,
     device: torch.device,
@@ -109,10 +107,7 @@ def _build_obs_batch(
     obs_images = torch.stack(camera_histories, dim=0)
     obs_images = spatial_preprocess_images(
         obs_images,
-        pre_crop_size=pre_crop_size,
-        resize_size=resize_size,
-        crop_size=crop_size,
-        random_crop=False,
+        image_size=image_size,
     )
 
     state = normalize(states[obs_indices].astype(np.float32), stats, prefix="state", mode=norm_mode)
@@ -361,9 +356,7 @@ def main() -> None:
                 cameras=cameras,
                 t=t,
                 n_obs_steps=n_obs,
-                pre_crop_size=cfg.dataset.pre_crop_size,
-                resize_size=cfg.dataset.resize_size,
-                crop_size=cfg.dataset.crop_size,
+                image_size=cfg.dataset.image_size,
                 stats=stats,
                 norm_mode=norm_mode,
                 device=device,

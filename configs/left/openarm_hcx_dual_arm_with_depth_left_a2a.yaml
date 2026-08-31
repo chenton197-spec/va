@@ -3,7 +3,7 @@
 # 数据：openarm_hcx_dual_arm_with_depth 划出 train/val（seed=43；缺 ep4 parquet）
 #   train 19 ep / 54848 帧；val 2 ep [1, 10] / 5612 帧
 # → floor(N/128)=428 steps/epoch → 100 epoch = 42800
-# 图像：1280×720 中心裁 720 → resize 256；uint8_cache + GPU color_jitter
+# 图像：1280×720 resize [256, 455]；uint8_cache + GPU color_jitter
 # 本机吞吐 2026-08-19（fp32, uint8_cache 256, h8, 2 cam sepenc）：
 #   bs32 w2 166 samp/s 2.9GB；bs80 179 / 6.5GB；bs128 w4 182 / 10.1GB ←
 #   compile bs128 w4 183 samp/s；w6 变慢；bs144+ 掉到 ~172；bs192 OOM
@@ -24,10 +24,7 @@ dataset:
   horizon: 8
   run_name: openarm_hcx_dual_arm_with_depth_train
   val_run_name: openarm_hcx_dual_arm_with_depth_val  # 2 ep holdout；训练中开环 MAE
-  pre_crop_size: 720
-  resize_size: 256
-  crop_size: null
-  eval_fixed_crop: true
+  image_size: [256, 455]
   norm_mode: gaussian_2std
   color_jitter_brightness: 0.1
   color_jitter_contrast: 0.1

@@ -16,8 +16,7 @@ dataset:
   n_obs_steps: 8
   horizon: 24
   run_name: shine_shoes_fr3_s256_prefix_speedup
-  resize_size: 256
-  crop_size: 224
+  image_size: [256, 256]
   color_jitter_brightness: 0.2
   color_jitter_contrast: 0.2
   color_jitter_saturation: 0.1

@@ -17,20 +17,23 @@ Checkpoint 含 ``step`` / ``policy_state_dict`` / ``optimizer_state_dict`` /
 checkpoint 存未包装权重，可与非 compile 推理/续训互通。
 ``dataset.val_run_name`` + ``train.val_freq`` 时，训练中在验证集上算
 训练 loss（``compute_loss``）以及开环物理 MAE/MSE（无 jitter / dropout /
-history noise，用训练集 stats）。最优 ``mae_joints`` 另存
-``checkpoint_best_val.pt``，曲线写 ``val.jsonl``。
+history noise，用训练集 stats）。最优 ``mae_joints`` / ``mse_all`` / ``loss``
+分别存 ``checkpoint_best_val.pt`` / ``checkpoint_best_mse.pt`` /
+``checkpoint_best_loss.pt``，曲线写 ``val.jsonl``。
 """
 
 from __future__ import annotations
 
+import copy
 import json
 import math
 import time
 from datetime import datetime
 from pathlib import Path
 
+import numpy as np
 import torch
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Subset
 from tqdm import tqdm
 
 from robotfm.config import (
@@ -45,13 +48,18 @@ from robotfm.data.action_delta import (
     joint_mask_from_names,
 )
 from robotfm.data.dataset import (
+    apply_arm_segment_dropout,
     apply_camera_dropout,
     apply_image_augments_batch,
     apply_state_dropout,
     build_episode_dataset,
     camera_dropout_prob,
     images_to_float01,
-    state_group_masks,
+)
+from robotfm.data.lerobot_dataset import (
+    is_lerobot_image_sequence_root,
+    list_episode_indices,
+    load_lerobot_info,
 )
 from robotfm.data.stats import (
     denormalize,
@@ -109,6 +117,33 @@ def _maybe_compile_policy(
     return compiled  # type: ignore[return-value]
 
 
+class ModelEMA:
+    def __init__(self, model: torch.nn.Module, decay: float = 0.999) -> None:
+        self.decay = float(decay)
+        self.ema = copy.deepcopy(model)
+        self.ema.eval()
+        for p in self.ema.parameters():
+            p.requires_grad_(False)
+
+    @torch.no_grad()
+    def update(self, model: torch.nn.Module) -> None:
+        d = self.decay
+        ema_params = dict(self.ema.named_parameters())
+        for name, param in model.named_parameters():
+            if not param.requires_grad:
+                continue
+            ema_params[name].mul_(d).add_(param.data, alpha=1.0 - d)
+        ema_bufs = dict(self.ema.named_buffers())
+        for name, buf in model.named_buffers():
+            ema_buf = ema_bufs.get(name)
+            if ema_buf is not None and ema_buf.shape == buf.shape:
+                ema_buf.copy_(buf)
+
+    def to(self, device: torch.device) -> ModelEMA:
+        self.ema.to(device)
+        return self
+
+
 def _checkpoint_payload(
     *,
     step: int,
@@ -117,11 +152,12 @@ def _checkpoint_payload(
     cfg: RobotFMConfig,
     stats: dict,
     scaler: torch.amp.GradScaler | None = None,
+    weights_module: torch.nn.Module | None = None,
 ) -> dict:
-    """统一 checkpoint 字段，支持续训（含 optimizer / step / AMP scaler）。"""
+    src = weights_module if weights_module is not None else policy
     payload = {
         "step": step,
-        "policy_state_dict": _unwrap_compiled(policy).state_dict(),
+        "policy_state_dict": _unwrap_compiled(src).state_dict(),
         "optimizer_state_dict": optim.state_dict(),
         "config": cfg,
         "stats": stats,
@@ -418,6 +454,10 @@ def build_policy(cfg: RobotFMConfig, stats: dict | None = None) -> PolicyModule:
 
     down_dims = tuple(cfg.policy.down_dims)
     rtc = _normalize_rtc_config(cfg.policy.rtc)
+    depth_cameras = tuple(cfg.dataset.depth_cameras or ())
+    share_image_encoder = bool(cfg.policy.share_image_encoder)
+    if len(cfg.cameras) > 1 or depth_cameras:
+        share_image_encoder = False
     fm_cfg = FlowMatchingConfig(
         num_cameras=len(cfg.cameras),
         state_dim=cfg.state_dim,
@@ -438,18 +478,39 @@ def build_policy(cfg: RobotFMConfig, stats: dict | None = None) -> PolicyModule:
         pretrained_encoder=cfg.policy.pretrained_encoder,
         use_frame_diff=cfg.policy.use_frame_diff,
         use_coord_conv=cfg.policy.use_coord_conv,
-        share_image_encoder=cfg.policy.share_image_encoder,
+        share_image_encoder=share_image_encoder,
         vision_backbone=cfg.policy.vision_backbone,
         rtc=rtc if rtc.enabled else None,
+        cameras=tuple(cfg.cameras),
+        depth_cameras=depth_cameras,
+        arm_aware=cfg.policy.arm_aware,
+        token_grid=cfg.policy.token_grid,
+        use_temporal_attn=cfg.policy.use_temporal_attn,
+        use_cross_attn=cfg.policy.use_cross_attn,
+        action_names=tuple(cfg.action_names) if cfg.action_names else None,
+        state_names=tuple(cfg.state_names) if cfg.state_names else None,
+        split_arm_unet=bool(cfg.policy.split_arm_unet),
     )
     return FlowMatchingPolicy(fm_cfg)
 
 
+def _proprio_param_ids(policy: PolicyModule) -> set[int]:
+    encoder = getattr(policy, "encoder", None)
+    if encoder is None:
+        return set()
+    ids: set[int] = set()
+    for name in ("left_proprio", "right_proprio", "state_encoder", "proprio_encoder"):
+        module = getattr(encoder, name, None)
+        if module is not None:
+            ids.update(id(p) for p in module.parameters())
+    return ids
+
+
 def _build_optimizer(policy: PolicyModule, cfg: RobotFMConfig) -> torch.optim.Optimizer:
-    """视觉 backbone 用更小 lr，其余参数用完整 lr。"""
     if isinstance(policy, ACTPolicy):
         backbone_ids = {id(p) for p in policy.model.backbone.parameters()}
         encoder_params = [p for p in policy.parameters() if id(p) in backbone_ids]
+        proprio_params: list[torch.nn.Parameter] = []
         other_params = [p for p in policy.parameters() if id(p) not in backbone_ids]
     else:
         vision_fn = getattr(policy.encoder, "vision_parameters", None)
@@ -457,16 +518,46 @@ def _build_optimizer(policy: PolicyModule, cfg: RobotFMConfig) -> torch.optim.Op
             encoder_ids = {id(p) for p in vision_fn()}
         else:
             encoder_ids = {id(p) for p in policy.encoder.image_encoder.parameters()}
+        proprio_ids = _proprio_param_ids(policy)
         encoder_params = [p for p in policy.parameters() if id(p) in encoder_ids]
-        other_params = [p for p in policy.parameters() if id(p) not in encoder_ids]
+        proprio_params = [
+            p for p in policy.parameters() if id(p) in proprio_ids and id(p) not in encoder_ids
+        ]
+        other_params = [
+            p
+            for p in policy.parameters()
+            if id(p) not in encoder_ids and id(p) not in proprio_ids
+        ]
     encoder_lr = cfg.train.lr * cfg.train.encoder_lr_scale
-    return torch.optim.AdamW(
-        [
-            {"params": encoder_params, "lr": encoder_lr, "base_lr": encoder_lr},
-            {"params": other_params, "lr": cfg.train.lr, "base_lr": cfg.train.lr},
-        ],
-        weight_decay=cfg.train.weight_decay,
+    proprio_lr = cfg.train.lr * float(getattr(cfg.train, "proprio_lr_scale", 0.05))
+    groups = []
+    if encoder_params:
+        groups.append(
+            {
+                "params": encoder_params,
+                "lr": encoder_lr,
+                "base_lr": encoder_lr,
+                "name": "vision",
+            }
+        )
+    if proprio_params:
+        groups.append(
+            {
+                "params": proprio_params,
+                "lr": proprio_lr,
+                "base_lr": proprio_lr,
+                "name": "proprio",
+            }
+        )
+    groups.append(
+        {
+            "params": other_params,
+            "lr": cfg.train.lr,
+            "base_lr": cfg.train.lr,
+            "name": "rest",
+        }
     )
+    return torch.optim.AdamW(groups, weight_decay=cfg.train.weight_decay)
 
 
 _LOSS_TERM_KEYS = ("flow", "consistency", "enc_recon", "flow_recon")
@@ -475,8 +566,6 @@ _LOSS_TERM_KEYS = ("flow", "consistency", "enc_recon", "flow_recon")
 def _apply_obs_augments(
     batch: dict[str, torch.Tensor],
     *,
-    crop_size: int | None,
-    random_crop: bool,
     brightness: float = 0.0,
     contrast: float = 0.0,
     saturation: float = 0.0,
@@ -485,8 +574,6 @@ def _apply_obs_augments(
     depths = batch.get("obs_depth")
     out = apply_image_augments_batch(
         batch["obs_images"],
-        crop_size=crop_size,
-        random_crop=random_crop,
         brightness=brightness,
         contrast=contrast,
         saturation=saturation,
@@ -528,14 +615,40 @@ def _val_run_name(cfg: RobotFMConfig) -> str | None:
     return name or None
 
 
+def _val_ratio(cfg: RobotFMConfig) -> float:
+    return max(0.0, float(getattr(cfg.dataset, "val_ratio", 0) or 0))
+
+
+def _val_enabled(cfg: RobotFMConfig) -> bool:
+    return _val_run_name(cfg) is not None or _val_ratio(cfg) > 0
+
+
 def _val_freq(cfg: RobotFMConfig) -> int:
-    """0 = 关闭。``val_run_name`` 已设且 ``val_freq<=0`` 时跟 ``save_freq``。"""
-    if _val_run_name(cfg) is None:
+    if not _val_enabled(cfg):
         return 0
     freq = int(getattr(cfg.train, "val_freq", 0) or 0)
-    if freq <= 0:
-        return int(cfg.train.save_freq)
-    return freq
+    if freq > 0:
+        return freq
+    latest = int(getattr(cfg.train, "latest_save_freq", 0) or 0)
+    if latest > 0:
+        return latest
+    return int(cfg.train.save_freq)
+
+
+def _split_episode_ids(
+    ep_ids: list[int], val_ratio: float, seed: int
+) -> tuple[list[int], list[int]]:
+    ids = [int(x) for x in ep_ids]
+    if val_ratio <= 0 or len(ids) <= 1:
+        return ids, []
+    rng = np.random.default_rng(int(seed))
+    perm = rng.permutation(len(ids))
+    n_val = max(1, int(round(len(ids) * float(val_ratio))))
+    n_val = min(n_val, len(ids) - 1)
+    val_set = {ids[int(i)] for i in perm[:n_val]}
+    train_ids = [e for e in ids if e not in val_set]
+    val_ids = [e for e in ids if e in val_set]
+    return train_ids, val_ids
 
 
 def _build_val_loader(
@@ -544,8 +657,10 @@ def _build_val_loader(
     val_dir: Path,
     stats: dict,
     gpu_augment: bool,
+    episode_ids: list[int] | None = None,
+    uint8_cache: bool = False,
+    uint8_cache_dir: str | None = None,
 ) -> DataLoader:
-    """验证集：训练集 stats、无 jitter / random crop / dropout。"""
     dataset = build_episode_dataset(
         run_dir=val_dir,
         n_obs_steps=cfg.dataset.n_obs_steps,
@@ -556,20 +671,20 @@ def _build_val_loader(
         normalize=True,
         norm_mode=cfg.dataset.norm_mode,
         resize_size=cfg.dataset.resize_size,
-        pre_crop_size=cfg.dataset.pre_crop_size,
-        crop_size=cfg.dataset.crop_size if cfg.dataset.eval_fixed_crop else None,
-        random_crop=False,
+        image_size=cfg.dataset.image_size,
         color_jitter_brightness=0.0,
         color_jitter_contrast=0.0,
         color_jitter_saturation=0.0,
         color_jitter_hue=0.0,
         defer_augment=gpu_augment,
-        uint8_cache=False,
-        uint8_cache_dir=None,
+        uint8_cache=uint8_cache,
+        uint8_cache_dir=uint8_cache_dir,
         predict_joint_delta=bool(cfg.policy.predict_joint_delta),
+        predict_state_delta=bool(cfg.policy.predict_state_delta),
         depth_cameras=tuple(cfg.dataset.depth_cameras),
         depth_min_mm=cfg.dataset.depth_min_mm,
         depth_max_mm=cfg.dataset.depth_max_mm,
+        episode_ids=episode_ids,
     )
     loader_kwargs: dict = {
         "batch_size": cfg.train.batch_size,
@@ -587,12 +702,111 @@ def _build_val_loader(
 def _split_joint_gripper_means(
     dim_err: torch.Tensor, joint_mask: torch.Tensor | list | tuple,
 ) -> tuple[float, float, float]:
-    """``dim_err`` 为 (action_dim,) 的 per-dim 均值。返回 joints / gripper / all。"""
     joint_t = torch.as_tensor(joint_mask, device=dim_err.device, dtype=torch.bool)
     grip_t = ~joint_t
     joints = float(dim_err[joint_t].mean().item()) if bool(joint_t.any()) else float("nan")
     gripper = float(dim_err[grip_t].mean().item()) if bool(grip_t.any()) else float("nan")
     return joints, gripper, float(dim_err.mean().item())
+
+
+def _arm_dim_groups(names: list[str], action_dim: int) -> dict[str, list[int]]:
+    left_j: list[int] = []
+    right_j: list[int] = []
+    left_g: list[int] = []
+    right_g: list[int] = []
+    for i, name in enumerate(list(names)[:action_dim]):
+        raw = str(name)
+        nl = raw.lower()
+        if "gripper" in nl:
+            if "left" in nl or raw.startswith("L"):
+                left_g.append(i)
+            elif "right" in nl or raw.startswith("R"):
+                right_g.append(i)
+            continue
+        if raw.startswith("L") or nl.startswith("left"):
+            left_j.append(i)
+        elif raw.startswith("R") or nl.startswith("right"):
+            right_j.append(i)
+    return {
+        "mae_left_joints": left_j,
+        "mae_right_joints": right_j,
+        "mae_left_gripper": left_g,
+        "mae_right_gripper": right_g,
+    }
+
+
+def _mean_sel(dim_err: torch.Tensor, idxs: list[int]) -> float:
+    if not idxs:
+        return float("nan")
+    return float(dim_err[idxs].mean().item())
+
+
+def _subset_val_loader(loader: DataLoader, n: int, step: int) -> DataLoader:
+    ds = loader.dataset
+    total = len(ds)
+    take = total if n <= 0 else min(int(n), total)
+    g = torch.Generator()
+    g.manual_seed(int(step) + 17)
+    idx = torch.randperm(total, generator=g)[:take].tolist()
+    return DataLoader(
+        Subset(ds, idx),
+        batch_size=loader.batch_size,
+        shuffle=False,
+        num_workers=0,
+        pin_memory=True,
+        drop_last=False,
+    )
+
+
+def _clone_obs_batch(batch: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+    return {k: (v.clone() if torch.is_tensor(v) else v) for k, v in batch.items()}
+
+
+def _pred_flow_v(
+    raw: torch.nn.Module,
+    batch: dict[str, torch.Tensor],
+    noise: torch.Tensor,
+    t: torch.Tensor,
+) -> torch.Tensor:
+    cond, tokens = raw._obs_cond(batch)
+    t_view = t[:, None, None]
+    x_t = (1.0 - t_view) * noise + t_view * batch["action"]
+    if hasattr(raw, "_unet_forward"):
+        return raw._unet_forward(x_t, t, cond, tokens)
+    return raw.unet(x_t, t, cond, vision_tokens=tokens)
+
+
+def _vision_ablation_report(
+    raw: torch.nn.Module,
+    batches: list[dict[str, torch.Tensor]],
+) -> dict[str, float]:
+    totals = {"rgb_zero": 0.0, "rgb_noise": 0.0, "depth_zero": 0.0}
+    n = 0
+    for batch in batches:
+        actions = batch["action"]
+        noise = torch.randn_like(actions)
+        t = raw.sample_time(actions.shape[0], actions.device, actions.dtype)
+        v_ref = _pred_flow_v(raw, batch, noise, t)
+        zero_rgb = _clone_obs_batch(batch)
+        zero_rgb["obs_images"] = torch.zeros_like(batch["obs_images"])
+        noise_rgb = _clone_obs_batch(batch)
+        noise_rgb["obs_images"] = torch.rand_like(batch["obs_images"])
+        zero_depth = _clone_obs_batch(batch)
+        depth = batch.get("obs_depth")
+        if depth is not None:
+            zero_depth["obs_depth"] = torch.zeros_like(depth)
+        variants = {
+            "rgb_zero": zero_rgb,
+            "rgb_noise": noise_rgb,
+            "depth_zero": zero_depth,
+        }
+        for name, b2 in variants.items():
+            v_ab = _pred_flow_v(raw, b2, noise, t)
+            totals[name] += float((v_ref - v_ab).abs().mean().item())
+        n += 1
+    if n == 0:
+        return totals
+    return {k: v / n for k, v in totals.items()}
 
 
 @torch.no_grad()
@@ -604,15 +818,13 @@ def _evaluate_val_mae(
     device: torch.device,
     *,
     use_amp: bool,
-    gpu_augment: bool,
+    step: int = 0,
 ) -> dict[str, float]:
-    """验证集：训练 loss + 开环物理 MAE/MSE（history_noise=0）。
-
-    走未 compile 模块，避免再编译 ``sample_actions`` / ``compute_loss``。
-    """
     n_act = int(cfg.policy.n_action_steps)
     predict_delta = bool(cfg.policy.predict_joint_delta)
-    joint_mask = joint_mask_from_names(list(cfg.action_names), int(cfg.action_dim))
+    names = list(cfg.action_names)
+    joint_mask = joint_mask_from_names(names, int(cfg.action_dim))
+    groups = _arm_dim_groups(names, int(cfg.action_dim))
     raw = _unwrap_compiled(policy)
     old_noise = getattr(getattr(raw, "cfg", None), "history_noise_std", None)
     if old_noise is not None:
@@ -628,16 +840,18 @@ def _evaluate_val_mae(
     sum_loss = 0.0
     sum_terms = {key: 0.0 for key in _LOSS_TERM_KEYS}
     seen_terms: set[str] = set()
+    kept_batches: list[dict[str, torch.Tensor]] = []
+    val_samples = int(getattr(cfg.train, "val_samples", 0) or 0)
+    eval_loader = _subset_val_loader(loader, val_samples, step)
+    can_ablate = (
+        hasattr(raw, "_obs_cond")
+        and hasattr(raw, "sample_time")
+        and (hasattr(raw, "_unet_forward") or hasattr(raw, "unet"))
+    )
     try:
-        for batch in loader:
+        for batch in eval_loader:
             batch = {k: v.to(device, non_blocking=True) for k, v in batch.items()}
             batch["obs_images"] = images_to_float01(batch["obs_images"])
-            if gpu_augment and cfg.dataset.crop_size is not None and cfg.dataset.eval_fixed_crop:
-                _apply_obs_augments(
-                    batch,
-                    crop_size=cfg.dataset.crop_size,
-                    random_crop=False,
-                )
             with torch.amp.autocast("cuda", enabled=use_amp):
                 loss, terms = _unpack_policy_loss(raw.compute_loss(batch))
                 pred_norm = raw.sample_actions(batch)[:, :n_act].float()
@@ -682,6 +896,11 @@ def _evaluate_val_mae(
             sum_sq = sq_sum if sum_sq is None else sum_sq + sq_sum
             n_valid += float(mask.sum().item())
             n_samples += bsz
+            if can_ablate:
+                kept_batches.append(batch)
+        ablation = (
+            _vision_ablation_report(raw, kept_batches) if can_ablate and kept_batches else {}
+        )
     finally:
         if old_noise is not None:
             raw.cfg.history_noise_std = old_noise
@@ -690,24 +909,67 @@ def _evaluate_val_mae(
             raw.train()
     if sum_abs is None or sum_sq is None or n_valid <= 0 or n_samples <= 0:
         raise RuntimeError("val loader produced no samples")
-    mae_j, mae_g, mae_all = _split_joint_gripper_means(sum_abs / n_valid, joint_mask)
-    mse_j, mse_g, mse_all = _split_joint_gripper_means(sum_sq / n_valid, joint_mask)
+    dim_mae = sum_abs / n_valid
+    dim_mse = sum_sq / n_valid
+    mae_j, mae_g, mae_all = _split_joint_gripper_means(dim_mae, joint_mask)
+    mse_j, mse_g, mse_all = _split_joint_gripper_means(dim_mse, joint_mask)
     metrics: dict[str, float] = {
         "loss": sum_loss / float(n_samples),
+        "mae": mae_all,
+        "rmse": float(math.sqrt(mse_all)),
         "mae_joints": mae_j,
         "mae_gripper": mae_g,
         "mae_all": mae_all,
         "mse_joints": mse_j,
         "mse_gripper": mse_g,
         "mse_all": mse_all,
+        "mae_left_joints": _mean_sel(dim_mae, groups["mae_left_joints"]),
+        "mae_right_joints": _mean_sel(dim_mae, groups["mae_right_joints"]),
+        "mae_left_gripper": _mean_sel(dim_mae, groups["mae_left_gripper"]),
+        "mae_right_gripper": _mean_sel(dim_mae, groups["mae_right_gripper"]),
         "n_samples": float(n_samples),
         "n_valid_steps": n_valid,
         "elapsed_s": time.perf_counter() - t0,
     }
+    for i, name in enumerate(names[: int(dim_mae.numel())]):
+        metrics[f"mae_{name}"] = float(dim_mae[i].item())
+    for key, val in ablation.items():
+        metrics[f"ablate_{key}"] = float(val)
     for key in _LOSS_TERM_KEYS:
         if key in seen_terms:
             metrics[key] = sum_terms[key] / float(n_samples)
     return metrics
+
+
+_BEST_CKPT_SPECS: tuple[tuple[str, str, str], ...] = (
+    ("mae_joints", "checkpoint_best_val.pt", "best_mae"),
+    ("mse_all", "checkpoint_best_mse.pt", "best_mse"),
+    ("loss", "checkpoint_best_loss.pt", "best_loss"),
+)
+
+
+def _maybe_save_best_ckpts(
+    metrics: dict[str, float],
+    best: dict[str, float],
+    *,
+    output_dir: Path,
+    logger: _TrainLogger,
+    make_payload,
+) -> list[str]:
+    tags: list[str] = []
+    payload = None
+    for key, filename, tag in _BEST_CKPT_SPECS:
+        val = float(metrics[key])
+        if not math.isfinite(val) or val >= best[key]:
+            continue
+        best[key] = val
+        if payload is None:
+            payload = make_payload()
+        path = output_dir / filename
+        torch.save(payload, path)
+        logger.log(f"saved: {path}", also_print=False)
+        tags.append(tag)
+    return tags
 
 
 def _log_val_metrics(
@@ -718,34 +980,80 @@ def _log_val_metrics(
     output_dir: Path,
     logger: _TrainLogger,
     pbar: tqdm | None = None,
-    best: bool = False,
+    best_tags: list[str] | None = None,
+    action_names: list[str] | None = None,
 ) -> None:
     term_msg = "".join(
         f" {key}={metrics[key]:.4f}"
         for key in _LOSS_TERM_KEYS
         if key in metrics
     )
+    tag_msg = ("  " + " ".join(f"[{t}]" for t in best_tags)) if best_tags else ""
     msg = (
         f"val step={step}/{total_steps} "
         f"loss={metrics['loss']:.4f}{term_msg} "
-        f"mse_joints={metrics['mse_joints']:.4f} "
-        f"mse_gripper={metrics['mse_gripper']:.4f} "
+        f"mae={metrics.get('mae', metrics['mae_all']):.4f} "
+        f"rmse={metrics.get('rmse', math.sqrt(metrics['mse_all'])):.4f} "
+        f"L_j={metrics.get('mae_left_joints', float('nan')):.4f} "
+        f"L_g={metrics.get('mae_left_gripper', float('nan')):.4f} "
+        f"R_j={metrics.get('mae_right_joints', float('nan')):.4f} "
+        f"R_g={metrics.get('mae_right_gripper', float('nan')):.4f} "
         f"mae_joints={metrics['mae_joints']:.4f} "
         f"mae_gripper={metrics['mae_gripper']:.4f} "
         f"n={int(metrics['n_samples'])} "
         f"time={metrics['elapsed_s']:.1f}s"
-        f"{'  [best]' if best else ''}"
+        f"{tag_msg}"
     )
     logger.log(msg, also_print=False)
     if pbar is not None:
         pbar.write(msg)
         pbar.set_postfix(
             val_loss=metrics["loss"],
-            val_mse_j=metrics["mse_joints"],
+            val_mae=metrics.get("mae", metrics["mae_joints"]),
             val_mae_j=metrics["mae_joints"],
         )
     else:
         logger.log(msg)
+    names = list(action_names or [])
+    if names:
+        per = ", ".join(
+            f"{n}={metrics[f'mae_{n}']:.3f}"
+            for n in names
+            if f"mae_{n}" in metrics
+        )
+        if per:
+            dim_line = f"val per-dim MAE: {per}"
+            logger.log(dim_line, also_print=False)
+            if pbar is not None:
+                pbar.write(dim_line)
+            else:
+                logger.log(dim_line)
+    if "ablate_rgb_zero" in metrics:
+        ab_line = (
+            "val vision ablation |Δv|: "
+            f"rgb_zero={metrics['ablate_rgb_zero']:.5f} "
+            f"rgb_noise={metrics['ablate_rgb_noise']:.5f} "
+            f"depth_zero={metrics['ablate_depth_zero']:.5f}"
+        )
+        logger.log(ab_line, also_print=False)
+        if pbar is not None:
+            pbar.write(ab_line)
+        else:
+            logger.log(ab_line)
+        if max(
+            metrics["ablate_rgb_zero"],
+            metrics["ablate_rgb_noise"],
+            metrics["ablate_depth_zero"],
+        ) < 1e-3:
+            warn = (
+                "WARNING: ablation barely changes predictions "
+                "→ vision/depth may be unused (proprio shortcut)."
+            )
+            logger.log(warn, also_print=False)
+            if pbar is not None:
+                pbar.write(warn)
+            else:
+                logger.log(warn)
     record = {"step": int(step), **{k: float(v) for k, v in metrics.items()}}
     with (output_dir / "val.jsonl").open("a", encoding="utf-8") as fh:
         fh.write(json.dumps(record) + "\n")
@@ -862,6 +1170,25 @@ def train_flow_matching(
             logger.log("stats: recomputed with image_mean/image_std for ACT dataset norm")
 
         gpu_augment = bool(cfg.dataset.gpu_augment)
+        train_episode_ids: list[int] | None = None
+        val_episode_ids: list[int] | None = None
+        val_ratio = _val_ratio(cfg)
+        if (
+            val_ratio > 0
+            and _val_run_name(cfg) is None
+            and is_lerobot_image_sequence_root(run_dir)
+        ):
+            all_ids = list_episode_indices(run_dir, load_lerobot_info(run_dir))
+            train_episode_ids, val_episode_ids = _split_episode_ids(
+                all_ids,
+                val_ratio,
+                int(getattr(cfg.dataset, "split_seed", 42)),
+            )
+            logger.log(
+                f"val_split: ratio={val_ratio} seed={getattr(cfg.dataset, 'split_seed', 42)} "
+                f"train_ep={len(train_episode_ids)} val_ep={len(val_episode_ids)} "
+                f"val_ep_ids={val_episode_ids}"
+            )
         dataset = build_episode_dataset(
             run_dir=run_dir,
             n_obs_steps=cfg.dataset.n_obs_steps,
@@ -872,9 +1199,7 @@ def train_flow_matching(
             normalize=True,
             norm_mode=cfg.dataset.norm_mode,
             resize_size=cfg.dataset.resize_size,
-            pre_crop_size=cfg.dataset.pre_crop_size,
-            crop_size=cfg.dataset.crop_size,
-            random_crop=True,
+            image_size=cfg.dataset.image_size,
             color_jitter_brightness=cfg.dataset.color_jitter_brightness,
             color_jitter_contrast=cfg.dataset.color_jitter_contrast,
             color_jitter_saturation=cfg.dataset.color_jitter_saturation,
@@ -883,9 +1208,21 @@ def train_flow_matching(
             uint8_cache=bool(cfg.dataset.uint8_cache),
             uint8_cache_dir=cfg.dataset.uint8_cache_dir,
             predict_joint_delta=bool(cfg.policy.predict_joint_delta),
+            predict_state_delta=bool(cfg.policy.predict_state_delta),
             depth_cameras=tuple(cfg.dataset.depth_cameras),
             depth_min_mm=cfg.dataset.depth_min_mm,
             depth_max_mm=cfg.dataset.depth_max_mm,
+            episode_ids=train_episode_ids,
+            reach_open_joint_weight=float(
+                getattr(cfg.train, "reach_open_joint_weight", 1.0) or 1.0
+            ),
+            reach_gripper_open_thr=float(
+                getattr(cfg.train, "reach_gripper_open_thr", 0.5)
+            ),
+            reach_move_deg_per_frame=float(
+                getattr(cfg.train, "reach_move_deg_per_frame", 0.35)
+            ),
+            action_names=list(cfg.action_names) if cfg.action_names else None,
         )
         logger.log(f"dataset: run_dir={run_dir} num_samples={len(dataset)}")
         probe = dataset[0]
@@ -908,17 +1245,67 @@ def train_flow_matching(
                 f"stats state/action dim {stats_state}/{stats_action} != "
                 f"config {cfg.state_dim}/{cfg.action_dim}"
             )
+        img = probe["obs_images"]
+        if img.ndim != 5:
+            raise ValueError(f"obs_images rank {img.ndim} != 5")
+        h, w = int(img.shape[-2]), int(img.shape[-1])
+        cfg.dataset.image_size = [h, w]
+        cfg.dataset.obs_image_shape = [int(x) for x in img.shape]
+        depth_cameras = tuple(cfg.dataset.depth_cameras or ())
+        depth = probe.get("obs_depth")
+        if depth_cameras:
+            if depth is None:
+                raise ValueError(
+                    f"depth_cameras={list(depth_cameras)} but sample has no obs_depth"
+                )
+            cfg.dataset.obs_depth_shape = [int(x) for x in depth.shape]
+            n_depth = int(depth.shape[0])
+            if n_depth != len(depth_cameras):
+                raise ValueError(
+                    f"obs_depth cameras={n_depth} != depth_cameras={list(depth_cameras)}"
+                )
+            if int(depth.shape[-2]) != h or int(depth.shape[-1]) != w:
+                raise ValueError(
+                    f"obs_depth HW={(int(depth.shape[-2]), int(depth.shape[-1]))} "
+                    f"!= obs_images HW={(h, w)}"
+                )
+            depth_meta = getattr(dataset, "_depth_meta", None) or {}
+            scales: dict[str, float] = {}
+            for cam in depth_cameras:
+                meta = depth_meta.get(cam)
+                if not meta or meta.get("scale_mm_per_raw_unit") is None:
+                    raise ValueError(f"missing scale_mm_per_raw_unit for {cam}")
+                scales[cam] = float(meta["scale_mm_per_raw_unit"])
+            cfg.dataset.scale_mm_per_raw_unit = scales
+        else:
+            cfg.dataset.obs_depth_shape = None
+            cfg.dataset.scale_mm_per_raw_unit = None
+        backup_train_config(cfg, output_dir)
         logger.log(
             f"dataset.shapes: cams={n_cams} state={state_d} action={action_d} "
             f"obs_T={tuple(probe['obs_state'].shape)} "
             f"act_T={tuple(probe['action'].shape)}"
         )
-        if cfg.policy.predict_joint_delta:
+        reach_w = float(getattr(cfg.train, "reach_open_joint_weight", 1.0) or 1.0)
+        if reach_w > 1.0:
             logger.log(
-                "policy.predict_joint_delta: joint targets are action-q_now; "
-                "grippers stay absolute; action mean/std recomputed on residuals; "
-                "A2A flow source obs_history is also q_now-relative (action-norm)"
+                f"train.reach_open_joint_weight: {reach_w} "
+                f"open_thr={float(getattr(cfg.train, 'reach_gripper_open_thr', 0.5))} "
+                f"move_deg={float(getattr(cfg.train, 'reach_move_deg_per_frame', 0.35))}"
             )
+        if cfg.policy.predict_joint_delta:
+            if cfg.policy.predict_state_delta:
+                logger.log(
+                    "policy.predict_state_delta: joint targets are state[t+1:t+H]-q_now; "
+                    "grippers stay absolute from future state; action mean/std recomputed on residuals; "
+                    "A2A flow source obs_history is also q_now-relative (action-norm)"
+                )
+            else:
+                logger.log(
+                    "policy.predict_joint_delta: joint targets are action-q_now; "
+                    "grippers stay absolute; action mean/std recomputed on residuals; "
+                    "A2A flow source obs_history is also q_now-relative (action-norm)"
+                )
             rtc_on = bool(getattr(cfg.policy.rtc, "enabled", False))
             if rtc_on:
                 logger.log(
@@ -931,7 +1318,7 @@ def train_flow_matching(
             logger.log(f"dataset.uint8_cache: enabled path={cache_dir}")
         if gpu_augment:
             logger.log(
-                "dataset.gpu_augment: crop/color_jitter deferred to GPU batch path; "
+                "dataset.gpu_augment: color_jitter deferred to GPU batch path; "
                 "obs_images stay uint8 until GPU /255"
             )
         loader_kwargs: dict = {
@@ -949,23 +1336,37 @@ def train_flow_matching(
 
         val_loader: DataLoader | None = None
         val_freq = _val_freq(cfg)
-        best_val_mae = math.inf
+        best = {"mae_joints": math.inf, "mse_all": math.inf, "loss": math.inf}
         last_val_step = -1
         if val_freq > 0:
             val_name = _val_run_name(cfg)
-            assert val_name is not None
-            val_dir = resolve_path(base_dir, cfg.data_root) / val_name
-            if not val_dir.is_dir():
-                raise FileNotFoundError(f"val dataset not found: {val_dir}")
-            val_loader = _build_val_loader(
-                cfg,
-                val_dir=val_dir,
-                stats=stats,
-                gpu_augment=gpu_augment,
-            )
+            if val_name is not None:
+                val_dir = resolve_path(base_dir, cfg.data_root) / val_name
+                if not val_dir.is_dir():
+                    raise FileNotFoundError(f"val dataset not found: {val_dir}")
+                val_loader = _build_val_loader(
+                    cfg,
+                    val_dir=val_dir,
+                    stats=stats,
+                    gpu_augment=gpu_augment,
+                )
+            elif val_episode_ids:
+                val_loader = _build_val_loader(
+                    cfg,
+                    val_dir=run_dir,
+                    stats=stats,
+                    gpu_augment=gpu_augment,
+                    episode_ids=val_episode_ids,
+                    uint8_cache=bool(cfg.dataset.uint8_cache),
+                    uint8_cache_dir=cfg.dataset.uint8_cache_dir,
+                )
+            else:
+                raise ValueError("val enabled but no val_run_name or val episode split")
             logger.log(
-                f"val: run_dir={val_dir} num_samples={len(val_loader.dataset)} "
-                f"freq={val_freq} (val loss + open-loop physical MAE/MSE, history_noise=0)"
+                f"val: run_dir={getattr(val_loader.dataset, 'run_dir', '')} "
+                f"num_samples={len(val_loader.dataset)} "
+                f"freq={val_freq} samples_per_eval={int(getattr(cfg.train, 'val_samples', 0) or 0)} "
+                f"(val loss + open-loop physical MAE/RMSE + vision ablation)"
             )
             val_jsonl = output_dir / "val.jsonl"
             if resume_path is not None and val_jsonl.is_file():
@@ -974,11 +1375,19 @@ def train_flow_matching(
                     if not line:
                         continue
                     rec = json.loads(line)
-                    prev = rec.get("mae_joints")
-                    if prev is not None and math.isfinite(float(prev)):
-                        best_val_mae = min(best_val_mae, float(prev))
-                if math.isfinite(best_val_mae):
-                    logger.log(f"val: resume best_mae_joints={best_val_mae:.4f}")
+                    for key in best:
+                        prev = rec.get(key)
+                        if prev is not None and math.isfinite(float(prev)):
+                            best[key] = min(best[key], float(prev))
+                resume_bits = []
+                if math.isfinite(best["mae_joints"]):
+                    resume_bits.append(f"best_mae_joints={best['mae_joints']:.4f}")
+                if math.isfinite(best["mse_all"]):
+                    resume_bits.append(f"best_mse_all={best['mse_all']:.4f}")
+                if math.isfinite(best["loss"]):
+                    resume_bits.append(f"best_loss={best['loss']:.4f}")
+                if resume_bits:
+                    logger.log(f"val: resume {' '.join(resume_bits)}")
 
         device = torch.device(cfg.train.device if torch.cuda.is_available() else "cpu")
         logger.log(f"device: {device}")
@@ -1012,7 +1421,6 @@ def train_flow_matching(
                 load_optimizer=not reset_step,
                 scaler=scaler if use_amp else None,
             )
-            # 把 Adam 状态迁到训练 device
             for state in optim.state.values():
                 for k, v in state.items():
                     if isinstance(v, torch.Tensor):
@@ -1021,23 +1429,37 @@ def train_flow_matching(
                 logger.log(f"resume: reset_step enabled (was {step} -> 0)")
                 step = 0
             else:
-                # load_state_dict 会带回旧 ckpt 的 base_lr；按当前 yaml 重写，
-                # 否则续训改 lr / encoder_lr_scale 不生效（Adam 矩仍沿用）。
                 encoder_lr = cfg.train.lr * cfg.train.encoder_lr_scale
-                new_bases = [encoder_lr, cfg.train.lr]
+                proprio_lr = cfg.train.lr * float(
+                    getattr(cfg.train, "proprio_lr_scale", 0.05)
+                )
+                named_bases = {
+                    "vision": encoder_lr,
+                    "proprio": proprio_lr,
+                    "rest": cfg.train.lr,
+                }
+                default_bases = [encoder_lr, cfg.train.lr]
                 for i, group in enumerate(optim.param_groups):
-                    new_base = float(
-                        new_bases[i] if i < len(new_bases) else cfg.train.lr
-                    )
+                    name = group.get("name")
+                    if name in named_bases:
+                        new_base = float(named_bases[name])
+                    else:
+                        new_base = float(
+                            default_bases[i] if i < len(default_bases) else cfg.train.lr
+                        )
                     old_base = float(group.get("base_lr", group["lr"]))
                     group["base_lr"] = new_base
                     if abs(old_base - new_base) > 1e-12:
                         logger.log(
                             f"resume: param_group[{i}] base_lr {old_base:.6g} -> {new_base:.6g} "
-                            "(current yaml lr / encoder_lr_scale)"
+                            "(current yaml lr / encoder_lr_scale / proprio_lr_scale)"
                         )
 
-        # compile 放在 load_state_dict / optimizer 之后，ckpt 仍存未包装权重
+        ema_decay = float(getattr(cfg.train, "ema_decay", 0.0) or 0.0)
+        ema = ModelEMA(_unwrap_compiled(policy), decay=ema_decay).to(device) if ema_decay > 0 else None
+        if ema is not None:
+            logger.log(f"train.ema_decay: {ema_decay}")
+
         policy = _maybe_compile_policy(policy, enabled=use_compile, logger=logger)
 
         if step >= cfg.train.steps:
@@ -1048,14 +1470,13 @@ def train_flow_matching(
             )
 
         pbar = tqdm(total=cfg.train.steps, initial=step, desc="train")
+        is_fm = _norm_policy_type(cfg.policy.type) == "flow_matching"
+        arm_drop_p = float(getattr(cfg.train, "arm_segment_drop_prob", 0.0) or 0.0)
+        if is_fm and arm_drop_p > 0:
+            logger.log(f"train.arm_segment_drop_prob: {arm_drop_p}")
         state_drop_cfg = cfg.dataset.state_dropout
         whole_state_drop_p = float(state_drop_cfg.whole_state_prob)
-        state_joint_mask = None
-        state_gripper_mask = None
-        if state_drop_cfg.enabled:
-            state_joint_mask, state_gripper_mask = state_group_masks(
-                cfg.state_names, cfg.state_dim
-            )
+        use_legacy_state_drop = (not is_fm) and state_drop_cfg.enabled
         while step < cfg.train.steps:
             for batch in loader:
                 batch = {k: v.to(device, non_blocking=True) for k, v in batch.items()}
@@ -1063,8 +1484,6 @@ def train_flow_matching(
                 if gpu_augment:
                     _apply_obs_augments(
                         batch,
-                        crop_size=cfg.dataset.crop_size,
-                        random_crop=True,
                         brightness=cfg.dataset.color_jitter_brightness,
                         contrast=cfg.dataset.color_jitter_contrast,
                         saturation=cfg.dataset.color_jitter_saturation,
@@ -1090,11 +1509,12 @@ def train_flow_matching(
                     )
                 joint_drop_p = 0.0
                 gripper_drop_p = 0.0
-                if (
-                    state_drop_cfg.enabled
-                    and state_joint_mask is not None
-                    and state_gripper_mask is not None
-                ):
+                if is_fm and arm_drop_p > 0:
+                    batch["obs_state"] = apply_arm_segment_dropout(
+                        batch["obs_state"],
+                        drop_prob=arm_drop_p,
+                    )
+                elif use_legacy_state_drop:
                     joint_drop_p = camera_dropout_prob(
                         step,
                         cfg.train.steps,
@@ -1117,8 +1537,6 @@ def train_flow_matching(
                     )
                     state = batch["obs_state"]
                     history = batch.get("obs_history")
-                    # obs_history 是 A2A flow 起点；只遮 obs_state 时模型仍能从
-                    # 关节历史抄动作。沿时间维拼在一起，共用同一组 drop mask。
                     if history is not None:
                         t_state = state.shape[1]
                         stacked = torch.cat([state, history], dim=1)
@@ -1127,9 +1545,6 @@ def train_flow_matching(
                             whole_p=whole_state_drop_p,
                             joint_p=joint_drop_p,
                             gripper_p=gripper_drop_p,
-                            joint_mask=state_joint_mask,
-                            gripper_mask=state_gripper_mask,
-                            keep_at_least_one=state_drop_cfg.keep_at_least_one,
                         )
                         batch["obs_state"] = stacked[:, :t_state]
                         batch["obs_history"] = stacked[:, t_state:]
@@ -1139,9 +1554,6 @@ def train_flow_matching(
                             whole_p=whole_state_drop_p,
                             joint_p=joint_drop_p,
                             gripper_p=gripper_drop_p,
-                            joint_mask=state_joint_mask,
-                            gripper_mask=state_gripper_mask,
-                            keep_at_least_one=state_drop_cfg.keep_at_least_one,
                         )
                 if cfg.train.cosine_lr:
                     _set_cosine_lr(optim, step, cfg)
@@ -1160,6 +1572,8 @@ def train_flow_matching(
                     )
                 scaler.step(optim)
                 scaler.update()
+                if ema is not None:
+                    ema.update(_unwrap_compiled(policy))
 
                 lr = float(optim.param_groups[-1]["lr"])
                 loss_v = float(loss.item())
@@ -1178,7 +1592,9 @@ def train_flow_matching(
                     }
                     if cam_drop_cfg.enabled:
                         postfix["cam_drop_p"] = cam_drop_p
-                    if state_drop_cfg.enabled:
+                    if is_fm and arm_drop_p > 0:
+                        postfix["arm_drop_p"] = arm_drop_p
+                    elif use_legacy_state_drop:
                         postfix["joint_drop_p"] = joint_drop_p
                         postfix["grip_drop_p"] = gripper_drop_p
                     for key in _LOSS_TERM_KEYS:
@@ -1189,7 +1605,9 @@ def train_flow_matching(
                     drop_msg = (
                         f" cam_drop_p={cam_drop_p:.4g}" if cam_drop_cfg.enabled else ""
                     )
-                    if state_drop_cfg.enabled:
+                    if is_fm and arm_drop_p > 0:
+                        drop_msg += f" arm_drop_p={arm_drop_p:.4g}"
+                    elif use_legacy_state_drop:
                         drop_msg += (
                             f" joint_drop_p={joint_drop_p:.4g}"
                             f" gripper_drop_p={gripper_drop_p:.4g}"
@@ -1239,30 +1657,32 @@ def train_flow_matching(
                     and step % val_freq == 0
                 )
                 if do_val:
+                    eval_policy = ema.ema if ema is not None else policy
                     val_metrics = _evaluate_val_mae(
-                        policy,
+                        eval_policy,
                         val_loader,
                         cfg,
                         stats,
                         device,
                         use_amp=use_amp,
-                        gpu_augment=gpu_augment,
+                        step=step,
                     )
                     last_val_step = step
-                    is_best = val_metrics["mae_joints"] < best_val_mae
-                    if is_best:
-                        best_val_mae = val_metrics["mae_joints"]
-                        best_payload = _checkpoint_payload(
+                    best_tags = _maybe_save_best_ckpts(
+                        val_metrics,
+                        best,
+                        output_dir=output_dir,
+                        logger=logger,
+                        make_payload=lambda: _checkpoint_payload(
                             step=step,
                             policy=policy,
                             optim=optim,
                             cfg=cfg,
                             stats=stats,
                             scaler=scaler if use_amp else None,
-                        )
-                        best_path = output_dir / "checkpoint_best_val.pt"
-                        torch.save(best_payload, best_path)
-                        logger.log(f"saved: {best_path}", also_print=False)
+                            weights_module=ema.ema if ema is not None else None,
+                        ),
+                    )
                     _log_val_metrics(
                         val_metrics,
                         step=step,
@@ -1270,7 +1690,8 @@ def train_flow_matching(
                         output_dir=output_dir,
                         logger=logger,
                         pbar=pbar,
-                        best=is_best,
+                        best_tags=best_tags,
+                        action_names=list(cfg.action_names),
                     )
                 step += 1
                 pbar.update(1)
@@ -1278,29 +1699,31 @@ def train_flow_matching(
                     break
 
         if val_loader is not None and last_val_step != step:
+            eval_policy = ema.ema if ema is not None else policy
             val_metrics = _evaluate_val_mae(
-                policy,
+                eval_policy,
                 val_loader,
                 cfg,
                 stats,
                 device,
                 use_amp=use_amp,
-                gpu_augment=gpu_augment,
+                step=step,
             )
-            is_best = val_metrics["mae_joints"] < best_val_mae
-            if is_best:
-                best_val_mae = val_metrics["mae_joints"]
-                best_payload = _checkpoint_payload(
+            best_tags = _maybe_save_best_ckpts(
+                val_metrics,
+                best,
+                output_dir=output_dir,
+                logger=logger,
+                make_payload=lambda: _checkpoint_payload(
                     step=step,
                     policy=policy,
                     optim=optim,
                     cfg=cfg,
                     stats=stats,
                     scaler=scaler if use_amp else None,
-                )
-                best_path = output_dir / "checkpoint_best_val.pt"
-                torch.save(best_payload, best_path)
-                logger.log(f"saved: {best_path}", also_print=False)
+                    weights_module=ema.ema if ema is not None else None,
+                ),
+            )
             _log_val_metrics(
                 val_metrics,
                 step=step,
@@ -1308,7 +1731,8 @@ def train_flow_matching(
                 output_dir=output_dir,
                 logger=logger,
                 pbar=pbar,
-                best=is_best,
+                best_tags=best_tags,
+                action_names=list(cfg.action_names),
             )
 
         final_payload = _checkpoint_payload(
@@ -1318,10 +1742,19 @@ def train_flow_matching(
             cfg=cfg,
             stats=stats,
             scaler=scaler if use_amp else None,
+            weights_module=ema.ema if ema is not None else None,
         )
         final_ckpt = output_dir / "checkpoint_final.pt"
         torch.save(final_payload, final_ckpt)
-        _save_latest_checkpoint(output_dir, final_payload)
+        latest_payload = _checkpoint_payload(
+            step=step,
+            policy=policy,
+            optim=optim,
+            cfg=cfg,
+            stats=stats,
+            scaler=scaler if use_amp else None,
+        )
+        _save_latest_checkpoint(output_dir, latest_payload)
         pbar.close()
         logger.log(f"saved: {final_ckpt}")
         logger.log(f"end_time: {datetime.now().isoformat(timespec='seconds')}")

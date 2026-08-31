@@ -17,10 +17,7 @@ dataset:
   horizon: 8
   run_name: openarm_hcx_dual_arm
   # 对齐参考实现的 256x256 输入，不额外随机裁剪或颜色增强
-  pre_crop_size: 720
-  resize_size: 256
-  crop_size: null
-  eval_fixed_crop: true
+  image_size: [256, 455]
   norm_mode: gaussian
   uint8_cache: true
   gpu_augment: true

@@ -1,9 +1,8 @@
 """Disk-backed uint8 RGB image cache for LeRobot image-sequence datasets.
 
-Layout under ``{run_dir}/cache/uint8_rgb_{H}x{W}/``
-(or ``..._pc{pre_crop}/`` when pre-crop is used)::
+Layout under ``{run_dir}/cache/uint8_rgb_{H}x{W}/``::
 
-    meta.json          cameras, episode offsets, shape, pre_crop_size
+    meta.json          cameras, episode offsets, shape, image_size
     {camera}.dat       memmap (total_frames, H, W, 3) uint8 RGB
 
 Build once with ``scripts/build_uint8_image_cache.py``, then train with
@@ -21,89 +20,68 @@ import cv2
 import numpy as np
 from tqdm import tqdm
 
+from robotfm.data.dataset import parse_image_hw
+
 CACHE_VERSION = 1
 CACHE_DIR_PREFIX = "uint8_rgb_"
 
 
-def cache_dir_for(
-    run_dir: Path,
-    height: int,
-    width: int,
-    *,
-    pre_crop_size: int | None = None,
-) -> Path:
+def cache_dir_for(run_dir: Path, height: int, width: int) -> Path:
     name = f"{CACHE_DIR_PREFIX}{height}x{width}"
-    if pre_crop_size is not None:
-        name = f"{name}_pc{int(pre_crop_size)}"
     return Path(run_dir) / "cache" / name
 
 
 def resolve_cache_dir(
     run_dir: Path,
     *,
-    resize_size: int | None,
-    pre_crop_size: int | None = None,
+    image_size: int | tuple[int, int] | list[int] | None,
     cache_dir: str | Path | None = None,
 ) -> Path:
-    """Resolve cache directory; prefer explicit path, else ``cache/uint8_rgb_{H}x{W}[_pcN]``."""
     if cache_dir is not None:
         return Path(cache_dir)
-    if resize_size is None:
+    hw = parse_image_hw(image_size)
+    if hw is None:
         raise ValueError(
-            "uint8 cache requires resize_size (or an explicit cache_dir) "
+            "uint8 cache requires image_size (or an explicit cache_dir) "
             "so the on-disk resolution is known"
         )
-    return cache_dir_for(
-        run_dir, resize_size, resize_size, pre_crop_size=pre_crop_size
-    )
+    return cache_dir_for(run_dir, hw[0], hw[1])
 
 
-def _center_crop_hwc(img: np.ndarray, crop_size: int) -> np.ndarray:
-    h, w = img.shape[:2]
-    if h == crop_size and w == crop_size:
-        return img
-    if h < crop_size or w < crop_size:
-        raise ValueError(f"Cannot crop {h}x{w} to {crop_size}")
-    top = (h - crop_size) // 2
-    left = (w - crop_size) // 2
-    return img[top : top + crop_size, left : left + crop_size]
-
-
-def _load_image_rgb(
-    path: Path,
-    resize_size: int | None,
-    pre_crop_size: int | None = None,
+def _resize_hw(
+    arr: np.ndarray,
+    height: int,
+    width: int,
+    interpolation: int,
 ) -> np.ndarray:
+    h, w = arr.shape[:2]
+    if h == height and w == width:
+        return arr
+    return cv2.resize(arr, (width, height), interpolation=interpolation)
+
+
+def _load_image_rgb(path: Path, height: int, width: int) -> np.ndarray:
     path_str = str(path)
     bgr = None
-    if resize_size is not None and pre_crop_size is None:
-        half = cv2.imread(path_str, cv2.IMREAD_REDUCED_COLOR_2)
-        if half is not None and min(half.shape[:2]) >= resize_size:
-            bgr = half
+    half = cv2.imread(path_str, cv2.IMREAD_REDUCED_COLOR_2)
+    if half is not None and min(half.shape[:2]) >= min(height, width):
+        bgr = half
     if bgr is None:
         bgr = cv2.imread(path_str, cv2.IMREAD_COLOR)
     if bgr is None:
         raise FileNotFoundError(f"Failed to read image: {path}")
-    if pre_crop_size is not None:
-        bgr = _center_crop_hwc(bgr, pre_crop_size)
-    if resize_size is not None:
-        h, w = bgr.shape[:2]
-        if h != resize_size or w != resize_size:
-            bgr = cv2.resize(
-                bgr, (resize_size, resize_size), interpolation=cv2.INTER_AREA
-            )
+    bgr = _resize_hw(bgr, height, width, cv2.INTER_AREA)
     return cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
 
 
 def _decode_job(
-    args: tuple[str, str, int, int, int | None],
+    args: tuple[str, str, int, int, int],
 ) -> tuple[str, int, np.ndarray]:
-    """Worker: (cam, path, flat_index, resize, pre_crop) → (cam, flat_index, RGB)."""
-    cam, path_str, flat_index, resize_size, pre_crop_size = args
-    rgb = _load_image_rgb(Path(path_str), resize_size, pre_crop_size=pre_crop_size)
-    if rgb.shape[0] != resize_size or rgb.shape[1] != resize_size:
+    cam, path_str, flat_index, height, width = args
+    rgb = _load_image_rgb(Path(path_str), height, width)
+    if rgb.shape[0] != height or rgb.shape[1] != width:
         raise ValueError(
-            f"decoded shape {rgb.shape} != ({resize_size},{resize_size},3) for {path_str}"
+            f"decoded shape {rgb.shape} != ({height},{width},3) for {path_str}"
         )
     return cam, flat_index, np.ascontiguousarray(rgb, dtype=np.uint8)
 
@@ -170,8 +148,7 @@ class Uint8ImageCache:
 def build_uint8_image_cache(
     run_dir: Path,
     *,
-    resize_size: int,
-    pre_crop_size: int | None = None,
+    image_size: int | tuple[int, int] | list[int],
     output_dir: Path | None = None,
     num_workers: int = 8,
     overwrite: bool = False,
@@ -185,6 +162,11 @@ def build_uint8_image_cache(
         load_episode_arrays_from_parquet,
         load_lerobot_info,
     )
+
+    hw = parse_image_hw(image_size)
+    if hw is None:
+        raise ValueError("image_size is required to build uint8 cache")
+    height, width = hw
 
     run_dir = Path(run_dir)
     info = load_lerobot_info(run_dir)
@@ -202,11 +184,7 @@ def build_uint8_image_cache(
     camera_feature_keys = [short_to_feat[name] for name in cameras]
 
     out_dir = (
-        Path(output_dir)
-        if output_dir is not None
-        else cache_dir_for(
-            run_dir, resize_size, resize_size, pre_crop_size=pre_crop_size
-        )
+        Path(output_dir) if output_dir is not None else cache_dir_for(run_dir, height, width)
     )
     out_dir.mkdir(parents=True, exist_ok=True)
     meta_path = out_dir / "meta.json"
@@ -221,7 +199,7 @@ def build_uint8_image_cache(
     episode_ids = list_episode_indices(run_dir, info)
     episode_offsets: list[int] = []
     episode_lengths: list[int] = []
-    decode_args: list[tuple[str, str, int, int, int | None]] = []
+    decode_args: list[tuple[str, str, int, int, int]] = []
     cursor = 0
 
     print(f"indexing episodes under {run_dir} ...")
@@ -236,16 +214,14 @@ def build_uint8_image_cache(
             flat = cursor + t
             for cam in cameras:
                 rel = payload["image_paths"][cam][t]
-                decode_args.append(
-                    (cam, str(run_dir / rel), flat, resize_size, pre_crop_size)
-                )
+                decode_args.append((cam, str(run_dir / rel), flat, height, width))
         cursor += length
 
     total_frames = cursor
-    gib = total_frames * resize_size * resize_size * 3 * len(cameras) / (1024**3)
+    gib = total_frames * height * width * 3 * len(cameras) / (1024**3)
     print(
         f"building cache: episodes={len(episode_ids)} frames={total_frames} "
-        f"cams={len(cameras)} pre_crop={pre_crop_size} → {gib:.2f} GiB at {out_dir}"
+        f"cams={len(cameras)} {height}x{width} → {gib:.2f} GiB at {out_dir}"
     )
 
     maps: dict[str, np.memmap] = {}
@@ -257,11 +233,10 @@ def build_uint8_image_cache(
             path,
             dtype=np.uint8,
             mode="w+",
-            shape=(total_frames, resize_size, resize_size, 3),
+            shape=(total_frames, height, width, 3),
         )
 
     workers = max(1, int(num_workers))
-    # Stream completions in chunks to avoid millions of Future objects in flight.
     chunk = max(workers * 64, 256)
     with ProcessPoolExecutor(max_workers=workers) as pool:
         with tqdm(total=len(decode_args), desc="decode") as pbar:
@@ -281,14 +256,13 @@ def build_uint8_image_cache(
 
     meta_obj = {
         "version": CACHE_VERSION,
-        "height": resize_size,
-        "width": resize_size,
+        "height": height,
+        "width": width,
         "cameras": cameras,
         "total_frames": total_frames,
         "dtype": "uint8",
         "layout": "NHWC",
-        "resize_size": resize_size,
-        "pre_crop_size": pre_crop_size,
+        "image_size": [height, width],
         "source_run_dir": str(run_dir.resolve()),
         "episode_ids": episode_ids,
         "episode_offsets": episode_offsets,

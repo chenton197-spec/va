@@ -110,6 +110,26 @@ def flow_history_from_phys(
     return normalize(hist, stats, prefix="action", mode=norm_mode)
 
 
+def target_chunk_from_t(
+    state: np.ndarray,
+    action: np.ndarray,
+    t: int,
+    horizon: int,
+    *,
+    predict_state_delta: bool,
+) -> tuple[np.ndarray, int]:
+    length = int(state.shape[0])
+    if predict_state_delta:
+        start = t + 1
+        end = min(t + 1 + horizon, length)
+        chunk = np.asarray(state[start:end], dtype=np.float32)
+    else:
+        start = t
+        end = min(t + horizon, length)
+        chunk = np.asarray(action[start:end], dtype=np.float32)
+    return chunk, int(end - start)
+
+
 def overlay_joint_delta_action_stats(
     stats: dict[str, np.ndarray],
     states: list[np.ndarray],
@@ -117,10 +137,12 @@ def overlay_joint_delta_action_stats(
     *,
     horizon: int,
     joint_mask: np.ndarray,
+    predict_state_delta: bool = False,
 ) -> dict[str, np.ndarray]:
     """Replace ``action_{mean,std,min,max}`` with chunk-relative joint-delta stats.
 
-    For each t, target[k] = action[t+k] − state[t] on joints (k < horizon).
+    For each t, target[k] = action[t+k] − state[t] on joints (k < horizon),
+    or ``state[t+1+k] − state[t]`` when ``predict_state_delta``.
     Mutates ``stats`` in place and returns it.
 
     If ``action_delta_mean`` already exists (e.g. train overlay, then val dataset
@@ -128,7 +150,9 @@ def overlay_joint_delta_action_stats(
     """
     if "action_delta_mean" in stats and "action_delta_std" in stats:
         return stats
-    if not states or not actions:
+    if not states:
+        raise ValueError("overlay_joint_delta_action_stats: empty state lists")
+    if not predict_state_delta and not actions:
         raise ValueError("overlay_joint_delta_action_stats: empty state/action lists")
     if int(horizon) <= 0:
         raise ValueError(f"horizon must be > 0, got {horizon}")
@@ -141,17 +165,31 @@ def overlay_joint_delta_action_stats(
 
     chunks: list[np.ndarray] = []
     mask = np.asarray(joint_mask, dtype=bool)
-    for st, ac in zip(states, actions):
-        st = np.asarray(st, dtype=np.float32)
-        ac = np.asarray(ac, dtype=np.float32)
-        t_len = int(min(st.shape[0], ac.shape[0]))
-        for h in range(int(horizon)):
-            n = t_len - h
-            if n <= 0:
-                break
-            delta = ac[h : h + n].copy()
-            delta[:, mask] -= st[:n, mask]
-            chunks.append(delta)
+    if predict_state_delta:
+        for st in states:
+            st = np.asarray(st, dtype=np.float32)
+            t_len = int(st.shape[0])
+            for h in range(int(horizon)):
+                n = t_len - 1 - h
+                if n <= 0:
+                    break
+                delta = st[h + 1 : h + 1 + n].copy()
+                delta[:, mask] -= st[:n, mask]
+                chunks.append(delta)
+    else:
+        for st, ac in zip(states, actions):
+            st = np.asarray(st, dtype=np.float32)
+            ac = np.asarray(ac, dtype=np.float32)
+            t_len = int(min(st.shape[0], ac.shape[0]))
+            for h in range(int(horizon)):
+                n = t_len - h
+                if n <= 0:
+                    break
+                delta = ac[h : h + n].copy()
+                delta[:, mask] -= st[:n, mask]
+                chunks.append(delta)
+    if not chunks:
+        raise ValueError("overlay_joint_delta_action_stats: no delta chunks")
     all_delta = np.concatenate(chunks, axis=0)
     stats["action_mean"] = all_delta.mean(axis=0).astype(np.float32)
     stats["action_std"] = (all_delta.std(axis=0) + 1e-6).astype(np.float32)
@@ -160,6 +198,82 @@ def overlay_joint_delta_action_stats(
     stats["action_delta_mean"] = stats["action_mean"].copy()
     stats["action_delta_std"] = stats["action_std"].copy()
     return stats
+
+
+def _arm_joint_gripper_indices(
+    names: list[str],
+    dim: int,
+) -> list[tuple[list[int], int | None]]:
+    left_j = [i for i, n in enumerate(names) if n.startswith("L") and n[1:].isdigit()]
+    right_j = [i for i, n in enumerate(names) if n.startswith("R") and n[1:].isdigit()]
+    left_g = next(
+        (i for i, n in enumerate(names) if "left" in n.lower() and "gripper" in n.lower()),
+        None,
+    )
+    right_g = next(
+        (i for i, n in enumerate(names) if "right" in n.lower() and "gripper" in n.lower()),
+        None,
+    )
+    if not left_j and not right_j and dim == 16 and left_g is not None and right_g is not None:
+        left_j = list(range(7))
+        right_j = list(range(7, 14))
+    arms: list[tuple[list[int], int | None]] = []
+    if left_j:
+        arms.append((left_j, left_g))
+    if right_j:
+        arms.append((right_j, right_g))
+    return arms
+
+
+def reach_open_joint_loss_weight(
+    state_t: np.ndarray,
+    state_ref: np.ndarray,
+    action_names: list[str] | None,
+    *,
+    weight: float,
+    gripper_open_thr: float = 0.5,
+    move_deg_per_frame: float = 0.35,
+) -> np.ndarray:
+    st = np.asarray(state_t, dtype=np.float32).reshape(-1)
+    ref = np.asarray(state_ref, dtype=np.float32).reshape(-1)
+    dim = int(st.shape[0])
+    out = np.ones(dim, dtype=np.float32)
+    w = float(weight)
+    if w <= 1.0:
+        return out
+    names = list(action_names or [])
+    if len(names) != dim:
+        names = [f"d{i}" for i in range(dim)]
+    dq = st - ref
+    for joints, gidx in _arm_joint_gripper_indices(names, dim):
+        moving = float(np.linalg.norm(dq[joints])) > float(move_deg_per_frame)
+        opened = gidx is not None and float(st[gidx]) > float(gripper_open_thr)
+        if moving and opened:
+            out[joints] = w
+    return out
+
+
+def reach_open_action_loss_w(
+    states: np.ndarray,
+    t: int,
+    horizon: int,
+    action_names: list[str] | None,
+    *,
+    weight: float,
+    gripper_open_thr: float = 0.5,
+    move_deg_per_frame: float = 0.35,
+) -> np.ndarray:
+    length = int(states.shape[0])
+    ref = t - 1 if t > 0 else min(t + 1, length - 1)
+    dw = reach_open_joint_loss_weight(
+        states[t],
+        states[ref],
+        action_names,
+        weight=weight,
+        gripper_open_thr=gripper_open_thr,
+        move_deg_per_frame=move_deg_per_frame,
+    )
+    return np.broadcast_to(dw, (int(horizon), int(dw.shape[0]))).copy()
 
 
 def denormalize_predicted_action(

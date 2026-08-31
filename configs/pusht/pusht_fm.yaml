@@ -19,8 +19,6 @@ dataset:
   n_obs_steps: 2
   horizon: 8
   run_name: pusht_demos_merged_2607211809_1829
-  crop_size: 84
-  eval_fixed_crop: true
   norm_mode: gaussian
 
 policy:

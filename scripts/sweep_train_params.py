@@ -59,9 +59,7 @@ def run_one(
         stats=stats,
         normalize=True,
         norm_mode=cfg.dataset.norm_mode,
-        resize_size=cfg.dataset.resize_size,
-        crop_size=cfg.dataset.crop_size,
-        random_crop=True,
+        image_size=cfg.dataset.image_size,
     )
     loader = DataLoader(
         dataset,

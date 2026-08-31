@@ -2,7 +2,7 @@
 """Open-loop offline eval: predicted vs GT actions on one dataset episode.
 
 训练相关配置优先来自训练 YAML（``--config``，或 checkpoint 同目录的
-``config_source.yaml`` / ``config.yaml``），否则回退到 checkpoint 内嵌
+``config.yaml`` / ``config_source.yaml``），否则回退到 checkpoint 内嵌
 config。权重与 stats 仍从 checkpoint 加载。
 
 评估预处理与部署一致：
@@ -30,14 +30,17 @@ import torch
 
 from robotfm.collect.loop import get_run_dir
 from robotfm.config import load_config, resolve_path
-from robotfm.data.dataset import spatial_preprocess_images
+from robotfm.data.dataset import parse_image_hw, spatial_preprocess_images
 from robotfm.data.action_delta import (
     denormalize_predicted_action,
     flow_history_from_phys,
     joint_mask_from_names,
 )
 from robotfm.data.lerobot_dataset import (
+    _load_depth_sources,
     _load_image_rgb,
+    _load_packed_depth,
+    _depth_rel_from_image_rel,
     _short_camera_name,
     load_episode_arrays_from_parquet,
     load_lerobot_info,
@@ -48,13 +51,13 @@ from robotfm.train import build_policy
 
 
 def _resolve_train_config(ckpt_path: Path, config_arg: str | None, base_dir: Path) -> Path | None:
-    """Resolve training YAML: CLI > config_source.yaml > config.yaml beside ckpt."""
+    """Resolve training YAML: CLI > config.yaml > config_source.yaml beside ckpt."""
     if config_arg:
         p = Path(config_arg)
         if not p.is_absolute():
             p = base_dir / p
         return p.resolve()
-    for name in ("config_source.yaml", "config.yaml"):
+    for name in ("config.yaml", "config_source.yaml"):
         cand = ckpt_path.parent / name
         if cand.is_file():
             return cand
@@ -77,9 +80,7 @@ def _build_obs_batch(
     cameras: list[str],
     t: int,
     n_obs_steps: int,
-    pre_crop_size: int | None,
-    resize_size: int | None,
-    crop_size: int | None,
+    image_size: int | list[int] | None,
     stats: dict,
     norm_mode: str,
     device: torch.device,
@@ -101,10 +102,7 @@ def _build_obs_batch(
     obs_images = torch.stack(camera_histories, dim=0)
     obs_images = spatial_preprocess_images(
         obs_images,
-        pre_crop_size=pre_crop_size,
-        resize_size=resize_size,
-        crop_size=crop_size,
-        random_crop=False,
+        image_size=image_size,
     )
 
     state = normalize(states[obs_indices].astype(np.float32), stats, prefix="state", mode=norm_mode)
@@ -135,20 +133,12 @@ def _preload_episode_images(
     image_paths: dict[str, list[str]],
     cameras: list[str],
     length: int,
-    pre_crop_size: int | None,
-    resize_size: int | None,
-    crop_size: int | None,
+    image_size: int | list[int] | None,
     episode: int,
 ) -> torch.Tensor:
-    """Load all episode images once. Returns ``(C, T, 3, H, W)`` uint8 RGB.
-
-    Prefers uint8 cache (already pre_crop + resize); otherwise decodes JPEGs.
-    """
     cache_path = None
-    if resize_size is not None:
-        cache_path = resolve_cache_dir(
-            run_dir, resize_size=resize_size, pre_crop_size=pre_crop_size
-        )
+    if parse_image_hw(image_size) is not None:
+        cache_path = resolve_cache_dir(run_dir, image_size=image_size)
     if cache_path is not None and (cache_path / "meta.json").is_file():
         cache = Uint8ImageCache(cache_path)
         if episode in cache.episode_ids and all(c in cache.cameras for c in cameras):
@@ -161,16 +151,6 @@ def _preload_episode_images(
                     chw = np.ascontiguousarray(np.transpose(hwc, (0, 3, 1, 2)))
                     cams.append(torch.from_numpy(chw))
                 images = torch.stack(cams, dim=0)
-                if crop_size is not None:
-                    images = images.float().div_(255.0)
-                    images = spatial_preprocess_images(
-                        images,
-                        pre_crop_size=None,
-                        resize_size=None,
-                        crop_size=crop_size,
-                        random_crop=False,
-                    )
-                    images = (images.clamp(0, 1) * 255.0).to(torch.uint8)
                 print(f"images: uint8_cache {cache_path} shape={tuple(images.shape)}")
                 return images
 
@@ -178,20 +158,59 @@ def _preload_episode_images(
     for cam in cameras:
         frames = []
         for fi in range(length):
-            img = _load_image_rgb(run_dir / image_paths[cam][fi])
-            frames.append(torch.from_numpy(np.transpose(img, (2, 0, 1)).astype(np.float32) / 255.0))
-        stacked = torch.stack(frames, dim=0)
-        stacked = spatial_preprocess_images(
-            stacked,
-            pre_crop_size=pre_crop_size,
-            resize_size=resize_size,
-            crop_size=crop_size,
-            random_crop=False,
-        )
-        cams.append(stacked.to(torch.uint8) if stacked.dtype == torch.uint8 else (stacked.clamp(0, 1) * 255.0).to(torch.uint8))
+            img = _load_image_rgb(
+                run_dir / image_paths[cam][fi],
+                image_size=image_size,
+            )
+            t = torch.from_numpy(np.ascontiguousarray(np.transpose(img, (2, 0, 1))))
+            if t.dtype != torch.uint8:
+                t = t.to(torch.uint8)
+            frames.append(t)
+        cams.append(torch.stack(frames, dim=0))
     images = torch.stack(cams, dim=0)
     print(f"images: decoded JPEG shape={tuple(images.shape)}")
     return images
+
+
+def _preload_episode_depth(
+    *,
+    run_dir: Path,
+    image_paths: dict[str, list[str]],
+    depth_cameras: list[str],
+    length: int,
+    image_size: int | list[int] | None,
+    depth_min_mm: float,
+    depth_max_mm: float,
+) -> torch.Tensor:
+    sources = _load_depth_sources(run_dir)
+    cams = []
+    for camera in depth_cameras:
+        feature = f"observation.depth.{camera}"
+        if feature not in sources:
+            raise KeyError(f"missing {feature} in depth_sources.json")
+        meta = sources[feature]
+        scale = float(meta["scale_mm_per_raw_unit"])
+        invalid_raw = int(meta.get("invalid_raw_value", meta.get("invalid_value", 0)))
+        frames = []
+        paths = image_paths[camera]
+        for fi in range(length):
+            rel = _depth_rel_from_image_rel(paths[fi], camera)
+            frames.append(
+                torch.from_numpy(
+                    _load_packed_depth(
+                        run_dir / rel,
+                        scale_mm=scale,
+                        invalid_raw=invalid_raw,
+                        min_mm=depth_min_mm,
+                        max_mm=depth_max_mm,
+                        image_size=image_size,
+                    )
+                )
+            )
+        cams.append(torch.stack(frames, dim=0))
+    depth = torch.stack(cams, dim=0)
+    print(f"depth: loaded shape={tuple(depth.shape)}")
+    return depth
 
 
 def _infer_episode_batched(
@@ -209,6 +228,8 @@ def _infer_episode_batched(
     device: torch.device,
     batch_size: int,
     reanchor: bool,
+    depth_frames: torch.Tensor | None = None,
+    dest_offset: int = 0,
 ) -> tuple[np.ndarray, np.ndarray, list[int]]:
     """GPU batched open-loop. ``exec_steps=1`` infers every frame (uses pred[0])."""
     length = int(states.shape[0])
@@ -219,12 +240,14 @@ def _infer_episode_batched(
     pred_raw = np.full((length, action_dim), np.nan, dtype=np.float32)
     pred = np.full((length, action_dim), np.nan, dtype=np.float32)
     cam_frames = cam_frames.contiguous()
+    if depth_frames is not None:
+        depth_frames = depth_frames.contiguous()
     bs = max(int(batch_size), 1)
+    dest_offset = int(dest_offset)
     for start in range(0, n_infer, bs):
         sl = slice(start, min(start + bs, n_infer))
         ts = infer_ts[sl]
         idx = obs_idx[sl]
-        # cam_frames: (C, T, 3, H, W); idx: (B, n_obs) → (B, C, n_obs, 3, H, W)
         obs_images = cam_frames[:, torch.as_tensor(idx)].permute(1, 0, 2, 3, 4, 5)
         obs_images = obs_images.to(device, non_blocking=True)
         if obs_images.dtype == torch.uint8:
@@ -254,6 +277,9 @@ def _infer_episode_batched(
                 device, non_blocking=True
             ),
         }
+        if depth_frames is not None:
+            obs_depth = depth_frames[:, torch.as_tensor(idx)].permute(1, 0, 2, 3, 4, 5)
+            batch["obs_depth"] = obs_depth.to(device, non_blocking=True)
         with torch.no_grad():
             pred_norm = policy.sample_actions(batch)[:, :n_action_steps].float().cpu()
         q_now = states[np.asarray(ts, dtype=np.int64)].astype(np.float32)
@@ -268,16 +294,21 @@ def _infer_episode_batched(
             )
         )
         for i, t in enumerate(ts):
-            take = min(exec_steps, length - t, pred_phys.shape[1])
+            dest = int(t) + dest_offset
+            if dest >= length:
+                continue
+            take = min(exec_steps, length - dest, pred_phys.shape[1])
+            if take <= 0:
+                continue
             chunk_raw = np.asarray(pred_phys[i, :take], dtype=np.float32)
-            pred_raw[t : t + take] = chunk_raw
+            pred_raw[dest : dest + take] = chunk_raw
             if reanchor:
                 chunk = chunk_raw.copy()
                 offset = q_now[i, delta_joint_mask] - chunk[0, delta_joint_mask]
                 chunk[:, delta_joint_mask] = chunk[:, delta_joint_mask] + offset
-                pred[t : t + take] = chunk
+                pred[dest : dest + take] = chunk
             else:
-                pred[t : t + take] = chunk_raw
+                pred[dest : dest + take] = chunk_raw
     return pred, pred_raw, infer_ts
 
 
@@ -288,7 +319,7 @@ def main() -> None:
         "--config",
         type=str,
         default=None,
-        help="训练配置 YAML（与训练一致）。默认用 checkpoint 同目录 config_source.yaml/config.yaml，再回退 checkpoint 内嵌 config",
+        help="训练配置 YAML（与训练一致）。默认用 checkpoint 同目录 config.yaml/config_source.yaml，再回退 checkpoint 内嵌 config",
     )
     parser.add_argument("--episode", type=int, default=10)
     parser.add_argument("--seed", type=int, default=0)
@@ -349,6 +380,14 @@ def main() -> None:
         help="Inference-time pseudo-delta: per chunk, joints become "
         "pred - pred[0] + q_now. Grippers stay absolute. Does not require "
         "predict_joint_delta training.",
+    )
+    parser.add_argument(
+        "--gt",
+        type=str,
+        default="auto",
+        choices=["auto", "action", "state"],
+        help="Compare predictions to parquet action, recorded state, or auto "
+        "(state if predict_state_delta else action).",
     )
     args = parser.parse_args()
 
@@ -419,6 +458,13 @@ def main() -> None:
     actions_gt = payload["action"]
     image_paths = payload["image_paths"]
     length = int(payload["length"])
+    predict_state_delta = bool(getattr(cfg.policy, "predict_state_delta", False))
+    if args.gt == "auto":
+        use_state_gt = predict_state_delta
+    else:
+        use_state_gt = args.gt == "state"
+    dest_offset = 1 if predict_state_delta else 0
+    compare_gt = states if use_state_gt else actions_gt
 
     out_dir = (
         Path(args.out_dir)
@@ -457,11 +503,12 @@ def main() -> None:
         f"num_inference_steps={num_inference_steps} "
         f"history_noise_std={history_noise_std} "
         f"predict_joint_delta={bool(cfg.policy.predict_joint_delta)} "
+        f"predict_state_delta={predict_state_delta} "
+        f"gt={'state' if use_state_gt else 'action'} dest_offset={dest_offset} "
         f"reanchor_pred0_to_qnow={reanchor}"
     )
     print(
-        f"pre_crop={cfg.dataset.pre_crop_size} resize={cfg.dataset.resize_size} "
-        f"crop={cfg.dataset.crop_size} eval_fixed_crop={cfg.dataset.eval_fixed_crop} "
+        f"image_size={cfg.dataset.image_size} "
         f"device={device}"
     )
 
@@ -471,12 +518,25 @@ def main() -> None:
         image_paths=image_paths,
         cameras=cameras,
         length=length,
-        pre_crop_size=cfg.dataset.pre_crop_size,
-        resize_size=cfg.dataset.resize_size,
-        crop_size=cfg.dataset.crop_size if cfg.dataset.eval_fixed_crop else None,
+        image_size=cfg.dataset.image_size,
         episode=args.episode,
     )
     print(f"preload_images: {time.perf_counter() - t_img:.2f}s")
+
+    depth_cameras = list(getattr(cfg.dataset, "depth_cameras", None) or [])
+    depth_frames = None
+    if depth_cameras:
+        t_d = time.perf_counter()
+        depth_frames = _preload_episode_depth(
+            run_dir=run_dir,
+            image_paths=image_paths,
+            depth_cameras=depth_cameras,
+            length=length,
+            image_size=cfg.dataset.image_size,
+            depth_min_mm=float(getattr(cfg.dataset, "depth_min_mm", 50.0)),
+            depth_max_mm=float(getattr(cfg.dataset, "depth_max_mm", 500.0)),
+        )
+        print(f"preload_depth: {time.perf_counter() - t_d:.2f}s cameras={depth_cameras}")
 
     t_inf = time.perf_counter()
     pred_actions, pred_actions_raw, replan_ts = _infer_episode_batched(
@@ -493,6 +553,8 @@ def main() -> None:
         device=device,
         batch_size=int(args.batch_size),
         reanchor=reanchor,
+        depth_frames=depth_frames,
+        dest_offset=dest_offset,
     )
     infer_s = time.perf_counter() - t_inf
     print(
@@ -502,11 +564,11 @@ def main() -> None:
 
     def _mae_rmse(pred_arr: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
         valid_m = np.isfinite(pred_arr).all(axis=1)
-        err_m = pred_arr[valid_m] - actions_gt[valid_m]
+        err_m = pred_arr[valid_m] - compare_gt[valid_m]
         return np.mean(np.abs(err_m), axis=0), np.sqrt(np.mean(err_m**2, axis=0))
 
     valid = np.isfinite(pred_actions).all(axis=1)
-    gt = actions_gt[valid]
+    gt = compare_gt[valid]
     pred = pred_actions[valid]
     err = pred - gt
     mae, rmse = _mae_rmse(pred_actions)
@@ -538,11 +600,12 @@ def main() -> None:
         "num_inference_steps": num_inference_steps,
         "history_noise_std": history_noise_std,
         "predict_joint_delta": bool(cfg.policy.predict_joint_delta),
+        "predict_state_delta": predict_state_delta,
+        "gt": "state" if use_state_gt else "action",
+        "dest_offset": dest_offset,
         "reanchor_pred0_to_qnow": reanchor,
         "run_dir": str(run_dir),
-        "pre_crop_size": cfg.dataset.pre_crop_size,
-        "resize_size": cfg.dataset.resize_size,
-        "crop_size": cfg.dataset.crop_size,
+        "image_size": cfg.dataset.image_size,
         "run_name": cfg.dataset.run_name,
         "seed": args.seed,
         "mae_per_dim": {n: float(v) for n, v in zip(action_names, mae)},
@@ -561,7 +624,8 @@ def main() -> None:
     (out_dir / "metrics.json").write_text(json.dumps(metrics, indent=2) + "\n")
     npz_kw = dict(
         pred=pred_actions,
-        gt=actions_gt,
+        gt=compare_gt,
+        action=actions_gt,
         state=states,
         replan_ts=np.asarray(replan_ts, dtype=np.int32),
         action_names=np.asarray(action_names),
@@ -578,7 +642,7 @@ def main() -> None:
     axes = np.atleast_1d(axes).ravel()
     for i, name in enumerate(action_names):
         ax = axes[i]
-        ax.plot(steps, actions_gt[:, i], label="GT", color="#1f77b4", linewidth=1.2)
+        ax.plot(steps, compare_gt[:, i], label="GT", color="#1f77b4", linewidth=1.2)
         if reanchor:
             ax.plot(
                 steps,
@@ -621,9 +685,33 @@ def main() -> None:
     plt.close(fig)
 
     # Left / right arm joint deviation: x=frame, y=pred-GT (physical units)
-    err_full = pred_actions - actions_gt
+    err_full = pred_actions - compare_gt
     left_idx = [i for i, n in enumerate(action_names) if n.startswith("L") and n[1:].isdigit()]
     right_idx = [i for i, n in enumerate(action_names) if n.startswith("R") and n[1:].isdigit()]
+    fig_err, axes_err = plt.subplots(nrows, ncols, figsize=(14, max(3.0 * nrows, 6.0)), sharex=True)
+    axes_err = np.atleast_1d(axes_err).ravel()
+    for i, name in enumerate(action_names):
+        ax = axes_err[i]
+        ax.plot(steps, err_full[:, i], color="#d62728", linewidth=1.0)
+        ax.axhline(0.0, color="black", linewidth=0.8, linestyle="--", alpha=0.5)
+        ax.set_ylabel(name)
+        ax.grid(True, alpha=0.3)
+        ax.set_title(f"{name}  MAE={mae[i]:.4f}")
+    for j in range(n_dim, len(axes_err)):
+        axes_err[j].set_visible(False)
+    for ax in axes_err[max(0, n_dim - ncols) : n_dim]:
+        ax.set_xlabel("frame")
+    gt_label = "state" if use_state_gt else "action"
+    fig_err.suptitle(
+        f"Episode {args.episode} pred−{gt_label}  |  {ckpt_path.name}  |  "
+        f"MAE joints={metrics['mae_joints']:.4f} gripper={metrics['mae_gripper']:.4f}",
+        fontsize=12,
+    )
+    fig_err.tight_layout()
+    err_plot_path = out_dir / "joint_error.png"
+    fig_err.savefig(err_plot_path, dpi=140)
+    plt.close(fig_err)
+
     if left_idx or right_idx:
         fig_lr, axes_lr = plt.subplots(1, 2, figsize=(14, 5), sharex=True)
         arm_specs = [
@@ -676,6 +764,7 @@ def main() -> None:
     if reanchor and "mae_all_raw" in metrics:
         print(f"  all      MAE_raw={metrics['mae_all_raw']:.6f}")
     print(f"\nsaved: {plot_path}")
+    print(f"saved: {err_plot_path}")
     if left_idx or right_idx:
         print(f"saved: {dev_plot_path}")
     print(f"saved: {out_dir / 'metrics.json'}")

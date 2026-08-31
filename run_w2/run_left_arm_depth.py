@@ -96,6 +96,16 @@ def _as_uint16_depth(raw: np.ndarray, meters: float, name: str) -> tuple[np.ndar
     return np.ascontiguousarray(depth), scale_m * 1000.0
 
 
+def _check_scale_mm_per_raw_unit(cam: str, scale_mm: float, expected: dict[str, float]) -> None:
+    if cam not in expected:
+        raise RuntimeError(f"训练配置缺少 dataset.scale_mm_per_raw_unit[{cam}]")
+    exp = float(expected[cam])
+    if not math.isclose(scale_mm, exp, rel_tol=1e-3, abs_tol=1e-6):
+        raise RuntimeError(
+            f"{cam} scale_mm_per_raw_unit={scale_mm:g} != 训练配置 {exp:g}"
+        )
+
+
 def _describe_rgbd_issue(cam: Any, name: str, *, need_depth: bool) -> str:
     serial = getattr(getattr(cam, "config", None), "serial_number", None) or "?"
     status = getattr(cam, "status", None)
@@ -134,11 +144,16 @@ def _describe_rgbd_issue(cam: Any, name: str, *, need_depth: bool) -> str:
 
 
 class HeadTriggeredCapture:
-    def __init__(self, camera_manager: Any) -> None:
+    def __init__(
+        self,
+        camera_manager: Any,
+        expected_scale_mm: dict[str, float],
+    ) -> None:
         self._manager = camera_manager
         self._head = camera_manager.camera("head")
         self._left = camera_manager.camera("left_hand")
         self._head_seq = int(self._head.latest_sequence())
+        self._expected_scale_mm = expected_scale_mm
         self._logged_scale = False
 
     def capture(self, *, timeout_s: float = 2.0) -> dict[str, np.ndarray]:
@@ -191,6 +206,7 @@ class HeadTriggeredCapture:
         depth, scale_mm = _as_uint16_depth(
             left_frame.depth, float(left_frame.meters_per_raw_unit), "left_hand"
         )
+        _check_scale_mm_per_raw_unit("left_hand", scale_mm, self._expected_scale_mm)
         rgb_left = _as_uint8_rgb(left_frame.rgb, "left_hand")
         if rgb_left.shape[:2] != depth.shape:
             raise RuntimeError(
@@ -200,7 +216,7 @@ class HeadTriggeredCapture:
         if not self._logged_scale:
             print(
                 f"[INFO] observation.depth.left_hand scale={scale_mm:g} mm/raw-unit "
-                f"（与 openarm_hcx_dual_arm_record / depth_sources.json 相同）",
+                f"（与训练配置 dataset.scale_mm_per_raw_unit 一致）",
                 flush=True,
             )
             self._logged_scale = True
@@ -341,10 +357,7 @@ class LeftStepObservationQueue(StepObservationQueue):
         obs.validate(self._cameras, self._state_dim)
         return _prepare_observation(
             obs,
-            pre_crop_size=self._pre_crop_size,
-            resize_size=self._resize_size,
-            crop_size=self._crop_size,
-            eval_fixed_crop=self._eval_fixed_crop,
+            image_size=self._image_size,
         )
 
 
@@ -520,6 +533,14 @@ def main() -> None:
         flush=True,
     )
 
+    depth_cameras = tuple(getattr(cfg.dataset, "depth_cameras", ()) or ())
+    expected_scale_mm = dict(getattr(cfg.dataset, "scale_mm_per_raw_unit", None) or {})
+    if not depth_cameras:
+        raise ValueError("本脚本需要 dataset.depth_cameras")
+    for cam in depth_cameras:
+        if cam not in expected_scale_mm:
+            raise ValueError(f"训练配置缺少 dataset.scale_mm_per_raw_unit[{cam}]")
+
     hw = HardwareBundle(
         left_start_joints_deg=deploy["left_start_joints_deg"],
         right_start_joints_deg=None,
@@ -534,7 +555,10 @@ def main() -> None:
             )
             hw.left_gripper_loop.start(initial_opening=hold_left)
         hw.camera_manager = _connect_record_cameras(teleop_yaml)
-        hw.camera_capture = HeadTriggeredCapture(hw.camera_manager)
+        hw.camera_capture = HeadTriggeredCapture(
+            hw.camera_manager,
+            expected_scale_mm=expected_scale_mm,
+        )
         print(
             "[INFO] 采图对齐 openarm_hcx_dual_arm_record："
             "head 新帧触发，left_hand 取 at_or_before 的 RGB-D",
@@ -583,19 +607,13 @@ def main() -> None:
             rate_hz=gripper_rate_hz,
         )
 
-        pre_crop_size = cfg.dataset.pre_crop_size
-        resize_size = cfg.dataset.resize_size
-        crop_size = cfg.dataset.crop_size
-        eval_fixed_crop = bool(cfg.dataset.eval_fixed_crop)
+        image_size = cfg.dataset.image_size
         obs_queue = LeftStepObservationQueue(
             hw,
             list(cameras),
             n_obs_steps=n_obs,
             state_dim=int(cfg.state_dim),
-            pre_crop_size=pre_crop_size,
-            resize_size=resize_size,
-            crop_size=crop_size,
-            eval_fixed_crop=eval_fixed_crop,
+            image_size=image_size,
         )
         obs_queue.fill_initial()
         print(

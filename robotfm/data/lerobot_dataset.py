@@ -23,12 +23,14 @@ import pyarrow.parquet as pq
 import torch
 from torch.utils.data import Dataset
 
-from robotfm.data.dataset import apply_hw_crop, color_jitter_images, crop_hw_box
+from robotfm.data.dataset import color_jitter_images, parse_image_hw
 from robotfm.data.action_delta import (
     flow_history_from_phys,
     joint_mask_from_names,
     overlay_joint_delta_action_stats,
+    reach_open_action_loss_w,
     subtract_joint_pose,
+    target_chunk_from_t,
 )
 from robotfm.data.stats import is_limits_mode, normalize, validate_norm_mode
 from robotfm.data.uint8_cache import Uint8ImageCache, resolve_cache_dir
@@ -75,15 +77,19 @@ def _raw_depth_to_normalized(
     return norm[None, ...]
 
 
-def _center_crop_hw(arr: np.ndarray, crop_size: int) -> np.ndarray:
-    h, w = arr.shape[:2]
-    if h == crop_size and w == crop_size:
+def _resize_hw(
+    arr: np.ndarray,
+    image_size: int | tuple[int, int] | list[int] | None,
+    interpolation: int,
+) -> np.ndarray:
+    hw = parse_image_hw(image_size)
+    if hw is None:
         return arr
-    if h < crop_size or w < crop_size:
-        raise ValueError(f"Cannot crop {h}x{w} to {crop_size}")
-    top = (h - crop_size) // 2
-    left = (w - crop_size) // 2
-    return arr[top : top + crop_size, left : left + crop_size]
+    th, tw = hw
+    h, w = arr.shape[:2]
+    if h == th and w == tw:
+        return arr
+    return cv2.resize(arr, (tw, th), interpolation=interpolation)
 
 
 def _depth_rel_from_image_rel(img_rel: str, camera: str) -> str:
@@ -99,22 +105,14 @@ def _load_packed_depth(
     invalid_raw: int,
     min_mm: float,
     max_mm: float,
-    resize_size: int | None,
-    pre_crop_size: int | None,
+    image_size: int | tuple[int, int] | list[int] | None,
 ) -> np.ndarray:
     bgr = cv2.imread(str(path), cv2.IMREAD_COLOR)
     if bgr is None:
         raise FileNotFoundError(f"Failed to read depth: {path}")
     packed = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
     raw = _decode_packed_depth_png(packed)
-    if pre_crop_size is not None:
-        raw = _center_crop_hw(raw, pre_crop_size)
-    if resize_size is not None:
-        h, w = raw.shape[:2]
-        if h != resize_size or w != resize_size:
-            raw = cv2.resize(
-                raw, (resize_size, resize_size), interpolation=cv2.INTER_NEAREST
-            )
+    raw = _resize_hw(raw, image_size, cv2.INTER_NEAREST)
     return _raw_depth_to_normalized(raw, scale_mm, min_mm, max_mm, invalid_raw)
 
 
@@ -266,51 +264,23 @@ def build_episode_meta_from_info(
     )
 
 
-def _center_crop_hwc(img: np.ndarray, crop_size: int) -> np.ndarray:
-    """Center-crop HWC array to ``crop_size×crop_size``."""
-    h, w = img.shape[:2]
-    if h == crop_size and w == crop_size:
-        return img
-    if h < crop_size or w < crop_size:
-        raise ValueError(f"Cannot crop {h}x{w} to {crop_size}")
-    top = (h - crop_size) // 2
-    left = (w - crop_size) // 2
-    return img[top : top + crop_size, left : left + crop_size]
-
-
 def _load_image_rgb(
     path: Path,
-    resize_size: int | None = None,
-    pre_crop_size: int | None = None,
+    image_size: int | tuple[int, int] | list[int] | None = None,
 ) -> np.ndarray:
-    """Decode JPEG via OpenCV (faster than PIL); optional center pre-crop then resize.
-
-    When only ``resize_size`` is set (no pre-crop), try half-resolution JPEG decode
-    first (``IMREAD_REDUCED_COLOR_2``), then ``cv2.resize`` to target. This avoids
-    bilinear interpolate on full 1280x720 float tensors (dual-cam n_obs hot path).
-
-    With ``pre_crop_size`` (e.g. 720 on 1280×720), always decode full-res so the
-    square crop is exact, then resize to ``resize_size``.
-    """
     path_str = str(path)
     bgr = None
-    # Half-res decode only when we are not center-cropping first (half of 720 < 720).
-    if resize_size is not None and pre_crop_size is None:
+    hw = parse_image_hw(image_size)
+    if hw is not None:
+        th, tw = hw
         half = cv2.imread(path_str, cv2.IMREAD_REDUCED_COLOR_2)
-        if half is not None and min(half.shape[:2]) >= resize_size:
+        if half is not None and min(half.shape[:2]) >= min(th, tw):
             bgr = half
     if bgr is None:
         bgr = cv2.imread(path_str, cv2.IMREAD_COLOR)
     if bgr is None:
         raise FileNotFoundError(f"Failed to read image: {path}")
-    if pre_crop_size is not None:
-        bgr = _center_crop_hwc(bgr, pre_crop_size)
-    if resize_size is not None:
-        h, w = bgr.shape[:2]
-        if h != resize_size or w != resize_size:
-            bgr = cv2.resize(
-                bgr, (resize_size, resize_size), interpolation=cv2.INTER_AREA
-            )
+    bgr = _resize_hw(bgr, image_size, cv2.INTER_AREA)
     return cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
 
 
@@ -419,10 +389,7 @@ class LeRobotImageSequenceDataset(Dataset):
         stats: dict[str, np.ndarray] | None = None,
         normalize: bool = True,
         norm_mode: str = "gaussian",
-        pre_crop_size: int | None = None,
-        resize_size: int | None = None,
-        crop_size: int | None = 84,
-        random_crop: bool = True,
+        image_size: int | tuple[int, int] | list[int] | None = None,
         color_jitter_brightness: float = 0.0,
         color_jitter_contrast: float = 0.0,
         color_jitter_saturation: float = 0.0,
@@ -431,9 +398,15 @@ class LeRobotImageSequenceDataset(Dataset):
         uint8_cache: bool = False,
         uint8_cache_dir: str | Path | None = None,
         predict_joint_delta: bool = False,
+        predict_state_delta: bool = False,
         depth_cameras: tuple[str, ...] | list[str] = (),
         depth_min_mm: float = 50.0,
         depth_max_mm: float = 500.0,
+        episode_ids: list[int] | tuple[int, ...] | None = None,
+        reach_open_joint_weight: float = 1.0,
+        reach_gripper_open_thr: float = 0.5,
+        reach_move_deg_per_frame: float = 0.35,
+        action_names: list[str] | None = None,
     ) -> None:
         self.run_dir = Path(run_dir)
         self.info = load_lerobot_info(self.run_dir)
@@ -460,16 +433,20 @@ class LeRobotImageSequenceDataset(Dataset):
                     "delete stats.json and recompute, or call ensure_stats(..., "
                     f"{self.norm_mode!r})"
                 )
-        self.pre_crop_size = pre_crop_size
-        self.resize_size = resize_size
-        self.crop_size = crop_size
-        self.random_crop = random_crop
+        self.image_size = image_size
         self.color_jitter_brightness = color_jitter_brightness
         self.color_jitter_contrast = color_jitter_contrast
         self.color_jitter_saturation = color_jitter_saturation
         self.color_jitter_hue = color_jitter_hue
         self.defer_augment = bool(defer_augment)
         self.predict_joint_delta = bool(predict_joint_delta)
+        self.predict_state_delta = bool(predict_state_delta)
+        if self.predict_state_delta and not self.predict_joint_delta:
+            raise ValueError("predict_state_delta requires predict_joint_delta")
+        self.reach_open_joint_weight = float(reach_open_joint_weight)
+        self.reach_gripper_open_thr = float(reach_gripper_open_thr)
+        self.reach_move_deg_per_frame = float(reach_move_deg_per_frame)
+        self._weight_names = list(action_names) if action_names else list(self.meta.action_names)
         self.depth_cameras = tuple(depth_cameras)
         self.depth_min_mm = float(depth_min_mm)
         self.depth_max_mm = float(depth_max_mm)
@@ -528,6 +505,11 @@ class LeRobotImageSequenceDataset(Dataset):
         episode_indices = list_episode_indices(self.run_dir, self.info)
         if not episode_indices:
             raise FileNotFoundError(f"No episodes listed under {self.run_dir}")
+        allowed = (
+            None
+            if episode_ids is None
+            else {int(x) for x in episode_ids}
+        )
 
         self._episode_ids: list[int] = []
         self._states: list[np.ndarray] = []
@@ -557,7 +539,11 @@ class LeRobotImageSequenceDataset(Dataset):
             self._actions.append(payload["action"])
             self._image_paths.append(payload["image_paths"])
             self._episode_lengths.append(length)
+            if allowed is not None and int(ep_id) not in allowed:
+                continue
             usable = length - self.drop_n_last_frames
+            if self.predict_state_delta:
+                usable = min(usable, length - 1)
             if usable <= 0:
                 continue
             for t in range(usable):
@@ -577,26 +563,25 @@ class LeRobotImageSequenceDataset(Dataset):
                 self._states,
                 self._actions,
                 horizon=self.horizon,
+                predict_state_delta=self.predict_state_delta,
                 joint_mask=self._joint_mask,
             )
 
         if uint8_cache:
             cache_path = resolve_cache_dir(
                 self.run_dir,
-                resize_size=self.resize_size,
-                pre_crop_size=self.pre_crop_size,
+                image_size=self.image_size,
                 cache_dir=uint8_cache_dir,
             )
+            hw = parse_image_hw(self.image_size)
             if not (cache_path / "meta.json").is_file():
+                hint = f"--run-dir {self.run_dir}"
+                if hw is not None:
+                    hint += f" --height {hw[0]} --width {hw[1]}"
                 raise FileNotFoundError(
                     f"uint8_cache enabled but missing {cache_path / 'meta.json'}. "
                     "Build it with: python scripts/build_uint8_image_cache.py "
-                    f"--run-dir {self.run_dir} --resize-size {self.resize_size}"
-                    + (
-                        f" --pre-crop-size {self.pre_crop_size}"
-                        if self.pre_crop_size is not None
-                        else ""
-                    )
+                    f"{hint}"
                 )
             self._image_cache = Uint8ImageCache(cache_path)
             if self._image_cache.cameras != list(self.meta.camera_names):
@@ -611,21 +596,12 @@ class LeRobotImageSequenceDataset(Dataset):
                     f"uint8 cache at {cache_path} does not match episode ids/lengths "
                     f"under {self.run_dir}; rebuild with --overwrite"
                 )
-            if self.resize_size is not None and (
-                self._image_cache.height != self.resize_size
-                or self._image_cache.width != self.resize_size
+            if hw is not None and (
+                self._image_cache.height != hw[0] or self._image_cache.width != hw[1]
             ):
                 raise ValueError(
                     f"cache HxW={self._image_cache.height}x{self._image_cache.width} "
-                    f"!= resize_size={self.resize_size}"
-                )
-            cached_pre = self._image_cache.meta.get("pre_crop_size")
-            if cached_pre != self.pre_crop_size and (
-                cached_pre is not None or self.pre_crop_size is not None
-            ):
-                raise ValueError(
-                    f"cache pre_crop_size={cached_pre} != "
-                    f"dataset pre_crop_size={self.pre_crop_size}; rebuild cache"
+                    f"!= image_size={hw}"
                 )
 
     def __len__(self) -> int:
@@ -648,13 +624,7 @@ class LeRobotImageSequenceDataset(Dataset):
         frames = []
         for fi in frame_indices:
             img_path = self.run_dir / paths[fi]
-            frames.append(
-                _load_image_rgb(
-                    img_path,
-                    resize_size=self.resize_size,
-                    pre_crop_size=self.pre_crop_size,
-                )
-            )
+            frames.append(_load_image_rgb(img_path, image_size=self.image_size))
         return np.stack(frames, axis=0)
 
     def _load_depth_cam_window(
@@ -672,8 +642,7 @@ class LeRobotImageSequenceDataset(Dataset):
                     invalid_raw=meta["invalid_raw_value"],
                     min_mm=self.depth_min_mm,
                     max_mm=self.depth_max_mm,
-                    resize_size=self.resize_size,
-                    pre_crop_size=self.pre_crop_size,
+                    image_size=self.image_size,
                 )
             )
         return np.stack(frames, axis=0)
@@ -712,21 +681,13 @@ class LeRobotImageSequenceDataset(Dataset):
                 )
             obs_depth = torch.stack(depth_cams, dim=0)
         if not self.defer_augment:
-            if self.crop_size is not None:
-                _, _, h, w = obs_images.shape[-4:]
-                if h != self.crop_size or w != self.crop_size:
-                    top, left = crop_hw_box(h, w, self.crop_size, self.random_crop)
-                    obs_images = apply_hw_crop(obs_images, top, left, self.crop_size)
-                    if obs_depth is not None:
-                        obs_depth = apply_hw_crop(obs_depth, top, left, self.crop_size)
-            if self.random_crop:
-                obs_images = color_jitter_images(
-                    obs_images,
-                    brightness=self.color_jitter_brightness,
-                    contrast=self.color_jitter_contrast,
-                    saturation=self.color_jitter_saturation,
-                    hue=self.color_jitter_hue,
-                )
+            obs_images = color_jitter_images(
+                obs_images,
+                brightness=self.color_jitter_brightness,
+                contrast=self.color_jitter_contrast,
+                saturation=self.color_jitter_saturation,
+                hue=self.color_jitter_hue,
+            )
 
         state_phys = state_all[obs_indices].astype(np.float32)
         state = self._normalize_state(state_phys)
@@ -743,9 +704,13 @@ class LeRobotImageSequenceDataset(Dataset):
         else:
             flow_hist = state
 
-        action_end = min(t + self.horizon, length)
-        valid_len = action_end - t
-        actions = action_all[t:action_end].astype(np.float32)
+        actions, valid_len = target_chunk_from_t(
+            state_all,
+            action_all,
+            t,
+            self.horizon,
+            predict_state_delta=self.predict_state_delta,
+        )
         if self.predict_joint_delta:
             q_now = state_all[t].astype(np.float32)
             actions = subtract_joint_pose(actions, q_now, self._joint_mask)
@@ -768,6 +733,18 @@ class LeRobotImageSequenceDataset(Dataset):
         }
         if obs_depth is not None:
             out["obs_depth"] = obs_depth
+        if self.reach_open_joint_weight > 1.0:
+            out["action_loss_w"] = torch.from_numpy(
+                reach_open_action_loss_w(
+                    state_all,
+                    t,
+                    self.horizon,
+                    self._weight_names,
+                    weight=self.reach_open_joint_weight,
+                    gripper_open_thr=self.reach_gripper_open_thr,
+                    move_deg_per_frame=self.reach_move_deg_per_frame,
+                )
+            )
         return out
 
 

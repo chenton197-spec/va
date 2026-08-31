@@ -586,27 +586,21 @@ def main() -> None:
             rate_hz=gripper_rate_hz,
         )
 
-        pre_crop_size = cfg.dataset.pre_crop_size
-        resize_size = cfg.dataset.resize_size
-        crop_size = cfg.dataset.crop_size
-        eval_fixed_crop = bool(cfg.dataset.eval_fixed_crop)
+        image_size = cfg.dataset.image_size
         obs_sampler = FpsObservationSampler(
             hw,
             cameras,
             n_obs_steps=n_obs,
             fps=train_fps,
             state_dim=state_dim,
-            pre_crop_size=pre_crop_size,
-            resize_size=resize_size,
-            crop_size=crop_size,
-            eval_fixed_crop=eval_fixed_crop,
+            image_size=image_size,
         )
         obs_sampler.start()
         hw.obs_sampler = obs_sampler
         fill_timeout_s = max(5.0, float(n_obs) / float(train_fps) + 3.0)
         print(
             f"[INFO] 观测采样已启动 fps={train_fps} n_obs={n_obs} "
-            f"pre_crop={pre_crop_size} resize={resize_size} crop={crop_size} "
+            f"image_size={image_size} "
             f"fill_timeout_s={fill_timeout_s:.1f}",
             flush=True,
         )

@@ -53,7 +53,7 @@ def _resolve_train_config(ckpt_path: Path, config_arg: str | None, base_dir: Pat
         if not p.is_absolute():
             p = base_dir / p
         return p.resolve()
-    for name in ("config_source.yaml", "config.yaml"):
+    for name in ("config.yaml", "config_source.yaml"):
         cand = ckpt_path.parent / name
         if cand.is_file():
             return cand
@@ -90,11 +90,8 @@ def _preload_episode_images(
     image_paths: dict[str, list[str]],
     cameras: list[str],
     length: int,
-    pre_crop_size: int | None,
-    resize_size: int | None,
-    crop_size: int | None,
+    image_size: int | list[int] | None,
 ) -> dict[str, torch.Tensor]:
-    """Decode + spatial preprocess every frame once. Returns cam -> (T, 3, H, W)."""
     cached: dict[str, torch.Tensor] = {}
     for cam in cameras:
         frames = []
@@ -105,10 +102,7 @@ def _preload_episode_images(
         stacked = torch.stack(frames, dim=0)
         stacked = spatial_preprocess_images(
             stacked,
-            pre_crop_size=pre_crop_size,
-            resize_size=resize_size,
-            crop_size=crop_size,
-            random_crop=False,
+            image_size=image_size,
         )
         cached[cam] = stacked.contiguous()
         print(f"  cached {cam}: {tuple(cached[cam].shape)}")
@@ -302,7 +296,7 @@ def main() -> None:
     ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
     train_cfg_path = _resolve_train_config(ckpt_path, args.config, base_dir)
     if train_cfg_path is None:
-        raise FileNotFoundError("need config_source.yaml / config.yaml beside checkpoint")
+        raise FileNotFoundError("need config.yaml / config_source.yaml beside checkpoint")
     cfg = load_config(train_cfg_path)
     # Deterministic open-loop: drop training history noise.
     cfg.policy.history_noise_std = 0.0
@@ -360,9 +354,7 @@ def main() -> None:
         image_paths=image_paths,
         cameras=cameras,
         length=length,
-        pre_crop_size=cfg.dataset.pre_crop_size,
-        resize_size=cfg.dataset.resize_size,
-        crop_size=cfg.dataset.crop_size,
+        image_size=cfg.dataset.image_size,
     )
 
     # Action stride is always 1/1 (15 Hz). Only observation temporal spacing changes.

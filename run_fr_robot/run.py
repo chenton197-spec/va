@@ -60,7 +60,7 @@ if str(VA_ROOT) not in sys.path:
 
 from robotfm.config import _normalize_rtc_config, load_config  # noqa: E402
 from robotfm.data.action_delta import denormalize_predicted_action, flow_history_from_phys, joint_mask_from_names  # noqa: E402
-from robotfm.data.dataset import spatial_preprocess_images  # noqa: E402
+from robotfm.data.dataset import parse_image_hw, spatial_preprocess_images  # noqa: E402
 from robotfm.data.stats import normalize  # noqa: E402
 from robotfm.policies.rtc import ActionQueue, RTCConfig  # noqa: E402
 from robotfm.train import build_policy  # noqa: E402
@@ -256,12 +256,12 @@ def _warmup_compiled_policy(
     cfg: Any,
     device: torch.device,
     *,
-    crop_size: int | None,
+    image_size: int | list[int] | None,
 ) -> None:
-    """One dummy ``sample_actions`` to finish Inductor compile + CUDA graphs."""
     n_cams = len(cfg.cameras)
     n_obs = int(cfg.dataset.n_obs_steps)
-    h = w = int(crop_size or cfg.dataset.resize_size or 224)
+    hw = parse_image_hw(image_size) or (224, 224)
+    h, w = hw
     batch = {
         "obs_images": torch.zeros(
             1, n_cams, n_obs, 3, h, w, device=device, dtype=torch.float32
@@ -364,28 +364,15 @@ def _pace_step(step_start: float, fps: int) -> None:
 def _preprocess_images(
     images: dict[str, np.ndarray],
     *,
-    pre_crop_size: int | None,
-    resize_size: int | None,
-    crop_size: int | None,
-    eval_fixed_crop: bool,
+    image_size: int | list[int] | None,
 ) -> dict[str, np.ndarray]:
-    """相机原图 HWC uint8 → 策略分辨率 HWC float32 [0,1]。
-
-    顺序：中心 pre_crop → resize → 可选中心 crop。入队时做一次。
-    """
     out: dict[str, np.ndarray] = {}
     for name, rgb in images.items():
         arr = np.asarray(rgb)
         if arr.dtype != np.uint8:
             arr = np.clip(arr, 0, 255).astype(np.uint8)
         t = torch.from_numpy(arr.astype(np.float32) / 255.0).permute(2, 0, 1).unsqueeze(0)
-        t = spatial_preprocess_images(
-            t,
-            pre_crop_size=pre_crop_size,
-            resize_size=resize_size,
-            crop_size=crop_size if eval_fixed_crop else None,
-            random_crop=False,
-        )
+        t = spatial_preprocess_images(t, image_size=image_size)
         out[name] = t.squeeze(0).permute(1, 2, 0).contiguous().numpy()
     return out
 
@@ -393,19 +380,12 @@ def _preprocess_images(
 def _prepare_observation(
     obs: Observation,
     *,
-    pre_crop_size: int | None,
-    resize_size: int | None,
-    crop_size: int | None,
-    eval_fixed_crop: bool,
+    image_size: int | list[int] | None,
 ) -> Observation:
-    """替换图像为入队即用的 pre_crop/resize/crop 结果；state 原样保留。"""
     return Observation(
         images=_preprocess_images(
             obs.images,
-            pre_crop_size=pre_crop_size,
-            resize_size=resize_size,
-            crop_size=crop_size,
-            eval_fixed_crop=eval_fixed_crop,
+            image_size=image_size,
         ),
         state=np.asarray(obs.state, dtype=np.float32),
         timestamp=obs.timestamp,
@@ -1195,8 +1175,7 @@ def main() -> None:
         f"n_action_steps={n_action_steps} num_inference_steps={cfg.policy.num_inference_steps}"
     )
     print(
-        f"[INFO] pre_crop={cfg.dataset.pre_crop_size} resize={cfg.dataset.resize_size} "
-        f"crop={cfg.dataset.crop_size} eval_fixed_crop={cfg.dataset.eval_fixed_crop} fps={fps}"
+        f"[INFO] image_size={cfg.dataset.image_size} fps={fps}"
     )
     print(f"[INFO] action_names={list(cfg.action_names)}")
     print(
@@ -1223,10 +1202,9 @@ def main() -> None:
         compiled = _compile_policy_submodules(policy)
         if compiled:
             print(f"[INFO] torch.compile({', '.join(compiled)}, mode=default)")
-            crop_for_warmup = cfg.dataset.crop_size
             t_warm = time.perf_counter()
             _warmup_compiled_policy(
-                policy, cfg, device, crop_size=crop_for_warmup
+                policy, cfg, device, image_size=cfg.dataset.image_size
             )
             warm_ms = (time.perf_counter() - t_warm) * 1000.0
             print(f"[INFO] compile warmup done ({warm_ms:.0f}ms)")
@@ -1280,23 +1258,13 @@ def main() -> None:
 
         obs = _read_observation(hw, cameras, last_state=None)
         obs.validate(cameras, int(cfg.state_dim))
-        pre_crop_size = cfg.dataset.pre_crop_size
-        resize_size = cfg.dataset.resize_size
-        crop_size = cfg.dataset.crop_size
-        eval_fixed_crop = bool(cfg.dataset.eval_fixed_crop)
+        image_size = cfg.dataset.image_size
         obs = _prepare_observation(
             obs,
-            pre_crop_size=pre_crop_size,
-            resize_size=resize_size,
-            crop_size=crop_size,
-            eval_fixed_crop=eval_fixed_crop,
+            image_size=image_size,
         )
         obs_history: list[Observation] = [obs]
-        print(
-            f"[INFO] 观测入队即 pre_crop/resize/crop "
-            f"(pre_crop={pre_crop_size} resize={resize_size} crop={crop_size} "
-            f"fixed={eval_fixed_crop})"
-        )
+        print(f"[INFO] 观测入队即 resize image_size={image_size}")
 
         print(f"[INFO] 开始闭环，最多 {max_steps} 步" + (" (RTC)" if rtc_enabled else ""))
 
@@ -1533,10 +1501,7 @@ def main() -> None:
                     last_logged_exec = step_i
                 obs = _prepare_observation(
                     _read_observation(hw, cameras, last_state=obs.state),
-                    pre_crop_size=pre_crop_size,
-                    resize_size=resize_size,
-                    crop_size=crop_size,
-                    eval_fixed_crop=eval_fixed_crop,
+                    image_size=image_size,
                 )
                 _append_observation(obs_history, obs, n_obs_steps=n_obs)
                 _pace_step(t0, fps)
@@ -1598,10 +1563,7 @@ def main() -> None:
                     last_logged_exec = step_i
                 obs = _prepare_observation(
                     _read_observation(hw, cameras, last_state=obs.state),
-                    pre_crop_size=pre_crop_size,
-                    resize_size=resize_size,
-                    crop_size=crop_size,
-                    eval_fixed_crop=eval_fixed_crop,
+                    image_size=image_size,
                 )
                 _append_observation(obs_history, obs, n_obs_steps=n_obs)
                 _pace_step(t0, fps)

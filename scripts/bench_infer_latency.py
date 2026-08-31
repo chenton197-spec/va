@@ -19,6 +19,7 @@ from pathlib import Path
 import torch
 
 from robotfm.config import load_config
+from robotfm.data.dataset import parse_image_hw
 from robotfm.train import build_policy
 
 
@@ -36,7 +37,8 @@ def _parse_args() -> argparse.Namespace:
 def _dummy_batch(cfg, device: torch.device) -> dict[str, torch.Tensor]:
     n_cams = len(cfg.cameras)
     n_obs = int(cfg.dataset.n_obs_steps)
-    h = w = int(cfg.dataset.crop_size or cfg.dataset.resize_size or 224)
+    hw = parse_image_hw(cfg.dataset.image_size) or (224, 224)
+    h, w = hw
     return {
         "obs_images": torch.rand(
             1, n_cams, n_obs, 3, h, w, device=device, dtype=torch.float32

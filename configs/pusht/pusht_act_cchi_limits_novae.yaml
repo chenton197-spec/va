@@ -19,8 +19,6 @@ dataset:
   n_obs_steps: 1
   horizon: 8
   run_name: pusht_merged_cchi_teleop10fps
-  crop_size: 84
-  eval_fixed_crop: true
   # Align successful FM PushT recipe
   norm_mode: limits
   image_norm_mode: dataset

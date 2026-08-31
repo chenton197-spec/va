@@ -34,9 +34,7 @@ dataset:
   n_obs_steps: 8
   horizon: 16
   run_name: openarm_hcx_dual_arm
-  pre_crop_size: 720
-  resize_size: 512
-  crop_size: null
+  image_size: [512, 911]
   color_jitter_brightness: 0.2
   color_jitter_contrast: 0.2
   color_jitter_saturation: 0.1

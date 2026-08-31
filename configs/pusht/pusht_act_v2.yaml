@@ -20,8 +20,6 @@ dataset:
   # 对齐 IL act_run.sh chunk_size=8 与 FM horizon
   horizon: 8
   run_name: pusht_merged_quanfu_my_demo_teleop10fps
-  crop_size: 84
-  eval_fixed_crop: true
   norm_mode: gaussian
 
 policy:

@@ -336,28 +336,15 @@ def _pace_step(step_start: float, fps: int) -> None:
 def _preprocess_images(
     images: dict[str, np.ndarray],
     *,
-    pre_crop_size: int | None,
-    resize_size: int | None,
-    crop_size: int | None,
-    eval_fixed_crop: bool,
+    image_size: int | list[int] | None,
 ) -> dict[str, np.ndarray]:
-    """相机原图 HWC uint8 → 策略分辨率 HWC float32 [0,1]。
-
-    顺序与训练/开环评估一致：中心 pre_crop → resize → 可选中心 crop。
-    """
     out: dict[str, np.ndarray] = {}
     for name, rgb in images.items():
         arr = np.asarray(rgb)
         if arr.dtype != np.uint8:
             arr = np.clip(arr, 0, 255).astype(np.uint8)
         t = torch.from_numpy(arr.astype(np.float32) / 255.0).permute(2, 0, 1).unsqueeze(0)
-        t = spatial_preprocess_images(
-            t,
-            pre_crop_size=pre_crop_size,
-            resize_size=resize_size,
-            crop_size=crop_size if eval_fixed_crop else None,
-            random_crop=False,
-        )
+        t = spatial_preprocess_images(t, image_size=image_size)
         out[name] = t.squeeze(0).permute(1, 2, 0).contiguous().numpy()
     return out
 
@@ -365,18 +352,12 @@ def _preprocess_images(
 def _prepare_observation(
     obs: Observation,
     *,
-    pre_crop_size: int | None,
-    resize_size: int | None,
-    crop_size: int | None,
-    eval_fixed_crop: bool,
+    image_size: int | list[int] | None,
 ) -> Observation:
     return Observation(
         images=_preprocess_images(
             obs.images,
-            pre_crop_size=pre_crop_size,
-            resize_size=resize_size,
-            crop_size=crop_size,
-            eval_fixed_crop=eval_fixed_crop,
+            image_size=image_size,
         ),
         state=np.asarray(obs.state, dtype=np.float32),
         timestamp=obs.timestamp,
@@ -737,10 +718,7 @@ class FpsObservationSampler:
         n_obs_steps: int,
         fps: int,
         state_dim: int,
-        pre_crop_size: int | None,
-        resize_size: int | None,
-        crop_size: int | None,
-        eval_fixed_crop: bool,
+        image_size: int | list[int] | None,
     ) -> None:
         if n_obs_steps <= 0:
             raise ValueError("n_obs_steps 必须 > 0")
@@ -752,10 +730,7 @@ class FpsObservationSampler:
         self._fps = int(fps)
         self._period_s = 1.0 / float(fps)
         self._state_dim = int(state_dim)
-        self._pre_crop_size = pre_crop_size
-        self._resize_size = resize_size
-        self._crop_size = crop_size
-        self._eval_fixed_crop = bool(eval_fixed_crop)
+        self._image_size = image_size
         self._lock = threading.Lock()
         self._history: deque[Observation] = deque(maxlen=self._n_obs_steps)
         self._error: BaseException | None = None
@@ -825,10 +800,7 @@ class FpsObservationSampler:
                 obs.validate(self._cameras, self._state_dim)
                 obs = _prepare_observation(
                     obs,
-                    pre_crop_size=self._pre_crop_size,
-                    resize_size=self._resize_size,
-                    crop_size=self._crop_size,
-                    eval_fixed_crop=self._eval_fixed_crop,
+                    image_size=self._image_size,
                 )
                 last_state = obs.state
                 with self._lock:
@@ -861,10 +833,7 @@ class StepObservationQueue:
         *,
         n_obs_steps: int,
         state_dim: int,
-        pre_crop_size: int | None,
-        resize_size: int | None,
-        crop_size: int | None,
-        eval_fixed_crop: bool,
+        image_size: int | list[int] | None,
     ) -> None:
         if n_obs_steps <= 0:
             raise ValueError("n_obs_steps 必须 > 0")
@@ -872,10 +841,7 @@ class StepObservationQueue:
         self._cameras = list(cameras)
         self._n_obs_steps = int(n_obs_steps)
         self._state_dim = int(state_dim)
-        self._pre_crop_size = pre_crop_size
-        self._resize_size = resize_size
-        self._crop_size = crop_size
-        self._eval_fixed_crop = bool(eval_fixed_crop)
+        self._image_size = image_size
         self._history: deque[Observation] = deque(maxlen=self._n_obs_steps)
 
     def fill_initial(self) -> None:
@@ -907,10 +873,7 @@ class StepObservationQueue:
         obs.validate(self._cameras, self._state_dim)
         return _prepare_observation(
             obs,
-            pre_crop_size=self._pre_crop_size,
-            resize_size=self._resize_size,
-            crop_size=self._crop_size,
-            eval_fixed_crop=self._eval_fixed_crop,
+            image_size=self._image_size,
         )
 
 
@@ -1504,10 +1467,10 @@ def _shutdown(hw: HardwareBundle) -> None:
 
 
 def _resolve_train_config(ckpt_path: Path, config_arg: Path | None) -> Path | None:
-    """CLI config > checkpoint 旁 config_source.yaml/config.yaml > None（用内嵌）。"""
+    """CLI config > checkpoint 旁 config.yaml/config_source.yaml > None（用内嵌）。"""
     if config_arg is not None:
         return config_arg
-    for name in ("config_source.yaml", "config.yaml"):
+    for name in ("config.yaml", "config_source.yaml"):
         cand = ckpt_path.parent / name
         if cand.is_file():
             return cand
@@ -1740,25 +1703,15 @@ def main() -> None:
             rate_hz=gripper_rate_hz,
         )
 
-        pre_crop_size = cfg.dataset.pre_crop_size
-        resize_size = cfg.dataset.resize_size
-        crop_size = cfg.dataset.crop_size
-        eval_fixed_crop = bool(cfg.dataset.eval_fixed_crop)
-        print(
-            f"[INFO] 观测入队即 pre_crop/resize/crop "
-            f"(pre_crop={pre_crop_size} resize={resize_size} crop={crop_size} "
-            f"fixed={eval_fixed_crop})"
-        )
+        image_size = cfg.dataset.image_size
+        print(f"[INFO] 观测入队即 resize image_size={image_size}")
         if obs_mode == "after_action":
             obs_queue = StepObservationQueue(
                 hw,
                 cameras,
                 n_obs_steps=n_obs,
                 state_dim=int(cfg.state_dim),
-                pre_crop_size=pre_crop_size,
-                resize_size=resize_size,
-                crop_size=crop_size,
-                eval_fixed_crop=eval_fixed_crop,
+                image_size=image_size,
             )
             obs_queue.fill_initial()
             print(
@@ -1853,10 +1806,7 @@ def main() -> None:
             n_obs_steps=n_obs,
             fps=obs_fps,
             state_dim=int(cfg.state_dim),
-            pre_crop_size=pre_crop_size,
-            resize_size=resize_size,
-            crop_size=crop_size,
-            eval_fixed_crop=eval_fixed_crop,
+            image_size=image_size,
         )
         hw.obs_sampler.start()
         fill_timeout_s = max(5.0, float(n_obs) / float(obs_fps) + 3.0)

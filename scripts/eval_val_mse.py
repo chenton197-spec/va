@@ -37,7 +37,7 @@ def _resolve_train_config(ckpt_path: Path, config_arg: str | None, base_dir: Pat
         if not p.is_absolute():
             p = base_dir / p
         return p.resolve()
-    for name in ("config_source.yaml", "config.yaml"):
+    for name in ("config.yaml", "config_source.yaml"):
         cand = ckpt_path.parent / name
         if cand.is_file():
             return cand
@@ -397,7 +397,7 @@ def main() -> None:
     policy.eval()
     print(
         f"run_dir: {run_dir}  device={device}  n_obs={n_obs} horizon={horizon} "
-        f"n_act={n_act} resize={cfg.dataset.resize_size} "
+        f"n_act={n_act} image_size={cfg.dataset.image_size} "
         f"predict_joint_delta={predict_joint_delta} "
         f"history_noise_std={cfg.policy.history_noise_std}  "
         f"n_ckpts={len(ckpt_paths)}  build={time.time() - t_load:.1f}s"
@@ -413,10 +413,7 @@ def main() -> None:
         stats=stats,
         normalize=True,
         norm_mode=cfg.dataset.norm_mode,
-        resize_size=cfg.dataset.resize_size,
-        pre_crop_size=cfg.dataset.pre_crop_size,
-        crop_size=None,
-        random_crop=False,
+        image_size=cfg.dataset.image_size,
         color_jitter_brightness=0.0,
         color_jitter_contrast=0.0,
         color_jitter_saturation=0.0,
@@ -424,6 +421,7 @@ def main() -> None:
         defer_augment=True,
         uint8_cache=False,
         predict_joint_delta=predict_joint_delta,
+        predict_state_delta=bool(cfg.policy.predict_state_delta),
     )
     keep_idx = _subset_indices_for_episodes(dataset, episode_filter)
     stride = max(int(args.stride), 1)

@@ -22,8 +22,6 @@ dataset:
   # chunk_size = horizon（对齐 LeRobot ACTConfig.chunk_size=100）
   horizon: 100
   run_name: pusht_merged_quanfu_my_demo_teleop10fps
-  crop_size: 84
-  eval_fixed_crop: true
   # 与原版 ACT / LeRobot 一致：MEAN_STD
   norm_mode: gaussian
 
