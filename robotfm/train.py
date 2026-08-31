@@ -636,16 +636,30 @@ def _val_freq(cfg: RobotFMConfig) -> int:
 
 
 def _split_episode_ids(
-    ep_ids: list[int], val_ratio: float, seed: int
+    ep_ids: list[int],
+    val_ratio: float,
+    seed: int,
+    *,
+    group_size: int = 1,
 ) -> tuple[list[int], list[int]]:
     ids = [int(x) for x in ep_ids]
     if val_ratio <= 0 or len(ids) <= 1:
         return ids, []
+    gsize = max(1, int(group_size))
+    groups: dict[int, list[int]] = {}
+    order: list[int] = []
+    for e in ids:
+        g = e // gsize
+        if g not in groups:
+            groups[g] = []
+            order.append(g)
+        groups[g].append(e)
     rng = np.random.default_rng(int(seed))
-    perm = rng.permutation(len(ids))
-    n_val = max(1, int(round(len(ids) * float(val_ratio))))
-    n_val = min(n_val, len(ids) - 1)
-    val_set = {ids[int(i)] for i in perm[:n_val]}
+    perm = rng.permutation(len(order))
+    n_val = max(1, int(round(len(order) * float(val_ratio))))
+    n_val = min(n_val, len(order) - 1)
+    val_g = {order[int(i)] for i in perm[:n_val]}
+    val_set = {e for g in val_g for e in groups[g]}
     train_ids = [e for e in ids if e not in val_set]
     val_ids = [e for e in ids if e in val_set]
     return train_ids, val_ids
@@ -1178,11 +1192,14 @@ def train_flow_matching(
             and _val_run_name(cfg) is None
             and is_lerobot_image_sequence_root(run_dir)
         ):
-            all_ids = list_episode_indices(run_dir, load_lerobot_info(run_dir))
+            info = load_lerobot_info(run_dir)
+            all_ids = list_episode_indices(run_dir, info)
+            group_size = 2 if info.get("phase_split") == "even_odd" else 1
             train_episode_ids, val_episode_ids = _split_episode_ids(
                 all_ids,
                 val_ratio,
                 int(getattr(cfg.dataset, "split_seed", 42)),
+                group_size=group_size,
             )
             logger.log(
                 f"val_split: ratio={val_ratio} seed={getattr(cfg.dataset, 'split_seed', 42)} "

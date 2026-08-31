@@ -5,14 +5,14 @@ state_names:
   [L0, L1, L2, L3, L4, L5, L6, R0, R1, R2, R3, R4, R5, R6, left_gripper, right_gripper]
 action_names:
   [L0, L1, L2, L3, L4, L5, L6, R0, R1, R2, R3, R4, R5, R6, left_gripper, right_gripper]
-fps: 30
+fps: 15
 data_root: data
 output_dir: outputs/fm_openarm_hcx_dual_arm_with_out_room_s_depth_nobs1_h80
 
 dataset:
   n_obs_steps: 1
   horizon: 80
-  run_name: openarm_hcx_dual_arm_with_out_room_s
+  run_name: openarm_hcx_dual_arm_with_out_room_s_15fps
   image_size: [256, 341]
   norm_mode: gaussian_2std
   color_jitter_brightness: 0.1
