@@ -1,19 +1,17 @@
-checkpoint: /home/a/ct/va/outputs/fm_openarm_hcx_dual_arm_with_out_room_s_depth_nobs1_h60_nact16_statedelta_reachw_260830213549/checkpoint_final.pt
-config: /home/a/ct/va/outputs/fm_openarm_hcx_dual_arm_with_out_room_s_depth_nobs1_h60_nact16_statedelta_reachw_260830213549/config.yaml
+checkpoint: /home/a/ct/va/outputs/fm_openarm_hcx_dual_arm_with_out_room_s_depth_nobs1_h60_nact16_statedelta_260830124458/checkpoint_final.pt
+config: /home/a/ct/va/outputs/fm_openarm_hcx_dual_arm_with_out_room_s_depth_nobs1_h60_nact16_statedelta_260830124458/config.yaml
 
 teleop_yaml: teleop_project/teleop.yaml
 
-obs_mode: fps
+obs_mode: after_action
 display_cameras: false
 max_steps: 50000
+chunk: 12
 
 rtc:
   enabled: true
   guidance_enabled: true
   inference_delay: 0
-  execution_horizon: 8
-
-action_queue_size_to_get_new_actions: 12
 
 servo:
   rate_hz: 500

@@ -3,11 +3,13 @@ from __future__ import annotations
 
 import argparse
 import math
+import multiprocessing as mp
 import sys
 import threading
 import time
 from collections import deque
 from pathlib import Path
+from queue import Empty
 from typing import Any
 
 import numpy as np
@@ -35,6 +37,7 @@ from robotfm.data.action_delta import (
 from robotfm.data.stats import normalize
 from robotfm.policies.rtc import ActionQueue
 from robotfm.train import build_policy
+from robotfm.types import Observation
 from run import (
     BackgroundGripperLoop,
     CameraPreviewLoop,
@@ -57,12 +60,12 @@ from run import (
     _shutdown,
     _validate_runtime_contract,
 )
+from hcx_sdk import RobotClient
 from run_dual_arm_depth import (
     HeadTriggeredCapture,
     _build_obs_batch,
     _connect_record_cameras,
     _prepare_rgbd_observation,
-    _read_dual_observation,
 )
 from teleop_sdk.adapters.hcx import (
     HcxConnection,
@@ -118,47 +121,54 @@ def _load_extra_deploy(deploy_path: Path) -> dict[str, Any]:
         raise ValueError(
             f"servo.rate_hz 必须是 {ARM_SERVO_HZ}，实际为 {servo.get('rate_hz')}"
         )
-    threshold = raw.get("action_queue_size_to_get_new_actions")
-    if threshold in (None, ""):
-        raise ValueError("deploy.yaml 需要 action_queue_size_to_get_new_actions")
-    threshold_i = int(threshold)
-    if threshold_i <= 0:
-        raise ValueError("action_queue_size_to_get_new_actions 必须 > 0")
+    chunk = raw.get("chunk")
+    if chunk in (None, ""):
+        raise ValueError("deploy.yaml 需要 chunk")
+    chunk_i = int(chunk)
+    if chunk_i < 4:
+        raise ValueError("chunk 必须 >= 4")
     return {
         "watchdog_s": watchdog_s,
         "command_filter_tau_s": command_filter_tau_s,
         "max_joint_vel_deg_s": max_joint_vel_deg_s,
         "servo_fault_hz_warn": servo_fault_hz_warn,
-        "action_queue_size_to_get_new_actions": threshold_i,
+        "chunk": chunk_i,
     }
 
 
-def _direct_servo_config(teleop_yaml: Path) -> tuple[Any, HcxDirectServoConfig]:
+def _direct_servo_config(teleop_yaml: Path) -> tuple[Any, HcxDirectServoConfig, int]:
     runtime = load_runtime_config(teleop_yaml)
     h = runtime.hcx
+    rate_hz = float(runtime.teleop.rate_hz)
+    if not rate_hz.is_integer():
+        raise RuntimeError("limited/linear 直伺服要求 teleop.rate_hz 为整数")
+    source_hz = int(rate_hz)
     if int(h.direct_servo_rate_hz) != ARM_SERVO_HZ:
         raise RuntimeError(
             f"teleop.yaml hcx.direct_servo_rate_hz 必须是 {ARM_SERVO_HZ}，"
             f"实际为 {h.direct_servo_rate_hz}"
         )
+    if ARM_SERVO_HZ % source_hz != 0:
+        raise RuntimeError(
+            f"{ARM_SERVO_HZ} Hz 必须是 teleop.rate_hz={source_hz} 的整数倍"
+        )
     if not bool(h.direct_servo_confirm_unsafe):
         raise RuntimeError("直伺服要求 hcx.direct_servo_confirm_unsafe: true")
-    direct_cfg = HcxDirectServoConfig(
-        rate_hz=ARM_SERVO_HZ,
-        watchdog_s=float(h.direct_servo_watchdog_s),
-        confirm_unsafe=True,
-        interpolation="direct",
-        source_rate_hz=None,
+    source_rate_hz = (
+        source_hz if h.direct_servo_interpolation in ("linear", "limited") else None
+    )
+    direct_cfg = HcxDirectServoConfig.from_runtime_config(
+        h, source_rate_hz=source_rate_hz
     )
     if direct_cfg.watchdog_s <= 1.0 / float(ARM_SERVO_HZ):
         raise RuntimeError("hcx.direct_servo_watchdog_s 必须大于一个 500 Hz 周期")
-    return runtime, direct_cfg
+    return runtime, direct_cfg, source_hz
 
 
 def _connect_hcx_direct(
     teleop_yaml: Path,
-) -> tuple[HcxConnection, HcxFollower, HcxFollower, Any, Any, HcxDirectServoConfig]:
-    runtime, direct_cfg = _direct_servo_config(teleop_yaml)
+) -> tuple[HcxConnection, HcxFollower, HcxFollower, Any, Any, HcxDirectServoConfig, int]:
+    runtime, direct_cfg, source_hz = _direct_servo_config(teleop_yaml)
     h = runtime.hcx
     connection = HcxConnection(HcxConnectionConfig.from_runtime_config(h))
     left = HcxFollower(
@@ -187,7 +197,7 @@ def _connect_hcx_direct(
     if client is None:
         raise RuntimeError("HCX 连接未建立")
     print(
-        f"[INFO] HCX 直伺服已连接: out={direct_cfg.rate_hz} Hz "
+        f"[INFO] HCX 直伺服已连接: source={source_hz} Hz out={direct_cfg.rate_hz} Hz "
         f"interpolation={direct_cfg.interpolation} "
         f"watchdog={direct_cfg.watchdog_s:g}s",
         flush=True,
@@ -199,7 +209,16 @@ def _connect_hcx_direct(
         client.arm(int(h.left_robot_id)),
         client.arm(int(h.right_robot_id)),
         direct_cfg,
+        source_hz,
     )
+
+
+def _connect_hcx_feedback(teleop_yaml: Path) -> tuple[Any, Any, Any]:
+    runtime = load_runtime_config(teleop_yaml)
+    h = runtime.hcx
+    client = RobotClient(h.local_ip, h.remote_ip, h.port)
+    client.connect(timeout_s=h.connect_timeout_s)
+    return client, client.arm(int(h.left_robot_id)), client.arm(int(h.right_robot_id))
 
 
 def _follower_stats_line(name: str, follower: HcxFollower) -> tuple[str, bool, float | None]:
@@ -220,44 +239,51 @@ class LatencyTracker:
     def add(self, latency_s: float) -> None:
         self._vals.append(float(latency_s))
 
-    def max(self) -> float:
+    def last(self) -> float:
         if not self._vals:
             return 0.0
-        return float(max(self._vals))
+        return float(self._vals[-1])
 
 
-class ServoSendQueue:
-    def __init__(self) -> None:
+class ServoInterpolator:
+    def __init__(self, source_fps: float, n_joints: int) -> None:
+        self._fps = float(source_fps)
+        self._n_joints = int(n_joints)
         self._lock = threading.Lock()
-        self._q: deque[tuple[np.ndarray, np.ndarray]] = deque()
-        self._last: tuple[np.ndarray, np.ndarray] | None = None
+        self._points: np.ndarray | None = None
+        self._t0 = 0.0
         self._popped = 0
 
-    def replace(self, points: list[tuple[np.ndarray, np.ndarray]]) -> None:
+    def submit(self, points: np.ndarray, t0: float) -> None:
+        pts = np.asarray(points, dtype=np.float64).reshape(-1, self._n_joints)
         with self._lock:
-            self._q = deque(points)
+            self._points = pts
+            self._t0 = float(t0)
             self._popped = 0
 
-    def pop(self) -> tuple[np.ndarray, np.ndarray] | None:
+    def sample(self, t: float) -> np.ndarray | None:
         with self._lock:
-            if self._q:
-                item = self._q.popleft()
-                self._last = item
-                self._popped += 1
-                return item
-            return self._last
+            if self._points is None:
+                return None
+            x = (t - self._t0) * self._fps
+            n = len(self._points)
+            if x <= 0.0:
+                target = self._points[0]
+            elif x >= n - 1:
+                target = self._points[-1]
+            else:
+                i = int(math.floor(x))
+                alpha = x - i
+                target = self._points[i] * (1.0 - alpha) + self._points[i + 1] * alpha
+            return target.copy()
 
-    def qsize(self) -> int:
+    def mark_sent(self) -> None:
         with self._lock:
-            return len(self._q)
+            self._popped += 1
 
     def popped(self) -> int:
         with self._lock:
             return self._popped
-
-    def last(self) -> tuple[np.ndarray, np.ndarray] | None:
-        with self._lock:
-            return self._last
 
 
 class ServoSendThread:
@@ -265,22 +291,48 @@ class ServoSendThread:
         self,
         left: HcxFollower,
         right: HcxFollower,
-        send_q: ServoSendQueue,
+        interp: ServoInterpolator,
         *,
         rate_hz: int,
+        joint_lo: np.ndarray,
+        joint_hi: np.ndarray,
+        follow_l_lo: np.ndarray,
+        follow_l_hi: np.ndarray,
+        follow_r_lo: np.ndarray,
+        follow_r_hi: np.ndarray,
+        tau_s: float,
+        max_vel_deg_s: float,
+        max_delta_deg: float,
     ) -> None:
         self._left = left
         self._right = right
-        self._q = send_q
-        self._dt = 1.0 / float(rate_hz)
+        self._interp = interp
+        self._rate_hz = int(rate_hz)
+        self._dt = 1.0 / float(self._rate_hz)
+        self._lo = np.asarray(joint_lo, dtype=np.float64)
+        self._hi = np.asarray(joint_hi, dtype=np.float64)
+        self._follow_l_lo = np.asarray(follow_l_lo, dtype=np.float64)
+        self._follow_l_hi = np.asarray(follow_l_hi, dtype=np.float64)
+        self._follow_r_lo = np.asarray(follow_r_lo, dtype=np.float64)
+        self._follow_r_hi = np.asarray(follow_r_hi, dtype=np.float64)
+        self._tau_s = float(tau_s)
+        self._max_vel_deg_s = float(max_vel_deg_s)
+        self._max_delta_deg = float(max_delta_deg)
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
         self._fault: str | None = None
+        self._cur_l: np.ndarray | None = None
+        self._cur_r: np.ndarray | None = None
+        self._last_l: np.ndarray | None = None
+        self._last_r: np.ndarray | None = None
+        self._cmd_lock = threading.Lock()
 
     def start(self) -> None:
         if self._thread is not None:
             raise RuntimeError("伺服下发线程已在运行")
-        self._thread = threading.Thread(target=self._run, name="servo-500hz", daemon=True)
+        self._thread = threading.Thread(
+            target=self._run, name=f"servo-{self._rate_hz}hz-source", daemon=True
+        )
         self._thread.start()
 
     def stop(self) -> None:
@@ -293,15 +345,78 @@ class ServoSendThread:
         if self._fault:
             raise RuntimeError(self._fault)
 
+    def popped(self) -> int:
+        return self._interp.popped()
+
+    def latest_joints(self) -> np.ndarray | None:
+        with self._cmd_lock:
+            if self._last_l is None or self._last_r is None:
+                return None
+            return np.concatenate([self._last_l, self._last_r]).astype(np.float32)
+
+    def _shape_arm(
+        self,
+        desired: np.ndarray,
+        *,
+        last: np.ndarray | None,
+        cur: np.ndarray | None,
+        follow_lo: np.ndarray,
+        follow_hi: np.ndarray,
+        dt: float,
+    ) -> np.ndarray:
+        desired = np.asarray(desired, dtype=np.float64).reshape(7)
+        if last is None:
+            cmd = np.clip(desired, self._lo, self._hi)
+            cmd = np.clip(cmd, follow_lo, follow_hi)
+            return cmd
+        clamped, _ = _clamp_joints_by_max_delta(desired, last, self._max_delta_deg)
+        desired = np.asarray(clamped, dtype=np.float64)
+        if self._tau_s > 0.0 and cur is not None:
+            alpha = dt / (self._tau_s + dt)
+            cmd = cur + alpha * (desired - cur)
+        else:
+            cmd = desired
+        max_step = self._max_vel_deg_s * dt
+        cmd = last + np.clip(cmd - last, -max_step, max_step)
+        cmd = np.clip(cmd, self._lo, self._hi)
+        return np.clip(cmd, follow_lo, follow_hi)
+
     def _run(self) -> None:
         try:
             next_t = time.perf_counter()
+            last_tick = next_t
             while not self._stop.is_set():
-                item = self._q.pop()
-                if item is not None:
-                    left, right = item
-                    self._left.send_joint_angles_deg(left, self._dt)
-                    self._right.send_joint_angles_deg(right, self._dt)
+                t = time.perf_counter()
+                dt = max(t - last_tick, 1e-4)
+                last_tick = t
+                target = self._interp.sample(t)
+                if target is not None:
+                    left_des = target[:7]
+                    right_des = target[7:14]
+                    left_cmd = self._shape_arm(
+                        left_des,
+                        last=self._last_l,
+                        cur=self._cur_l,
+                        follow_lo=self._follow_l_lo,
+                        follow_hi=self._follow_l_hi,
+                        dt=dt,
+                    )
+                    right_cmd = self._shape_arm(
+                        right_des,
+                        last=self._last_r,
+                        cur=self._cur_r,
+                        follow_lo=self._follow_r_lo,
+                        follow_hi=self._follow_r_hi,
+                        dt=dt,
+                    )
+                    self._cur_l = left_cmd
+                    self._cur_r = right_cmd
+                    with self._cmd_lock:
+                        self._last_l = left_cmd.copy()
+                        self._last_r = right_cmd.copy()
+                    self._left.send_joint_angles_deg(left_cmd, self._dt)
+                    self._right.send_joint_angles_deg(right_cmd, self._dt)
+                    self._interp.mark_sent()
                 next_t += self._dt
                 sleep_s = next_t - time.perf_counter()
                 if sleep_s > 0.0:
@@ -367,118 +482,51 @@ class ServoWatchdogThread:
             self._stop.set()
 
 
-class FpsRgbDObservationSampler:
-    def __init__(
-        self,
-        hw: HardwareBundle,
-        cameras: list[str],
-        *,
-        n_obs_steps: int,
-        fps: int,
-        image_size: int | list[int] | None,
-        depth_cameras: list[str],
-        depth_min_mm: float,
-        depth_max_mm: float,
-        expected_scale_mm: dict[str, float],
-    ) -> None:
-        if n_obs_steps <= 0:
-            raise ValueError("n_obs_steps 必须 > 0")
-        if fps <= 0:
-            raise ValueError("fps 必须 > 0")
-        self._hw = hw
-        self._cameras = list(cameras)
-        self._n_obs_steps = int(n_obs_steps)
-        self._fps = int(fps)
-        self._period_s = 1.0 / float(fps)
-        self._image_size = image_size
-        self._depth_cameras = list(depth_cameras)
-        self._depth_min_mm = float(depth_min_mm)
-        self._depth_max_mm = float(depth_max_mm)
-        self._expected_scale_mm = dict(expected_scale_mm)
-        self._lock = threading.Lock()
-        self._history: deque = deque(maxlen=self._n_obs_steps)
-        self._error: BaseException | None = None
-        self._stop = threading.Event()
-        self._thread: threading.Thread | None = None
+def _capture_infer_obs(
+    hw: HardwareBundle,
+    cameras: list[str],
+    joint_arr: Any,
+    *,
+    image_size: int | list[int] | None,
+    depth_cameras: list[str],
+    depth_min_mm: float,
+    depth_max_mm: float,
+    expected_scale_mm: dict[str, float],
+) -> Observation:
+    capture = hw.camera_capture
+    if capture is None:
+        raise RuntimeError("相机采集器未初始化")
+    images, depths = capture.capture()
+    missing = [n for n in cameras if n not in images]
+    if missing:
+        raise RuntimeError(f"采图缺少相机: {missing}")
+    images = {n: images[n] for n in cameras}
+    with joint_arr.get_lock():
+        arr = np.frombuffer(joint_arr.get_obj(), dtype=np.float64).copy()
+    raw = Observation(
+        images=images,
+        state=arr.astype(np.float32),
+        timestamp=time.time(),
+        depths=depths,
+    )
+    raw.validate(cameras, int(raw.state.shape[0]))
+    return _prepare_rgbd_observation(
+        raw,
+        image_size=image_size,
+        depth_cameras=depth_cameras,
+        depth_min_mm=depth_min_mm,
+        depth_max_mm=depth_max_mm,
+        expected_scale_mm=expected_scale_mm,
+    )
 
-    def start(self) -> None:
-        if self._thread is not None:
-            raise RuntimeError("观测采样已在运行")
-        self._thread = threading.Thread(target=self._run, name="obs-rgbd-fps", daemon=True)
-        self._thread.start()
 
-    def stop(self, *, join_timeout_s: float = 2.0) -> None:
-        self._stop.set()
-        if self._thread is not None and self._thread.is_alive():
-            self._thread.join(timeout=join_timeout_s)
-        self._thread = None
-
-    def snapshot(self) -> list:
-        with self._lock:
-            self._raise_if_locked_unhealthy()
-            return list(self._history)
-
-    def raise_if_unhealthy(self) -> None:
-        with self._lock:
-            self._raise_if_locked_unhealthy()
-
-    def _raise_if_locked_unhealthy(self) -> None:
-        if self._error is not None:
-            raise RuntimeError(f"{self._fps}fps RGB-D 观测采样失败") from self._error
-        if not self._history:
-            raise RuntimeError(f"{self._fps}fps RGB-D 观测缓冲为空")
-
-    def wait_until_filled(self, *, timeout_s: float) -> None:
-        if not math.isfinite(timeout_s) or timeout_s <= 0.0:
-            raise ValueError("观测缓冲等待超时必须是正的有限秒数")
-        deadline = time.perf_counter() + timeout_s
-        size = 0
-        while time.perf_counter() < deadline:
-            with self._lock:
-                err = self._error
-                size = len(self._history)
-            if err is not None:
-                raise RuntimeError(f"{self._fps}fps RGB-D 观测采样失败") from err
-            if size >= self._n_obs_steps:
-                return
-            if self._stop.wait(timeout=0.01):
-                raise RuntimeError("观测采样在缓冲填满前已停止")
-        raise TimeoutError(
-            f"等待 {self._n_obs_steps} 帧 {self._fps}fps 观测超时 ({timeout_s:.1f}s)，"
-            f"当前 {size} 帧"
-        )
-
-    def _run(self) -> None:
-        next_t = time.perf_counter()
-        last_state: np.ndarray | None = None
-        while not self._stop.is_set():
-            try:
-                raw = _read_dual_observation(
-                    self._hw, self._cameras, last_state=last_state
-                )
-                raw.validate(self._cameras, int(raw.state.shape[0]))
-                obs = _prepare_rgbd_observation(
-                    raw,
-                    image_size=self._image_size,
-                    depth_cameras=self._depth_cameras,
-                    depth_min_mm=self._depth_min_mm,
-                    depth_max_mm=self._depth_max_mm,
-                    expected_scale_mm=self._expected_scale_mm,
-                )
-                last_state = np.asarray(obs.state, dtype=np.float32)
-                with self._lock:
-                    self._history.append(obs)
-                    self._error = None
-            except Exception as exc:
-                with self._lock:
-                    self._error = exc
-            next_t += self._period_s
-            sleep_s = next_t - time.perf_counter()
-            if sleep_s > 0.0:
-                if self._stop.wait(timeout=sleep_s):
-                    break
-            else:
-                next_t = time.perf_counter()
+def _rtc_delay(
+    latency_tracker: LatencyTracker, train_fps: float, chunk: int, infer_i: int
+) -> int:
+    if infer_i == 0:
+        return 0
+    d = int(math.ceil(latency_tracker.last() * float(train_fps)))
+    return max(0, min(d, int(chunk) - 3))
 
 
 def _policy_index_from_pops(popped: int, train_fps: float, servo_hz: int) -> int:
@@ -577,6 +625,219 @@ def _reanchor_leftover(
     return torch.from_numpy(np.asarray(normed, dtype=np.float32)).to(device)
 
 
+def _deploy_rtc(deploy_rtc: dict[str, Any] | None) -> dict[str, Any]:
+    out = dict(deploy_rtc or {})
+    out.pop("execution_horizon", None)
+    return out
+
+
+def _submit_interp_chunk(interp: ServoInterpolator, chunk: np.ndarray) -> None:
+    interp.submit(np.asarray(chunk, dtype=np.float64), time.perf_counter())
+
+
+def _infer_worker(
+    spec: dict[str, Any],
+    joint_arr: Any,
+    popped_val: Any,
+    ack_val: Any,
+    out_q: Any,
+    ready_evt: Any,
+    stop_evt: Any,
+) -> None:
+    try:
+        torch.set_num_threads(1)
+        ckpt_path = Path(spec["ckpt"])
+        train_cfg_path = spec["train_cfg"]
+        train_cfg_path = None if train_cfg_path is None else Path(train_cfg_path)
+        teleop_yaml = Path(spec["teleop_yaml"])
+        ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+        cfg = load_config(train_cfg_path) if train_cfg_path is not None else ckpt["config"]
+        stats = ckpt["stats"]
+        cameras = list(cfg.cameras)
+        _apply_rtc_overrides(cfg, _deploy_rtc(spec.get("deploy_rtc")))
+        rtc_cfg = _normalize_rtc_config(cfg.policy.rtc)
+        cfg.policy.history_noise_std = 0.0
+        n_obs = int(cfg.dataset.n_obs_steps)
+        train_fps = float(cfg.fps)
+        chunk_n = int(spec["chunk"])
+        max_steps = int(spec["max_steps"])
+        source_hz = int(spec["source_hz"])
+        depth_cameras = list(getattr(cfg.dataset, "depth_cameras", ()) or ())
+        expected_scale_mm = dict(getattr(cfg.dataset, "scale_mm_per_raw_unit", None) or {})
+        depth_min_mm = float(cfg.dataset.depth_min_mm)
+        depth_max_mm = float(cfg.dataset.depth_max_mm)
+        image_size = cfg.dataset.image_size
+        device = torch.device(cfg.train.device if torch.cuda.is_available() else "cpu")
+        policy = build_policy(cfg, stats)
+        policy.load_state_dict(ckpt["policy_state_dict"])
+        policy.to(device)
+        policy.eval()
+        policy_cfg = getattr(policy, "cfg", None)
+        if hasattr(policy_cfg, "history_noise_std"):
+            policy_cfg.history_noise_std = 0.0
+        predict_joint_delta = bool(cfg.policy.predict_joint_delta)
+        joint_mask = joint_mask_from_names(cfg.action_names, cfg.action_dim)
+        joint_idx = np.where(joint_mask)[0]
+        left_j = joint_idx[:7]
+        right_j = joint_idx[7:14]
+        grip_idx = np.where(~joint_mask)[0]
+        left_g_i = int(grip_idx[0]) if grip_idx.size >= 1 else 14
+        right_g_i = int(grip_idx[1]) if grip_idx.size >= 2 else 15
+        hw = HardwareBundle(
+            left_start_joints_deg=spec["left_start"],
+            right_start_joints_deg=spec["right_start"],
+        )
+        fb_client, fb_left, fb_right = _connect_hcx_feedback(teleop_yaml)
+        hw.hcx_client = fb_client
+        hw.left_arm = fb_left
+        hw.right_arm = fb_right
+        hw.camera_manager = _connect_record_cameras(teleop_yaml)
+        hw.camera_capture = HeadTriggeredCapture(
+            hw.camera_manager,
+            depth_cameras=depth_cameras,
+            expected_scale_mm=expected_scale_mm,
+        )
+        obs_kw = dict(
+            image_size=image_size,
+            depth_cameras=depth_cameras,
+            depth_min_mm=depth_min_mm,
+            depth_max_mm=depth_max_mm,
+            expected_scale_mm=expected_scale_mm,
+        )
+        action_queue = ActionQueue(rtc_cfg)
+        latency_tracker = LatencyTracker()
+        warmup_obs = _capture_infer_obs(hw, list(cameras), joint_arr, **obs_kw)
+        warmup_batch = _build_obs_batch(
+            [warmup_obs],
+            cameras=list(cameras),
+            n_obs_steps=n_obs,
+            stats=stats,
+            norm_mode=cfg.dataset.norm_mode,
+            device=device,
+            depth_cameras=depth_cameras,
+            predict_joint_delta=predict_joint_delta,
+            joint_mask=joint_mask,
+        )
+        with torch.no_grad():
+            policy.sample_actions(
+                warmup_batch,
+                prev_chunk_left_over=None,
+                inference_delay=0,
+                execution_horizon=2,
+            )[0].cpu()
+        infer_i = 0
+        while infer_i < max_steps and not stop_evt.is_set():
+            infer_delay = _rtc_delay(latency_tracker, train_fps, chunk_n, infer_i)
+            exec_h = infer_delay + 2
+            if infer_i > 0:
+                while not stop_evt.is_set() and int(ack_val.value) != infer_i - 1:
+                    time.sleep(0.002)
+                threshold = infer_delay + 2
+                while not stop_evt.is_set():
+                    _sync_action_queue_index(
+                        action_queue, int(popped_val.value), train_fps, source_hz
+                    )
+                    if action_queue.qsize() <= threshold:
+                        break
+                    time.sleep(0.002)
+                if stop_evt.is_set():
+                    break
+            idx_before = action_queue.get_action_index()
+            leftover = action_queue.get_left_over()
+            if leftover is not None and leftover.shape[0] == 0:
+                leftover = None
+            leftover_len = 0 if leftover is None else int(leftover.shape[0])
+            obs = _capture_infer_obs(hw, list(cameras), joint_arr, **obs_kw)
+            obs_history = [obs]
+            q_now = np.asarray(obs_history[-1].state, dtype=np.float32)
+            batch = _build_obs_batch(
+                obs_history,
+                cameras=list(cameras),
+                n_obs_steps=n_obs,
+                stats=stats,
+                norm_mode=cfg.dataset.norm_mode,
+                device=device,
+                depth_cameras=depth_cameras,
+                predict_joint_delta=predict_joint_delta,
+                joint_mask=joint_mask,
+            )
+            if leftover is not None:
+                leftover = leftover.to(device)
+                if predict_joint_delta:
+                    abs_left = action_queue.get_processed_left_over()
+                    if abs_left is not None and abs_left.shape[0] > 0:
+                        leftover = _reanchor_leftover(
+                            abs_left,
+                            q_now,
+                            stats=stats,
+                            norm_mode=cfg.dataset.norm_mode,
+                            joint_mask=joint_mask,
+                            device=device,
+                        )
+            t_infer = time.perf_counter()
+            with torch.no_grad():
+                pred = policy.sample_actions(
+                    batch,
+                    prev_chunk_left_over=leftover,
+                    inference_delay=infer_delay,
+                    execution_horizon=exec_h,
+                )[0].cpu()
+            infer_s = time.perf_counter() - t_infer
+            latency_tracker.add(infer_s)
+            pred = pred[:chunk_n]
+            popped = 0 if infer_i == 0 else int(popped_val.value)
+            idx_after = _sync_action_queue_index(
+                action_queue, popped, train_fps, source_hz
+            )
+            new_delay = 0
+            if infer_i > 0:
+                new_delay = max(0, idx_after - idx_before)
+                new_delay = min(new_delay, leftover_len, chunk_n - 3)
+            processed = denormalize_predicted_action(
+                pred,
+                stats,
+                cfg.dataset.norm_mode,
+                q_now_phys=q_now,
+                predict_joint_delta=predict_joint_delta,
+                joint_mask=joint_mask,
+            )
+            processed = np.asarray(processed, dtype=np.float32)[:chunk_n]
+            processed_t = torch.as_tensor(processed, dtype=torch.float32)
+            action_queue.merge(pred, processed_t, new_delay, idx_before)
+            phys = np.asarray(processed, dtype=np.float64)
+            if infer_i == 0:
+                phys[0, left_j] = q_now[left_j].astype(np.float64)
+                phys[0, right_j] = q_now[right_j].astype(np.float64)
+                skip = 0
+            else:
+                skip = min(new_delay, int(phys.shape[0]) - 1)
+            remain = phys[skip:]
+            out_chunk = np.concatenate([remain[:, left_j], remain[:, right_j]], axis=1)
+            g_row = remain[0]
+            out_q.put(
+                {
+                    "infer_i": infer_i,
+                    "chunk": out_chunk,
+                    "grip_l": float(np.clip(g_row[left_g_i], 0.0, 1.0)),
+                    "grip_r": float(np.clip(g_row[right_g_i], 0.0, 1.0)),
+                    "leftover": leftover_len,
+                    "delay": int(new_delay),
+                    "qsize": int(action_queue.qsize()),
+                    "infer_ms": float(infer_s * 1e3),
+                }
+            )
+            if infer_i == 0:
+                ready_evt.set()
+            infer_i += 1
+        _shutdown(hw)
+    except BaseException as exc:
+        try:
+            out_q.put({"error": f"{type(exc).__name__}: {exc}"})
+        except Exception:
+            pass
+        ready_evt.set()
+
+
 def main() -> None:
     args = _parse_args()
     deploy_path = _resolve_deploy_path(args.deploy)
@@ -609,12 +870,10 @@ def main() -> None:
             f"实际 cameras={cameras} layout={layout}"
         )
 
-    _apply_rtc_overrides(cfg, deploy.get("rtc") or {})
+    _apply_rtc_overrides(cfg, _deploy_rtc(deploy.get("rtc")))
     rtc_cfg = _normalize_rtc_config(cfg.policy.rtc)
     if not bool(rtc_cfg.enabled):
         raise ValueError("本脚本要求 rtc.enabled=true")
-    if str(deploy.get("obs_mode") or "fps").strip().lower() != "fps":
-        raise ValueError("本脚本要求 obs_mode=fps")
 
     train_history_noise = float(getattr(cfg.policy, "history_noise_std", 0.0) or 0.0)
     cfg.policy.history_noise_std = 0.0
@@ -624,19 +883,10 @@ def main() -> None:
     horizon = int(cfg.dataset.horizon)
     train_fps = float(cfg.fps)
     max_steps = int(deploy["max_steps"])
-    threshold = int(extra["action_queue_size_to_get_new_actions"])
-    exec_h = int(rtc_cfg.execution_horizon)
-    if exec_h >= n_action_steps:
+    chunk_n = int(extra["chunk"])
+    if chunk_n >= horizon:
         raise ValueError(
-            f"RTC execution_horizon 必须小于 n_action_steps "
-            f"(execution_horizon={exec_h}, n_action_steps={n_action_steps})"
-        )
-    if not (exec_h < threshold < n_action_steps):
-        raise ValueError(
-            "action_queue_size_to_get_new_actions 须满足 "
-            f"execution_horizon < threshold < n_action_steps "
-            f"(got execution_horizon={exec_h}, threshold={threshold}, "
-            f"n_action_steps={n_action_steps})"
+            f"chunk 必须小于模型输出长度 (chunk={chunk_n}, horizon={horizon})"
         )
     policy_type = str(cfg.policy.type).lower().replace("-", "_")
     if policy_type == "a2au":
@@ -656,14 +906,6 @@ def main() -> None:
             raise ValueError(f"训练配置缺少 dataset.scale_mm_per_raw_unit[{cam}]")
 
     device = torch.device(cfg.train.device if torch.cuda.is_available() else "cpu")
-    policy = build_policy(cfg, stats)
-    policy.load_state_dict(ckpt["policy_state_dict"])
-    policy.to(device)
-    policy.eval()
-    policy_cfg = getattr(policy, "cfg", None)
-    if hasattr(policy_cfg, "history_noise_std"):
-        policy_cfg.history_noise_std = 0.0
-
     predict_joint_delta = bool(cfg.policy.predict_joint_delta)
     joint_mask = joint_mask_from_names(cfg.action_names, cfg.action_dim)
     joint_idx = np.where(joint_mask)[0]
@@ -677,9 +919,9 @@ def main() -> None:
 
     print(
         f"[INFO] 策略就绪 layout=dual device={device} cameras={cameras} "
-        f"norm={norm_mode} n_obs={n_obs} n_action_steps={n_action_steps} "
+        f"norm={norm_mode} n_obs={n_obs} "
         f"train_fps={train_fps:g} rtc.guidance={rtc_cfg.guidance_enabled} "
-        f"exec_h={exec_h} threshold={threshold} "
+        f"chunk={chunk_n} delay_exec_h=delay+2 n_action_steps={n_action_steps} "
         f"history_noise_std=0 (train={train_history_noise:g})",
         flush=True,
     )
@@ -691,10 +933,11 @@ def main() -> None:
         right_start_joints_deg=deploy["right_start_joints_deg"],
     )
     send_thread: ServoSendThread | None = None
+    infer_proc: mp.Process | None = None
+    stop_evt = None
     watchdog: ServoWatchdogThread | None = None
     left_follower: HcxFollower | None = None
     right_follower: HcxFollower | None = None
-    obs_sampler: FpsRgbDObservationSampler | None = None
     try:
         (
             _hcx_connection,
@@ -703,6 +946,7 @@ def main() -> None:
             left_arm,
             right_arm,
             direct_cfg,
+            source_hz,
         ) = _connect_hcx_direct(teleop_yaml)
         hw.hcx_client = _hcx_connection.client
         hw.left_arm = left_arm
@@ -722,18 +966,6 @@ def main() -> None:
                 hw.right_gripper, rate_hz=gripper_rate_hz
             )
             hw.right_gripper_loop.start(initial_opening=hold_right)
-
-        hw.camera_manager = _connect_record_cameras(teleop_yaml)
-        hw.camera_capture = HeadTriggeredCapture(
-            hw.camera_manager,
-            depth_cameras=depth_cameras,
-            expected_scale_mm=expected_scale_mm,
-        )
-        if deploy["display_cameras"]:
-            hw.camera_preview = CameraPreviewLoop(
-                hw.camera_manager, list(cameras), fps=PREVIEW_FPS
-            )
-            hw.camera_preview.start()
 
         if deploy["left_start_joints_deg"] is not None:
             left_start = _clamp_joints_by_limits(
@@ -794,52 +1026,93 @@ def main() -> None:
             rate_hz=gripper_rate_hz,
         )
 
-        obs_sampler = FpsRgbDObservationSampler(
-            hw,
-            list(cameras),
-            n_obs_steps=n_obs,
-            fps=int(train_fps),
-            image_size=cfg.dataset.image_size,
-            depth_cameras=depth_cameras,
-            depth_min_mm=float(cfg.dataset.depth_min_mm),
-            depth_max_mm=float(cfg.dataset.depth_max_mm),
-            expected_scale_mm=expected_scale_mm,
-        )
-        obs_sampler.start()
-        hw.obs_sampler = obs_sampler
-        fill_timeout_s = max(5.0, float(n_obs) / float(train_fps) + 3.0)
-        print(
-            f"[INFO] 观测采样已启动 fps={int(train_fps)} n_obs={n_obs} "
-            f"fill_timeout_s={fill_timeout_s:.1f}",
-            flush=True,
-        )
-        obs_sampler.wait_until_filled(timeout_s=fill_timeout_s)
-        print("[INFO] 观测缓冲已就绪", flush=True)
-
-        if not left_follower.start_servo():
-            raise RuntimeError("HCX left direct-servo 启动失败")
-        if not right_follower.start_servo():
-            raise RuntimeError("HCX right direct-servo 启动失败")
-        print(
-            f"[INFO] 双臂 direct-servo 已启动 interpolation={direct_cfg.interpolation} "
-            f"out={direct_cfg.rate_hz}Hz",
-            flush=True,
-        )
-
         follow_l_lo, follow_l_hi = left_follower.joint_limits_deg
         follow_r_lo, follow_r_hi = right_follower.joint_limits_deg
         follow_l_lo = np.asarray(follow_l_lo, dtype=np.float64)
         follow_l_hi = np.asarray(follow_l_hi, dtype=np.float64)
         follow_r_lo = np.asarray(follow_r_lo, dtype=np.float64)
         follow_r_hi = np.asarray(follow_r_hi, dtype=np.float64)
-        dt = 1.0 / float(ARM_SERVO_HZ)
         tau_s = float(extra["command_filter_tau_s"])
         max_vel = float(extra["max_joint_vel_deg_s"])
         max_delta = float(deploy["move_max_delta_deg"])
-
-        send_q = ServoSendQueue()
+        interp = ServoInterpolator(source_fps=train_fps, n_joints=14)
         send_thread = ServoSendThread(
-            left_follower, right_follower, send_q, rate_hz=ARM_SERVO_HZ
+            left_follower,
+            right_follower,
+            interp,
+            rate_hz=source_hz,
+            joint_lo=joint_lo,
+            joint_hi=joint_hi,
+            follow_l_lo=follow_l_lo,
+            follow_l_hi=follow_l_hi,
+            follow_r_lo=follow_r_lo,
+            follow_r_hi=follow_r_hi,
+            tau_s=tau_s,
+            max_vel_deg_s=max_vel,
+            max_delta_deg=max_delta,
+        )
+        seed_l = _read_hcx_joints(hw.left_arm, hw.left_start_joints_deg)
+        seed_r = _read_hcx_joints(hw.right_arm, hw.right_start_joints_deg)
+        seed_lg = _read_gripper(hw.left_gripper, fallback=1.0)
+        seed_rg = _read_gripper(hw.right_gripper, fallback=1.0)
+        seed = np.concatenate(
+            [seed_l, seed_r, np.asarray([seed_lg, seed_rg], dtype=np.float32)]
+        ).astype(np.float64)
+        ctx = mp.get_context("spawn")
+        joint_arr = ctx.Array("d", 16)
+        with joint_arr.get_lock():
+            for i, v in enumerate(seed.tolist()):
+                joint_arr[i] = float(v)
+        popped_val = ctx.Value("i", 0)
+        ack_val = ctx.Value("i", -1)
+        out_q = ctx.Queue(maxsize=4)
+        ready_evt = ctx.Event()
+        stop_evt = ctx.Event()
+        spec = {
+            "ckpt": str(ckpt_path),
+            "train_cfg": None if train_cfg_path is None else str(train_cfg_path),
+            "teleop_yaml": str(teleop_yaml),
+            "deploy_rtc": _deploy_rtc(deploy.get("rtc")),
+            "chunk": int(chunk_n),
+            "max_steps": int(max_steps),
+            "source_hz": int(source_hz),
+            "left_start": deploy["left_start_joints_deg"],
+            "right_start": deploy["right_start_joints_deg"],
+        }
+        infer_proc = ctx.Process(
+            target=_infer_worker,
+            args=(spec, joint_arr, popped_val, ack_val, out_q, ready_evt, stop_evt),
+            name="infer-worker",
+            daemon=True,
+        )
+        infer_proc.start()
+        print("[INFO] 推理进程已启动", flush=True)
+        if not ready_evt.wait(timeout=180.0):
+            raise RuntimeError("推理进程启动超时")
+        item = out_q.get(timeout=30.0)
+        if "error" in item:
+            raise RuntimeError(item["error"])
+        _submit_interp_chunk(interp, np.asarray(item["chunk"], dtype=np.float64))
+        popped_val.value = 0
+        ack_val.value = int(item["infer_i"])
+        if hw.left_gripper_loop is not None:
+            hw.left_gripper_loop.set_opening(float(item["grip_l"]))
+        if hw.right_gripper_loop is not None:
+            hw.right_gripper_loop.set_opening(float(item["grip_r"]))
+        print(
+            f"[INFO] infer={item['infer_i']} leftover={item['leftover']} "
+            f"delay={item['delay']} qsize={item['qsize']} "
+            f"infer_ms={item['infer_ms']:.0f}",
+            flush=True,
+        )
+        if not left_follower.start_servo():
+            raise RuntimeError("HCX left direct-servo 启动失败")
+        if not right_follower.start_servo():
+            raise RuntimeError("HCX right direct-servo 启动失败")
+        print(
+            f"[INFO] 双臂 direct-servo 已启动 interpolation={direct_cfg.interpolation} "
+            f"source={source_hz}Hz out={direct_cfg.rate_hz}Hz",
+            flush=True,
         )
         send_thread.start()
         watchdog = ServoWatchdogThread(
@@ -848,167 +1121,63 @@ def main() -> None:
             fault_hz=float(extra["servo_fault_hz_warn"]),
         )
         watchdog.start()
-        print("[INFO] 500Hz 下发线程已启动（只 pop+send）", flush=True)
-
-        action_queue = ActionQueue(rtc_cfg)
-        latency_tracker = LatencyTracker()
-        infer_i = 0
-        while infer_i < max_steps:
+        print(
+            f"[INFO] {source_hz}Hz 源点下发已启动 → {ARM_SERVO_HZ}Hz",
+            flush=True,
+        )
+        while True:
             send_thread.check_fault()
             watchdog.check_fault()
-            obs_sampler.raise_if_unhealthy()
-            _pump_camera_preview(hw)
-            _sync_action_queue_index(
-                action_queue, send_q.popped(), train_fps, ARM_SERVO_HZ
-            )
-            if infer_i > 0 and action_queue.qsize() > threshold:
-                time.sleep(0.002)
-                continue
-
-            idx_before = action_queue.get_action_index()
-            leftover = action_queue.get_left_over()
-            if leftover is not None and leftover.shape[0] == 0:
-                leftover = None
-            infer_delay = int(math.ceil(latency_tracker.max() * train_fps))
-            obs_history = obs_sampler.snapshot()
-            q_now = np.asarray(obs_history[-1].state, dtype=np.float32)
-            batch = _build_obs_batch(
-                obs_history,
-                cameras=list(cameras),
-                n_obs_steps=n_obs,
-                stats=stats,
-                norm_mode=norm_mode,
-                device=device,
-                depth_cameras=depth_cameras,
-                predict_joint_delta=predict_joint_delta,
-                joint_mask=joint_mask,
-            )
-            if leftover is not None:
-                leftover = leftover.to(device)
-                if predict_joint_delta:
-                    abs_left = action_queue.get_processed_left_over()
-                    if abs_left is not None and abs_left.shape[0] > 0:
-                        leftover = _reanchor_leftover(
-                            abs_left,
-                            q_now,
-                            stats=stats,
-                            norm_mode=norm_mode,
-                            joint_mask=joint_mask,
-                            device=device,
-                        )
-            if infer_i < 3 or infer_i % _LOG_STATE_INPUT_EVERY == 0:
-                _log_inference_state_input(
-                    step_i=infer_i,
-                    obs_history=obs_history,
-                    n_obs_steps=n_obs,
-                    batch=batch,
+            joints = send_thread.latest_joints()
+            with joint_arr.get_lock():
+                if joints is not None:
+                    for i, v in enumerate(np.asarray(joints, dtype=np.float64).reshape(-1)[:14]):
+                        joint_arr[i] = float(v)
+                joint_arr[14] = float(
+                    _read_gripper(hw.left_gripper, fallback=float(joint_arr[14]))
                 )
-            t_infer = time.perf_counter()
-            with torch.no_grad():
-                pred = policy.sample_actions(
-                    batch,
-                    prev_chunk_left_over=leftover,
-                    inference_delay=infer_delay,
-                    execution_horizon=exec_h,
-                )[0].cpu()
-            infer_s = time.perf_counter() - t_infer
-            latency_tracker.add(infer_s)
-            idx_after = _sync_action_queue_index(
-                action_queue, send_q.popped(), train_fps, ARM_SERVO_HZ
-            )
-            new_delay = max(
-                int(math.ceil(infer_s * train_fps)),
-                max(0, idx_after - idx_before),
-            )
-            processed = denormalize_predicted_action(
-                pred,
-                stats,
-                norm_mode,
-                q_now_phys=q_now,
-                predict_joint_delta=predict_joint_delta,
-                joint_mask=joint_mask,
-            )
-            processed_t = torch.as_tensor(np.asarray(processed), dtype=torch.float32)
-            if infer_i < 3 or infer_i % _LOG_RESULT_EVERY == 0:
-                _log_inference_result(
-                    step_i=infer_i, pred_norm=pred, pred_phys=np.asarray(processed)
+                joint_arr[15] = float(
+                    _read_gripper(hw.right_gripper, fallback=float(joint_arr[15]))
                 )
-            action_queue.merge(pred, processed_t, new_delay, idx_before)
-            phys = np.asarray(processed, dtype=np.float64)
-            if infer_i == 0:
-                q7l = q_now[left_j].astype(np.float64)
-                q7r = q_now[right_j].astype(np.float64)
-                row0 = phys[0].copy()
-                row0[left_j] = q7l
-                row0[right_j] = q7r
-                phys = np.vstack([row0[None, :], phys])
-                skip = 0
+            popped_val.value = int(send_thread.popped())
+            if infer_proc is not None and not infer_proc.is_alive():
+                try:
+                    item = out_q.get_nowait()
+                except Empty:
+                    break
             else:
-                skip = new_delay
-            hz_phys = _interpolate_policy_to_servo(
-                phys,
-                train_fps=train_fps,
-                servo_hz=ARM_SERVO_HZ,
-                skip_policy_steps=skip,
-            )
-            left_des = hz_phys[:, left_j]
-            right_des = hz_phys[:, right_j]
-            last_item = send_q.last()
-            last_left = None if last_item is None else last_item[0]
-            last_right = None if last_item is None else last_item[1]
-            left_cmd = _shape_arm_traj(
-                left_des,
-                last=last_left,
-                lo=joint_lo,
-                hi=joint_hi,
-                follow_lo=follow_l_lo,
-                follow_hi=follow_l_hi,
-                tau_s=tau_s,
-                max_vel_deg_s=max_vel,
-                max_delta_deg=max_delta,
-                dt=dt,
-            )
-            right_cmd = _shape_arm_traj(
-                right_des,
-                last=last_right,
-                lo=joint_lo,
-                hi=joint_hi,
-                follow_lo=follow_r_lo,
-                follow_hi=follow_r_hi,
-                tau_s=tau_s,
-                max_vel_deg_s=max_vel,
-                max_delta_deg=max_delta,
-                dt=dt,
-            )
-            points = [
-                (left_cmd[i].copy(), right_cmd[i].copy())
-                for i in range(int(left_cmd.shape[0]))
-            ]
-            send_q.replace(points)
-            g_row = phys[min(skip, phys.shape[0] - 1)]
+                try:
+                    item = out_q.get(timeout=0.002)
+                except Empty:
+                    continue
+            if "error" in item:
+                raise RuntimeError(item["error"])
+            _submit_interp_chunk(interp, np.asarray(item["chunk"], dtype=np.float64))
+            popped_val.value = 0
+            ack_val.value = int(item["infer_i"])
             if hw.left_gripper_loop is not None:
-                hw.left_gripper_loop.set_opening(float(np.clip(g_row[left_g_i], 0.0, 1.0)))
+                hw.left_gripper_loop.set_opening(float(item["grip_l"]))
             if hw.right_gripper_loop is not None:
-                hw.right_gripper_loop.set_opening(
-                    float(np.clip(g_row[right_g_i], 0.0, 1.0))
-                )
-            leftover_len = 0 if leftover is None else int(leftover.shape[0])
+                hw.right_gripper_loop.set_opening(float(item["grip_r"]))
             print(
-                f"[INFO] infer={infer_i} leftover={leftover_len} delay={new_delay} "
-                f"qsize={action_queue.qsize()} send={send_q.qsize()} "
-                f"infer_ms={infer_s * 1e3:.0f}",
+                f"[INFO] infer={item['infer_i']} leftover={item['leftover']} "
+                f"delay={item['delay']} qsize={item['qsize']} "
+                f"infer_ms={item['infer_ms']:.0f}",
                 flush=True,
             )
-            infer_i += 1
     except KeyboardInterrupt:
         print("\n[INFO] 收到 Ctrl+C，停止伺服", flush=True)
     finally:
+        if stop_evt is not None:
+            stop_evt.set()
+        if infer_proc is not None:
+            infer_proc.join(timeout=5.0)
+            if infer_proc.is_alive():
+                infer_proc.terminate()
         if send_thread is not None:
             send_thread.stop()
         if watchdog is not None:
             watchdog.stop()
-        if obs_sampler is not None:
-            obs_sampler.stop()
         if left_follower is not None:
             try:
                 left_follower.stop_servo()
@@ -1031,4 +1200,8 @@ def main() -> None:
 
 
 if __name__ == "__main__":
+    try:
+        mp.set_start_method("spawn")
+    except RuntimeError:
+        pass
     main()
