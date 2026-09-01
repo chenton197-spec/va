@@ -1,13 +1,15 @@
-checkpoint: /home/a/ct/va/outputs/fm_openarm_hcx_dual_arm_with_out_room_s_depth_nobs1_h60_nact16_statedelta_260830124458/checkpoint_final.pt
-config: /home/a/ct/va/outputs/fm_openarm_hcx_dual_arm_with_out_room_s_depth_nobs1_h60_nact16_statedelta_260830124458/config.yaml
+checkpoint: /home/a/ct/va/outputs/quanfu/epoch_0062.pth
+high_dim_root: /home/a/PycharmProjects/v3.1
+ode_steps: 10
+fps: 30
+camera_native_size: [480, 640]
 
 teleop_yaml: teleop_project/teleop.yaml
 
 obs_mode: after_action
 display_cameras: false
 max_steps: 50000
-chunk: 12
-fps: 0
+chunk: 9
 
 rtc:
   enabled: true
@@ -31,7 +33,7 @@ start_pose:
   gripper_ramp_s: 0.9
 
 joint_limits_deg:
-  min: [-169.9, -100.9, -169.9, -139.9, -169.0, -54.9, -59.9]
+  min: [-169.9, -100.9, -169.9, -139.9, -169.9, -54.9, -59.9]
   max: [169.9, 100.9, 169.9, 54.9, 169.9, 54.9, 59.9]
 
 move_joints:

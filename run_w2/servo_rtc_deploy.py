@@ -108,9 +108,15 @@ def _load_extra_deploy(deploy_path: Path) -> dict[str, Any]:
     watchdog_s = float(servo.get("watchdog_s", 0.5))
     if not math.isfinite(watchdog_s) or watchdog_s < 0.0:
         raise ValueError("servo.watchdog_s 必须是 >= 0 的有限数")
-    command_filter_tau_s = float(servo.get("command_filter_tau_s", 0.0))
+    command_deadband_deg = float(servo.get("command_deadband_deg", 0.08))
+    if not math.isfinite(command_deadband_deg) or command_deadband_deg < 0.0:
+        raise ValueError("servo.command_deadband_deg 必须是 >= 0 的有限数")
+    command_filter_tau_s = float(servo.get("command_filter_tau_s", 0.025))
     if not math.isfinite(command_filter_tau_s) or command_filter_tau_s < 0.0:
         raise ValueError("servo.command_filter_tau_s 必须是 >= 0 的有限数")
+    command_filter_tau2_s = float(servo.get("command_filter_tau2_s", 0.06))
+    if not math.isfinite(command_filter_tau2_s) or command_filter_tau2_s < 0.0:
+        raise ValueError("servo.command_filter_tau2_s 必须是 >= 0 的有限数")
     max_joint_vel_deg_s = float(servo.get("max_joint_vel_deg_s", 90.0))
     if not math.isfinite(max_joint_vel_deg_s) or max_joint_vel_deg_s <= 0.0:
         raise ValueError("servo.max_joint_vel_deg_s 必须 > 0")
@@ -127,12 +133,24 @@ def _load_extra_deploy(deploy_path: Path) -> dict[str, Any]:
     chunk_i = int(chunk)
     if chunk_i < 4:
         raise ValueError("chunk 必须 >= 4")
+    fps_raw = raw.get("fps")
+    if fps_raw in (None, ""):
+        fps_override = None
+    else:
+        fps_override = float(fps_raw)
+        if not math.isfinite(fps_override) or fps_override < 0.0:
+            raise ValueError("fps 必须是 >= 0 的有限数")
+        if fps_override == 0.0:
+            fps_override = None
     return {
         "watchdog_s": watchdog_s,
+        "command_deadband_deg": command_deadband_deg,
         "command_filter_tau_s": command_filter_tau_s,
+        "command_filter_tau2_s": command_filter_tau2_s,
         "max_joint_vel_deg_s": max_joint_vel_deg_s,
         "servo_fault_hz_warn": servo_fault_hz_warn,
         "chunk": chunk_i,
+        "fps": fps_override,
     }
 
 
@@ -301,6 +319,8 @@ class ServoSendThread:
         follow_r_lo: np.ndarray,
         follow_r_hi: np.ndarray,
         tau_s: float,
+        tau2_s: float,
+        deadband_deg: float,
         max_vel_deg_s: float,
         max_delta_deg: float,
     ) -> None:
@@ -316,13 +336,17 @@ class ServoSendThread:
         self._follow_r_lo = np.asarray(follow_r_lo, dtype=np.float64)
         self._follow_r_hi = np.asarray(follow_r_hi, dtype=np.float64)
         self._tau_s = float(tau_s)
+        self._tau2_s = float(tau2_s)
+        self._deadband_deg = float(deadband_deg)
         self._max_vel_deg_s = float(max_vel_deg_s)
         self._max_delta_deg = float(max_delta_deg)
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
         self._fault: str | None = None
-        self._cur_l: np.ndarray | None = None
-        self._cur_r: np.ndarray | None = None
+        self._f1_l: np.ndarray | None = None
+        self._f2_l: np.ndarray | None = None
+        self._f1_r: np.ndarray | None = None
+        self._f2_r: np.ndarray | None = None
         self._last_l: np.ndarray | None = None
         self._last_r: np.ndarray | None = None
         self._cmd_lock = threading.Lock()
@@ -359,27 +383,42 @@ class ServoSendThread:
         desired: np.ndarray,
         *,
         last: np.ndarray | None,
-        cur: np.ndarray | None,
+        f1: np.ndarray | None,
+        f2: np.ndarray | None,
         follow_lo: np.ndarray,
         follow_hi: np.ndarray,
         dt: float,
-    ) -> np.ndarray:
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
         desired = np.asarray(desired, dtype=np.float64).reshape(7)
         if last is None:
             cmd = np.clip(desired, self._lo, self._hi)
             cmd = np.clip(cmd, follow_lo, follow_hi)
-            return cmd
+            return cmd, cmd.copy(), cmd.copy()
         clamped, _ = _clamp_joints_by_max_delta(desired, last, self._max_delta_deg)
         desired = np.asarray(clamped, dtype=np.float64)
-        if self._tau_s > 0.0 and cur is not None:
+        if self._deadband_deg > 0.0:
+            desired = np.where(
+                np.abs(desired - last) < self._deadband_deg, last, desired
+            )
+        if self._tau_s > 0.0 and f1 is not None:
             alpha = dt / (self._tau_s + dt)
-            cmd = cur + alpha * (desired - cur)
+            f1 = f1 + alpha * (desired - f1)
         else:
-            cmd = desired
+            f1 = desired
+        if self._tau2_s > 0.0 and f2 is not None:
+            alpha2 = dt / (self._tau2_s + dt)
+            f2 = f2 + alpha2 * (f1 - f2)
+        else:
+            f2 = f1
         max_step = self._max_vel_deg_s * dt
-        cmd = last + np.clip(cmd - last, -max_step, max_step)
+        cmd = last + np.clip(f2 - last, -max_step, max_step)
         cmd = np.clip(cmd, self._lo, self._hi)
-        return np.clip(cmd, follow_lo, follow_hi)
+        cmd = np.clip(cmd, follow_lo, follow_hi)
+        return (
+            cmd,
+            np.array(f1, dtype=np.float64, copy=True),
+            np.array(f2, dtype=np.float64, copy=True),
+        )
 
     def _run(self) -> None:
         try:
@@ -393,24 +432,24 @@ class ServoSendThread:
                 if target is not None:
                     left_des = target[:7]
                     right_des = target[7:14]
-                    left_cmd = self._shape_arm(
+                    left_cmd, self._f1_l, self._f2_l = self._shape_arm(
                         left_des,
                         last=self._last_l,
-                        cur=self._cur_l,
+                        f1=self._f1_l,
+                        f2=self._f2_l,
                         follow_lo=self._follow_l_lo,
                         follow_hi=self._follow_l_hi,
                         dt=dt,
                     )
-                    right_cmd = self._shape_arm(
+                    right_cmd, self._f1_r, self._f2_r = self._shape_arm(
                         right_des,
                         last=self._last_r,
-                        cur=self._cur_r,
+                        f1=self._f1_r,
+                        f2=self._f2_r,
                         follow_lo=self._follow_r_lo,
                         follow_hi=self._follow_r_hi,
                         dt=dt,
                     )
-                    self._cur_l = left_cmd
-                    self._cur_r = right_cmd
                     with self._cmd_lock:
                         self._last_l = left_cmd.copy()
                         self._last_r = right_cmd.copy()
@@ -658,7 +697,7 @@ def _infer_worker(
         rtc_cfg = _normalize_rtc_config(cfg.policy.rtc)
         cfg.policy.history_noise_std = 0.0
         n_obs = int(cfg.dataset.n_obs_steps)
-        train_fps = float(cfg.fps)
+        train_fps = float(spec["fps"])
         chunk_n = int(spec["chunk"])
         max_steps = int(spec["max_steps"])
         source_hz = int(spec["source_hz"])
@@ -882,6 +921,8 @@ def main() -> None:
     n_action_steps = int(cfg.policy.n_action_steps)
     horizon = int(cfg.dataset.horizon)
     train_fps = float(cfg.fps)
+    if extra.get("fps"):
+        train_fps = float(extra["fps"])
     max_steps = int(deploy["max_steps"])
     chunk_n = int(extra["chunk"])
     if chunk_n >= horizon:
@@ -1033,6 +1074,8 @@ def main() -> None:
         follow_r_lo = np.asarray(follow_r_lo, dtype=np.float64)
         follow_r_hi = np.asarray(follow_r_hi, dtype=np.float64)
         tau_s = float(extra["command_filter_tau_s"])
+        tau2_s = float(extra["command_filter_tau2_s"])
+        deadband_deg = float(extra["command_deadband_deg"])
         max_vel = float(extra["max_joint_vel_deg_s"])
         max_delta = float(deploy["move_max_delta_deg"])
         interp = ServoInterpolator(source_fps=train_fps, n_joints=14)
@@ -1048,6 +1091,8 @@ def main() -> None:
             follow_r_lo=follow_r_lo,
             follow_r_hi=follow_r_hi,
             tau_s=tau_s,
+            tau2_s=tau2_s,
+            deadband_deg=deadband_deg,
             max_vel_deg_s=max_vel,
             max_delta_deg=max_delta,
         )
@@ -1076,6 +1121,7 @@ def main() -> None:
             "chunk": int(chunk_n),
             "max_steps": int(max_steps),
             "source_hz": int(source_hz),
+            "fps": float(train_fps),
             "left_start": deploy["left_start_joints_deg"],
             "right_start": deploy["right_start_joints_deg"],
         }
