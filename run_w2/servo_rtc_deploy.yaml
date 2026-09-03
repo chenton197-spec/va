@@ -1,4 +1,4 @@
-checkpoint: /home/a/ct/va/outputs/fm_openarm_hcx_dual_arm_with_out_room_s_depth_nobs1_h32_nact16_statedelta_260831202123/checkpoint_final.pt
+checkpoint: /home/a/ct/va/outputs/fm_openarm_hcx_dual_arm_with_out_room_s_depth_nobs1_h60_nact16_statedelta_260902201902/checkpoint_final.pt
 config: /home/a/ct/va/outputs/fm_openarm_hcx_dual_arm_with_out_room_s_depth_nobs1_h60_nact16_statedelta_260902201902/config.yaml
 
 teleop_yaml: teleop_project/teleop.yaml
