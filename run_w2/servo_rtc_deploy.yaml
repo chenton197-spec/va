@@ -14,6 +14,11 @@ rtc:
   guidance_enabled: true
   inference_delay: 0
 
+one_euro:
+  mincutoff_hz: 3.0
+  beta: 0.05
+  dcutoff_hz: 1.0
+
 servo:
   rate_hz: 500
   watchdog_s: 0.5

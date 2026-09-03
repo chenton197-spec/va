@@ -1,4 +1,4 @@
-checkpoint: /home/a/ct/va/outputs/quanfu/epoch_0062.pth
+checkpoint: /home/a/ct/va/outputs/quanfu/epoch_0040.pth
 high_dim_root: /home/a/PycharmProjects/v3.1
 ode_steps: 10
 fps: 30

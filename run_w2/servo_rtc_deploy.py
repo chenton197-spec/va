@@ -74,6 +74,7 @@ from teleop_sdk.adapters.hcx import (
     HcxFollower,
 )
 from teleop_sdk.config import load_runtime_config
+from teleop_sdk.filters import OneEuroFilter
 
 ARM_SERVO_HZ = 500
 ARM_RATE_FAIL_HZ = 450.0
@@ -142,6 +143,18 @@ def _load_extra_deploy(deploy_path: Path) -> dict[str, Any]:
             raise ValueError("fps 必须是 >= 0 的有限数")
         if fps_override == 0.0:
             fps_override = None
+    one_euro = raw.get("one_euro", {}) or {}
+    if not isinstance(one_euro, dict):
+        raise ValueError(f"deploy.yaml 的 one_euro 必须是映射: {deploy_path}")
+    mincutoff_hz = float(one_euro.get("mincutoff_hz", 3.0))
+    if not math.isfinite(mincutoff_hz) or mincutoff_hz <= 0.0:
+        raise ValueError("one_euro.mincutoff_hz 必须 > 0")
+    beta = float(one_euro.get("beta", 0.05))
+    if not math.isfinite(beta) or beta < 0.0:
+        raise ValueError("one_euro.beta 必须是 >= 0 的有限数")
+    dcutoff_hz = float(one_euro.get("dcutoff_hz", 1.0))
+    if not math.isfinite(dcutoff_hz) or dcutoff_hz <= 0.0:
+        raise ValueError("one_euro.dcutoff_hz 必须 > 0")
     return {
         "watchdog_s": watchdog_s,
         "command_deadband_deg": command_deadband_deg,
@@ -151,6 +164,9 @@ def _load_extra_deploy(deploy_path: Path) -> dict[str, Any]:
         "servo_fault_hz_warn": servo_fault_hz_warn,
         "chunk": chunk_i,
         "fps": fps_override,
+        "one_euro_mincutoff_hz": mincutoff_hz,
+        "one_euro_beta": beta,
+        "one_euro_dcutoff_hz": dcutoff_hz,
     }
 
 
@@ -674,6 +690,49 @@ def _submit_interp_chunk(interp: ServoInterpolator, chunk: np.ndarray) -> None:
     interp.submit(np.asarray(chunk, dtype=np.float64), time.perf_counter())
 
 
+def _euro_snap(euro: OneEuroFilter) -> tuple[np.ndarray | None, np.ndarray, float | None]:
+    x = None if euro._x is None else np.array(euro._x, dtype=np.float64, copy=True)
+    return x, np.array(euro._dx, dtype=np.float64, copy=True), euro._last_t
+
+
+def _euro_restore(
+    euro: OneEuroFilter,
+    snap: tuple[np.ndarray | None, np.ndarray, float | None],
+) -> None:
+    x, dx, last_t = snap
+    euro._x = None if x is None else np.array(x, dtype=np.float64, copy=True)
+    euro._dx = np.array(dx, dtype=np.float64, copy=True)
+    euro._last_t = last_t
+
+
+def _filter_chunk_joints(
+    processed: np.ndarray,
+    *,
+    skip: int,
+    restore_i: int,
+    joint_idx: np.ndarray,
+    euro: OneEuroFilter,
+    dt: float,
+    snaps_prev: list[tuple[np.ndarray | None, np.ndarray, float | None]],
+) -> tuple[np.ndarray, list[tuple[np.ndarray | None, np.ndarray, float | None]]]:
+    out = np.array(processed, dtype=np.float32, copy=True)
+    n = int(out.shape[0])
+    skip = max(0, min(int(skip), n - 1))
+    if snaps_prev and restore_i >= 0:
+        _euro_restore(euro, snaps_prev[min(restore_i, len(snaps_prev) - 1)])
+    snaps: list[tuple[np.ndarray | None, np.ndarray, float | None]] = []
+    for i in range(skip, n):
+        if euro._last_t is None:
+            t = 0.0
+        else:
+            t = float(euro._last_t) + float(dt)
+        out[i, joint_idx] = euro.step(
+            np.asarray(out[i, joint_idx], dtype=np.float64), t
+        ).astype(np.float32)
+        snaps.append(_euro_snap(euro))
+    return out, snaps
+
+
 def _infer_worker(
     spec: dict[str, Any],
     joint_arr: Any,
@@ -745,6 +804,13 @@ def _infer_worker(
         )
         action_queue = ActionQueue(rtc_cfg)
         latency_tracker = LatencyTracker()
+        one_euro = OneEuroFilter(
+            n_joints=int(joint_idx.size),
+            mincutoff=float(spec["one_euro_mincutoff_hz"]),
+            beta=float(spec["one_euro_beta"]),
+            dcutoff=float(spec["one_euro_dcutoff_hz"]),
+        )
+        euro_snaps: list[tuple[np.ndarray | None, np.ndarray, float | None]] = []
         warmup_obs = _capture_infer_obs(hw, list(cameras), joint_arr, **obs_kw)
         warmup_batch = _build_obs_batch(
             [warmup_obs],
@@ -841,15 +907,26 @@ def _infer_worker(
                 joint_mask=joint_mask,
             )
             processed = np.asarray(processed, dtype=np.float32)[:chunk_n]
+            if infer_i == 0:
+                processed[0, left_j] = q_now[left_j]
+                processed[0, right_j] = q_now[right_j]
+                skip = 0
+                restore_i = -1
+            else:
+                skip = min(new_delay, int(processed.shape[0]) - 1)
+                restore_i = int(idx_after) - 1
+            processed, euro_snaps = _filter_chunk_joints(
+                processed,
+                skip=skip,
+                restore_i=restore_i,
+                joint_idx=joint_idx,
+                euro=one_euro,
+                dt=1.0 / float(train_fps),
+                snaps_prev=euro_snaps,
+            )
             processed_t = torch.as_tensor(processed, dtype=torch.float32)
             action_queue.merge(pred, processed_t, new_delay, idx_before)
             phys = np.asarray(processed, dtype=np.float64)
-            if infer_i == 0:
-                phys[0, left_j] = q_now[left_j].astype(np.float64)
-                phys[0, right_j] = q_now[right_j].astype(np.float64)
-                skip = 0
-            else:
-                skip = min(new_delay, int(phys.shape[0]) - 1)
             remain = phys[skip:]
             out_chunk = np.concatenate([remain[:, left_j], remain[:, right_j]], axis=1)
             g_row = remain[0]
@@ -1124,6 +1201,9 @@ def main() -> None:
             "fps": float(train_fps),
             "left_start": deploy["left_start_joints_deg"],
             "right_start": deploy["right_start_joints_deg"],
+            "one_euro_mincutoff_hz": float(extra["one_euro_mincutoff_hz"]),
+            "one_euro_beta": float(extra["one_euro_beta"]),
+            "one_euro_dcutoff_hz": float(extra["one_euro_dcutoff_hz"]),
         }
         infer_proc = ctx.Process(
             target=_infer_worker,
