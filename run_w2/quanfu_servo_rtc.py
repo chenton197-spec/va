@@ -55,7 +55,6 @@ from servo_rtc_deploy import (
     ServoSendThread,
     ServoWatchdogThread,
     _connect_hcx_direct,
-    _connect_hcx_feedback,
     _load_extra_deploy,
     _resolve_deploy_path,
     _rtc_delay,
@@ -484,10 +483,6 @@ def _infer_worker(
             left_start_joints_deg=spec["left_start"],
             right_start_joints_deg=spec["right_start"],
         )
-        fb_client, fb_left, fb_right = _connect_hcx_feedback(teleop_yaml)
-        hw.hcx_client = fb_client
-        hw.left_arm = fb_left
-        hw.right_arm = fb_right
         hw.camera_manager = _connect_record_cameras(teleop_yaml)
         hw.camera_capture = LiveScaleHeadCapture(hw.camera_manager, depth_cameras)
         action_queue = ActionQueue(rtc_cfg)

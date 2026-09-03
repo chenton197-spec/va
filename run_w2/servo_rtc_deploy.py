@@ -4,12 +4,17 @@ from __future__ import annotations
 import argparse
 import math
 import multiprocessing as mp
+import os
+import select
+import signal
 import sys
+import termios
 import threading
 import time
+import tty
 from collections import deque
 from pathlib import Path
-from queue import Empty
+from queue import Empty, Full
 from typing import Any
 
 import numpy as np
@@ -60,7 +65,6 @@ from run import (
     _shutdown,
     _validate_runtime_contract,
 )
-from hcx_sdk import RobotClient
 from run_dual_arm_depth import (
     HeadTriggeredCapture,
     _build_obs_batch,
@@ -80,6 +84,75 @@ ARM_SERVO_HZ = 500
 ARM_RATE_FAIL_HZ = 450.0
 _LOG_STATE_INPUT_EVERY = 25
 _LOG_RESULT_EVERY = 5
+
+
+class QuitKeyThread:
+    def __init__(self) -> None:
+        self._stop = threading.Event()
+        self._quit = threading.Event()
+        self._fd: int | None = None
+        self._old = None
+        self._thread: threading.Thread | None = None
+
+    def start(self) -> None:
+        try:
+            self._fd = os.open("/dev/tty", os.O_RDWR | os.O_NOCTTY)
+            self._old = termios.tcgetattr(self._fd)
+            tty.setcbreak(self._fd)
+        except Exception:
+            if self._fd is not None:
+                try:
+                    os.close(self._fd)
+                except Exception:
+                    pass
+            self._fd = None
+            self._old = None
+            return
+        self._thread = threading.Thread(
+            target=self._run, name="quit-key", daemon=True
+        )
+        self._thread.start()
+
+    def pressed(self) -> bool:
+        return self._quit.is_set()
+
+    def stop(self) -> None:
+        self._stop.set()
+        if self._thread is not None:
+            self._thread.join(timeout=1.0)
+            self._thread = None
+        if self._fd is None:
+            return
+        if self._old is not None:
+            try:
+                termios.tcsetattr(self._fd, termios.TCSADRAIN, self._old)
+            except Exception:
+                pass
+        try:
+            os.close(self._fd)
+        except Exception:
+            pass
+        self._fd = None
+
+    def _run(self) -> None:
+        fd = self._fd
+        if fd is None:
+            return
+        try:
+            while not self._stop.is_set() and not self._quit.is_set():
+                try:
+                    tty.setcbreak(fd)
+                except Exception:
+                    pass
+                ready, _, _ = select.select([fd], [], [], 0.1)
+                if not ready:
+                    continue
+                data = os.read(fd, 8)
+                if b"q" in data.lower():
+                    self._quit.set()
+                    return
+        except Exception:
+            return
 
 
 def _parse_args() -> argparse.Namespace:
@@ -245,14 +318,6 @@ def _connect_hcx_direct(
         direct_cfg,
         source_hz,
     )
-
-
-def _connect_hcx_feedback(teleop_yaml: Path) -> tuple[Any, Any, Any]:
-    runtime = load_runtime_config(teleop_yaml)
-    h = runtime.hcx
-    client = RobotClient(h.local_ip, h.remote_ip, h.port)
-    client.connect(timeout_s=h.connect_timeout_s)
-    return client, client.arm(int(h.left_robot_id)), client.arm(int(h.right_robot_id))
 
 
 def _follower_stats_line(name: str, follower: HcxFollower) -> tuple[str, bool, float | None]:
@@ -742,6 +807,14 @@ def _infer_worker(
     ready_evt: Any,
     stop_evt: Any,
 ) -> None:
+    signal.signal(signal.SIGINT, signal.SIG_IGN)
+    try:
+        devnull = os.open(os.devnull, os.O_RDWR)
+        os.dup2(devnull, 0)
+        os.close(devnull)
+    except OSError:
+        pass
+    hw: HardwareBundle | None = None
     try:
         torch.set_num_threads(1)
         ckpt_path = Path(spec["ckpt"])
@@ -785,10 +858,6 @@ def _infer_worker(
             left_start_joints_deg=spec["left_start"],
             right_start_joints_deg=spec["right_start"],
         )
-        fb_client, fb_left, fb_right = _connect_hcx_feedback(teleop_yaml)
-        hw.hcx_client = fb_client
-        hw.left_arm = fb_left
-        hw.right_arm = fb_right
         hw.camera_manager = _connect_record_cameras(teleop_yaml)
         hw.camera_capture = HeadTriggeredCapture(
             hw.camera_manager,
@@ -930,28 +999,39 @@ def _infer_worker(
             remain = phys[skip:]
             out_chunk = np.concatenate([remain[:, left_j], remain[:, right_j]], axis=1)
             g_row = remain[0]
-            out_q.put(
-                {
-                    "infer_i": infer_i,
-                    "chunk": out_chunk,
-                    "grip_l": float(np.clip(g_row[left_g_i], 0.0, 1.0)),
-                    "grip_r": float(np.clip(g_row[right_g_i], 0.0, 1.0)),
-                    "leftover": leftover_len,
-                    "delay": int(new_delay),
-                    "qsize": int(action_queue.qsize()),
-                    "infer_ms": float(infer_s * 1e3),
-                }
-            )
+            payload = {
+                "infer_i": infer_i,
+                "chunk": out_chunk,
+                "grip_l": float(np.clip(g_row[left_g_i], 0.0, 1.0)),
+                "grip_r": float(np.clip(g_row[right_g_i], 0.0, 1.0)),
+                "leftover": leftover_len,
+                "delay": int(new_delay),
+                "qsize": int(action_queue.qsize()),
+                "infer_ms": float(infer_s * 1e3),
+            }
+            while not stop_evt.is_set():
+                try:
+                    out_q.put(payload, timeout=0.2)
+                    break
+                except Full:
+                    continue
+            if stop_evt.is_set():
+                break
             if infer_i == 0:
                 ready_evt.set()
             infer_i += 1
-        _shutdown(hw)
     except BaseException as exc:
         try:
-            out_q.put({"error": f"{type(exc).__name__}: {exc}"})
+            out_q.put({"error": f"{type(exc).__name__}: {exc}"}, timeout=1.0)
         except Exception:
             pass
         ready_evt.set()
+    finally:
+        if hw is not None:
+            try:
+                _shutdown(hw)
+            except Exception:
+                pass
 
 
 def main() -> None:
@@ -1056,6 +1136,7 @@ def main() -> None:
     watchdog: ServoWatchdogThread | None = None
     left_follower: HcxFollower | None = None
     right_follower: HcxFollower | None = None
+    quit_keys: QuitKeyThread | None = None
     try:
         (
             _hcx_connection,
@@ -1248,10 +1329,15 @@ def main() -> None:
         )
         watchdog.start()
         print(
-            f"[INFO] {source_hz}Hz 源点下发已启动 → {ARM_SERVO_HZ}Hz",
+            f"[INFO] {source_hz}Hz 源点下发已启动 → {ARM_SERVO_HZ}Hz，按 q 安全退出",
             flush=True,
         )
+        quit_keys = QuitKeyThread()
+        quit_keys.start()
         while True:
+            if quit_keys.pressed():
+                print("\n[INFO] 收到 q，停止伺服", flush=True)
+                break
             send_thread.check_fault()
             watchdog.check_fault()
             joints = send_thread.latest_joints()
@@ -1294,12 +1380,8 @@ def main() -> None:
     except KeyboardInterrupt:
         print("\n[INFO] 收到 Ctrl+C，停止伺服", flush=True)
     finally:
-        if stop_evt is not None:
-            stop_evt.set()
-        if infer_proc is not None:
-            infer_proc.join(timeout=5.0)
-            if infer_proc.is_alive():
-                infer_proc.terminate()
+        if quit_keys is not None:
+            quit_keys.stop()
         if send_thread is not None:
             send_thread.stop()
         if watchdog is not None:
@@ -1309,15 +1391,24 @@ def main() -> None:
                 left_follower.stop_servo()
             except Exception:
                 pass
-            try:
-                left_follower.disconnect()
-            except Exception as exc:
-                print(f"[WARN] 断开左臂 follower 出错: {exc}", flush=True)
         if right_follower is not None:
             try:
                 right_follower.stop_servo()
             except Exception:
                 pass
+        if stop_evt is not None:
+            stop_evt.set()
+        if infer_proc is not None:
+            infer_proc.join(timeout=5.0)
+            if infer_proc.is_alive():
+                infer_proc.terminate()
+                infer_proc.join(timeout=2.0)
+        if left_follower is not None:
+            try:
+                left_follower.disconnect()
+            except Exception as exc:
+                print(f"[WARN] 断开左臂 follower 出错: {exc}", flush=True)
+        if right_follower is not None:
             try:
                 right_follower.disconnect()
             except Exception as exc:
