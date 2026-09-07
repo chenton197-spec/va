@@ -1,0 +1,55 @@
+checkpoint: /home/a/ct/va/outputs/fm_openarm_hcx_dual_arm_with_out_room_s_depth_nobs1_h60_nact16_statedelta_260902201902/checkpoint_final.pt
+config: /home/a/ct/va/outputs/fm_openarm_hcx_dual_arm_with_out_room_s_depth_nobs1_h60_nact16_statedelta_260902201902/config.yaml
+
+teleop_yaml: teleop_project/teleop.yaml
+
+obs_mode: after_action
+display_cameras: false
+max_steps: 50000
+chunk: 12
+fps: 30
+
+rtc:
+  enabled: true
+  guidance_enabled: true
+  inference_delay: 0
+
+one_euro:
+  enabled: true
+  mincutoff_hz: 3.0
+  beta: 0.05
+  dcutoff_hz: 1.0
+
+servo:
+  rate_hz: 500
+  watchdog_s: 0.5
+  command_deadband_deg: 0.08
+  command_filter_tau_s: 0.025
+  command_filter_tau2_s: 0.06
+  kalman_enabled: false
+  kalman_q: 400.0
+  kalman_r: 0.1
+  max_joint_vel_deg_s: 90.0
+  servo_fault_hz_warn: 490.0
+
+start_pose:
+  left_joints_deg: null
+  right_joints_deg: null
+  left_gripper: 1.0
+  right_gripper: 1.0
+  gripper_ramp_s: 0.9
+
+joint_limits_deg:
+  min: [-169.9, -100.9, -169.9, -139.9, -169.0, -54.9, -59.9]
+  max: [169.9, 100.9, 169.9, 54.9, 169.9, 54.9, 59.9]
+
+move_joints:
+  speed_ratio: 1
+  acceleration_seconds: 0.1
+  deceleration_seconds: 0.1
+  feedback_confirm_timeout_s: 30.0
+  feedback_confirm_poll_interval_s: 0.05
+  angle_tolerance_deg: 0.02
+  feedback_confirm: true
+  interrupt: false
+  max_delta_deg: 12.0
