@@ -1,6 +1,5 @@
-checkpoint: /home/a/ct/va/outputs/fm_openarm_hcx_dual_arm_with_out_room_s_depth_nobs1_h60_nact16_statedelta_260902201902/checkpoint_final.pt
-config: /home/a/ct/va/outputs/fm_openarm_hcx_dual_arm_with_out_room_s_depth_nobs1_h60_nact16_statedelta_260902201902/config.yaml
-
+checkpoint: /home/a/ct/va/outputs/fm_openarm_hcx_dual_arm_with_out_room_s_depth_nobs1_h60_nact16_statedelta_260906232800/checkpoint_best_mse.pt
+config: /home/a/ct/va/outputs/fm_openarm_hcx_dual_arm_with_out_room_s_depth_nobs1_h60_nact16_statedelta_260906232800/config.yaml
 teleop_yaml: teleop_project/teleop.yaml
 
 obs_mode: after_action
@@ -35,7 +34,7 @@ servo:
 start_pose:
   left_joints_deg: null
   right_joints_deg: null
-  left_gripper: 1.0
+  left_gripper: 0.566
   right_gripper: 1.0
   gripper_ramp_s: 0.9
 

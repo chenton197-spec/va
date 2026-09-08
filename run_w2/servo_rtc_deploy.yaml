@@ -31,7 +31,7 @@ servo:
 start_pose:
   left_joints_deg: null
   right_joints_deg: null
-  left_gripper: 1.0
+  left_gripper: 0.566
   right_gripper: 1.0
   gripper_ramp_s: 0.9
 

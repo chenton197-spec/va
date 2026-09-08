@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import gc
 import math
 import multiprocessing as mp
 import os
@@ -870,6 +871,53 @@ def _filter_chunk_joints(
     return out, snaps
 
 
+def _cpu_affinity_halves() -> tuple[set[int], set[int]] | None:
+    n = os.cpu_count() or 0
+    if n < 4:
+        return None
+    mid = n // 2
+    return set(range(0, mid)), set(range(mid, n))
+
+
+def _bind_cpus(cores: set[int]) -> None:
+    try:
+        os.sched_setaffinity(0, cores)
+    except (AttributeError, OSError):
+        pass
+
+
+def _gpu_keepalive(keep: torch.Tensor | None) -> None:
+    if keep is not None:
+        keep.add_(0.0)
+
+
+def _sample_actions_timed(
+    policy: Any,
+    batch: dict[str, torch.Tensor],
+    *,
+    leftover: torch.Tensor | None,
+    inference_delay: int,
+    execution_horizon: int,
+    device: torch.device,
+    chunk_n: int,
+) -> tuple[torch.Tensor, float]:
+    use_cuda = device.type == "cuda"
+    if use_cuda:
+        torch.cuda.synchronize()
+    t0 = time.perf_counter()
+    with torch.inference_mode():
+        pred_g = policy.sample_actions(
+            batch,
+            prev_chunk_left_over=leftover,
+            inference_delay=inference_delay,
+            execution_horizon=execution_horizon,
+        )[0][:chunk_n].contiguous()
+        if use_cuda:
+            torch.cuda.synchronize()
+        pred = pred_g.cpu()
+    return pred, time.perf_counter() - t0
+
+
 def _infer_worker(
     spec: dict[str, Any],
     joint_arr: Any,
@@ -888,7 +936,15 @@ def _infer_worker(
         pass
     hw: HardwareBundle | None = None
     try:
+        halves = _cpu_affinity_halves()
+        if halves is not None:
+            _bind_cpus(halves[1])
+        gc.disable()
         torch.set_num_threads(1)
+        if torch.cuda.is_available():
+            torch.backends.cudnn.benchmark = True
+            torch.backends.cuda.matmul.allow_tf32 = True
+            torch.backends.cudnn.allow_tf32 = True
         ckpt_path = Path(spec["ckpt"])
         train_cfg_path = spec["train_cfg"]
         train_cfg_path = None if train_cfg_path is None else Path(train_cfg_path)
@@ -918,6 +974,13 @@ def _infer_worker(
         policy_cfg = getattr(policy, "cfg", None)
         if hasattr(policy_cfg, "history_noise_std"):
             policy_cfg.history_noise_std = 0.0
+        if device.type == "cuda":
+            policy = torch.compile(policy, mode="default")
+        keep = (
+            torch.zeros(1, device=device, dtype=torch.float32)
+            if device.type == "cuda"
+            else None
+        )
         predict_joint_delta = bool(cfg.policy.predict_joint_delta)
         joint_mask = joint_mask_from_names(cfg.action_names, cfg.action_dim)
         joint_idx = np.where(joint_mask)[0]
@@ -965,19 +1028,22 @@ def _infer_worker(
             predict_joint_delta=predict_joint_delta,
             joint_mask=joint_mask,
         )
-        with torch.no_grad():
-            policy.sample_actions(
-                warmup_batch,
-                prev_chunk_left_over=None,
-                inference_delay=0,
-                execution_horizon=2,
-            )[0].cpu()
+        _, _ = _sample_actions_timed(
+            policy,
+            warmup_batch,
+            leftover=None,
+            inference_delay=0,
+            execution_horizon=2,
+            device=device,
+            chunk_n=chunk_n,
+        )
         infer_i = 0
         while infer_i < max_steps and not stop_evt.is_set():
             infer_delay = _rtc_delay(latency_tracker, train_fps, chunk_n, infer_i)
             exec_h = infer_delay + 2
             if infer_i > 0:
                 while not stop_evt.is_set() and int(ack_val.value) != infer_i - 1:
+                    _gpu_keepalive(keep)
                     time.sleep(0.002)
                 threshold = infer_delay + 2
                 while not stop_evt.is_set():
@@ -986,6 +1052,7 @@ def _infer_worker(
                     )
                     if action_queue.qsize() <= threshold:
                         break
+                    _gpu_keepalive(keep)
                     time.sleep(0.002)
                 if stop_evt.is_set():
                     break
@@ -1021,17 +1088,16 @@ def _infer_worker(
                             joint_mask=joint_mask,
                             device=device,
                         )
-            t_infer = time.perf_counter()
-            with torch.no_grad():
-                pred = policy.sample_actions(
-                    batch,
-                    prev_chunk_left_over=leftover,
-                    inference_delay=infer_delay,
-                    execution_horizon=exec_h,
-                )[0].cpu()
-            infer_s = time.perf_counter() - t_infer
+            pred, infer_s = _sample_actions_timed(
+                policy,
+                batch,
+                leftover=leftover,
+                inference_delay=infer_delay,
+                execution_horizon=exec_h,
+                device=device,
+                chunk_n=chunk_n,
+            )
             latency_tracker.add(infer_s)
-            pred = pred[:chunk_n]
             popped = 0 if infer_i == 0 else int(popped_val.value)
             idx_after = _sync_action_queue_index(
                 action_queue, popped, train_fps, source_hz
@@ -1188,6 +1254,10 @@ def main() -> None:
     grip_idx = np.where(~joint_mask)[0]
     left_g_i = int(grip_idx[0]) if grip_idx.size >= 1 else 14
     right_g_i = int(grip_idx[1]) if grip_idx.size >= 2 else 15
+
+    halves = _cpu_affinity_halves()
+    if halves is not None:
+        _bind_cpus(halves[0])
 
     print(
         f"[INFO] 策略就绪 layout=dual device={device} cameras={cameras} "
