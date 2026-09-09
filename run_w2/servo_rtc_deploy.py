@@ -902,25 +902,22 @@ def _infer_worker(
         infer_i = 0
         while infer_i < max_steps and not stop_evt.is_set():
             infer_delay = _rtc_delay(latency_tracker, train_fps, chunk_n, infer_i)
-            exec_h = infer_delay + 2
             if infer_i > 0:
                 while not stop_evt.is_set() and int(ack_val.value) != infer_i - 1:
                     time.sleep(0.002)
-                threshold = infer_delay + 2
-                while not stop_evt.is_set():
-                    _sync_action_queue_index(
-                        action_queue, int(popped_val.value), train_fps, source_hz
-                    )
-                    if action_queue.qsize() <= threshold:
-                        break
-                    time.sleep(0.002)
                 if stop_evt.is_set():
                     break
+                _sync_action_queue_index(
+                    action_queue, int(popped_val.value), train_fps, source_hz
+                )
             idx_before = action_queue.get_action_index()
             leftover = action_queue.get_left_over()
             if leftover is not None and leftover.shape[0] == 0:
                 leftover = None
             leftover_len = 0 if leftover is None else int(leftover.shape[0])
+            exec_h = infer_delay + 2
+            if leftover_len > 0:
+                exec_h = min(exec_h, leftover_len)
             obs = _capture_infer_obs(hw, list(cameras), joint_arr, **obs_kw)
             obs_history = [obs]
             q_now = np.asarray(obs_history[-1].state, dtype=np.float32)
@@ -948,6 +945,14 @@ def _infer_worker(
                             joint_mask=joint_mask,
                             device=device,
                         )
+                n_left = int(leftover.shape[0])
+                if n_left < chunk_n:
+                    leftover = torch.cat(
+                        [leftover, leftover[-1:].expand(chunk_n - n_left, -1)],
+                        dim=0,
+                    )
+                elif n_left > chunk_n:
+                    leftover = leftover[:chunk_n]
             t_infer = time.perf_counter()
             with torch.no_grad():
                 pred = policy.sample_actions(
