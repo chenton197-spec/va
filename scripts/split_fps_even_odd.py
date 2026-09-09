@@ -240,7 +240,9 @@ def write_split_episode(
     return n, stats_entry
 
 
-def run(src_root: Path, dst_root: Path, *, overwrite: bool) -> None:
+def run(src_root: Path, dst_root: Path, *, overwrite: bool, append: bool) -> None:
+    if overwrite and append:
+        raise SystemExit("pass only one of --overwrite / --append")
     if not is_lerobot_image_sequence_root(src_root):
         raise SystemExit(f"Not a leobot image_sequence dataset: {src_root}")
     info = load_lerobot_info(src_root)
@@ -249,11 +251,18 @@ def run(src_root: Path, dst_root: Path, *, overwrite: bool) -> None:
         raise SystemExit(f"src fps={src_fps}, expected {SRC_FPS}")
     if dst_root.resolve() == src_root.resolve():
         raise SystemExit("dst must differ from src")
-    if dst_root.exists():
+    if append:
+        if not dst_root.exists():
+            raise SystemExit(f"Output missing: {dst_root} (needed for --append)")
+        if not is_lerobot_image_sequence_root(dst_root):
+            raise SystemExit(f"Not a leobot image_sequence dataset: {dst_root}")
+    elif dst_root.exists():
         if not overwrite:
-            raise SystemExit(f"Output exists: {dst_root} (pass --overwrite)")
+            raise SystemExit(f"Output exists: {dst_root} (pass --overwrite or --append)")
         shutil.rmtree(dst_root)
-    dst_root.mkdir(parents=True)
+        dst_root.mkdir(parents=True)
+    else:
+        dst_root.mkdir(parents=True)
 
     episodes = list_episode_indices(src_root, info)
     ep_meta_src = {
@@ -266,19 +275,28 @@ def run(src_root: Path, dst_root: Path, *, overwrite: bool) -> None:
     n_depth = len(depth_keys)
 
     meta_dst = dst_root / "meta"
-    meta_dst.mkdir(parents=True)
+    meta_dst.mkdir(parents=True, exist_ok=True)
     for name in ("depth_sources.json", "tasks.jsonl"):
         src_meta = src_root / "meta" / name
         if src_meta.is_file():
             shutil.copy2(src_meta, meta_dst / name)
 
-    global_index = 0
-    total_frames = 0
+    chunks_size = int(info["chunks_size"])
+    existing_dst: set[int] = set()
     ep_jsonl_rows: list[dict[str, Any]] = []
     ep_stats_rows: list[dict[str, Any]] = []
-    written = 0
-    chunks_size = int(info["chunks_size"])
+    global_index = 0
+    total_frames = 0
+    if append:
+        dst_info = load_lerobot_info(dst_root)
+        existing_dst = set(list_episode_indices(dst_root, dst_info))
+        ep_jsonl_rows = _load_jsonl(dst_root / "meta" / "episodes.jsonl")
+        ep_stats_rows = _load_jsonl(dst_root / "meta" / "episodes_stats.jsonl")
+        existing_dst |= {int(r["episode_index"]) for r in ep_jsonl_rows}
+        global_index = int(dst_info["total_frames"])
+        total_frames = global_index
 
+    added = 0
     for src_ep in episodes:
         data_rel = _format_data_path(info["data_path"], src_ep, chunks_size)
         t_src = pq.read_table(src_root / data_rel, columns=["frame_index"]).num_rows
@@ -289,6 +307,8 @@ def run(src_root: Path, dst_root: Path, *, overwrite: bool) -> None:
         src_row = ep_meta_src.get(src_ep, {"episode_index": src_ep})
         for dst_ep, keep in phases:
             if keep.size == 0:
+                continue
+            if dst_ep in existing_dst:
                 continue
             n, stats_entry = write_split_episode(
                 src_root,
@@ -302,7 +322,8 @@ def run(src_root: Path, dst_root: Path, *, overwrite: bool) -> None:
             )
             global_index += n
             total_frames += n
-            written += 1
+            added += 1
+            existing_dst.add(dst_ep)
             ep_stats_rows.append(stats_entry)
             ep_jsonl_rows.append(
                 {
@@ -313,7 +334,10 @@ def run(src_root: Path, dst_root: Path, *, overwrite: bool) -> None:
             )
             print(f"src {src_ep:03d} -> dst {dst_ep:03d}  {t_src}->{n}")
 
+    if not ep_jsonl_rows:
+        raise SystemExit("no episodes written")
     max_ep = max(int(r["episode_index"]) for r in ep_jsonl_rows)
+    written = len(ep_jsonl_rows)
     out_info = dict(info)
     out_info["fps"] = DST_FPS
     out_info["total_episodes"] = written
@@ -335,7 +359,10 @@ def run(src_root: Path, dst_root: Path, *, overwrite: bool) -> None:
             if k in old:
                 stats[k] = np.asarray(old[k], dtype=np.float32)
     save_stats(dst_root, stats)
-    print(f"wrote {dst_root} episodes={written} frames={total_frames} fps={DST_FPS}")
+    print(
+        f"wrote {dst_root} added={added} episodes={written} "
+        f"frames={total_frames} fps={DST_FPS}"
+    )
 
 
 def main() -> None:
@@ -352,8 +379,14 @@ def main() -> None:
         default=va_root / "data" / "openarm_hcx_dual_arm_with_out_room_s_15fps",
     )
     parser.add_argument("--overwrite", action="store_true")
+    parser.add_argument("--append", action="store_true")
     args = parser.parse_args()
-    run(_resolve(args.src), _resolve(args.dst), overwrite=args.overwrite)
+    run(
+        _resolve(args.src),
+        _resolve(args.dst),
+        overwrite=args.overwrite,
+        append=args.append,
+    )
 
 
 if __name__ == "__main__":

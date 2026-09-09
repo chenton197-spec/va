@@ -5,14 +5,14 @@ state_names:
   [L0, L1, L2, L3, L4, L5, L6, R0, R1, R2, R3, R4, R5, R6, left_gripper, right_gripper]
 action_names:
   [L0, L1, L2, L3, L4, L5, L6, R0, R1, R2, R3, R4, R5, R6, left_gripper, right_gripper]
-fps: 15
+fps: 30
 data_root: data
-output_dir: outputs/fm_openarm_hcx_dual_arm_with_out_room_s_depth_nobs1_h32_nact16_statedelta
+output_dir: outputs/fm_openarm_hcx_dual_arm_with_out_room_s_depth_nobs1_h60_nact16_statedelta
 
 dataset:
   n_obs_steps: 1
-  horizon: 32
-  run_name: openarm_hcx_dual_arm_with_out_room_s_15fps
+  horizon: 60
+  run_name: openarm_hcx_dual_arm_with_out_room_s
   image_size: [256, 341]
   norm_mode: gaussian_2std
   color_jitter_brightness: 0.3
@@ -54,14 +54,14 @@ policy:
     enabled: false
 
 train:
-  batch_size: 64
-  steps: 101850
+  batch_size: 80
+  steps: 227760
   lr: 0.0001
   weight_decay: 0.0001
   log_freq: 50
-  save_freq: 6790
-  latest_save_freq: 6790
-  keep_last_ckpts: 12
+  save_freq: 11388
+  latest_save_freq: 11388
+  keep_last_ckpts: 20
   device: cuda
   num_workers: 4
   cosine_lr: true
@@ -73,5 +73,5 @@ train:
   max_grad_norm: 1.0
   amp: false
   compile: true
-  val_freq: 1697
+  val_freq: 1423
   val_samples: 256
