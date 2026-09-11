@@ -1,5 +1,4 @@
 #!/usr/bin/env python3
-# 做了初步的加减速
 from __future__ import annotations
 
 import argparse
@@ -91,7 +90,7 @@ GRIP_OPEN = 0.45
 SKIP_PHASE_A = 20
 SKIP_PHASE_B = 10
 RAMP_ACTIONS = 15
-SPEED_MAX_A = 1.8
+SPEED_MAX_A = 2.0
 SPEED_MAX_B = 1.5
 GL_STILL_OPEN = 0.25
 GL_WILL_CLOSE = 0.15
@@ -102,6 +101,11 @@ PATH_IDLE = 2.0
 PATH_LIFT = 8.0
 DR0_LIFT = -0.4
 DR0_FWD = 0.4
+LEFT_HOLD_S = 1.0
+LEFT_DOWN_S = 2.0
+LEFT_CLOSE_HALF_S = 1.0
+RIGHT_OPEN_MOVE = 2.0
+RIGHT_NEAR_N = 30
 
 
 class QuitKeyThread:
@@ -890,6 +894,23 @@ class _VelPhase:
     def __init__(self) -> None:
         self.lifted = False
         self.prev_path = 0.0
+        self.prev_gr = 1.0
+        self.right_x2 = False
+        self.right_moved = False
+        self.left_on = False
+        self.left_i = 0
+        self.hold_i = 0
+        self.down_i = 0
+        self.close_half_i = 0
+        self.right_lat_i = 0
+
+
+def _reset_left_sm(phase: _VelPhase) -> None:
+    phase.left_on = False
+    phase.left_i = 0
+    phase.hold_i = 0
+    phase.down_i = 0
+    phase.close_half_i = 0
 
 
 def _close_scale(steps_to_k: int) -> float:
@@ -897,29 +918,23 @@ def _close_scale(steps_to_k: int) -> float:
         return 1.0
     if steps_to_k > 4:
         return 0.6
-    if steps_to_k > 1:
-        return 0.3
-    return 0.15
+    return 0.5
 
 
 def _path_scale(path_i: float) -> float:
     if path_i > 15.0:
         return 1.0
-    if path_i > 8.0:
-        return 0.5
-    if path_i > 3.0:
-        return 0.25
-    return 0.1
+    return 0.5
 
 
-def _ease_in_scale(i: int) -> float:
-    if i <= 1:
-        return 0.15
-    if i <= 3:
-        return 0.3
-    if i <= 5:
-        return 0.6
-    return 1.0
+def _lifted_move_scale(dist: int | None, lat_i: int) -> float:
+    if dist is not None and dist <= RIGHT_NEAR_N:
+        if dist <= 0:
+            return 0.5
+        return 0.5 + 0.5 * (float(dist) / float(RIGHT_NEAR_N))
+    if lat_i >= RAMP_ACTIONS:
+        return 1.0
+    return 2.0 - float(lat_i) / float(RAMP_ACTIONS)
 
 
 def _scale_joint_deltas(
@@ -951,12 +966,17 @@ def _apply_phase_slowdown(
     left_g_i: int,
     right_g_i: int,
     phase: _VelPhase,
+    fps: float,
 ) -> np.ndarray:
     n = int(processed.shape[0])
     skip_i = max(0, min(int(skip), n - 1))
     remain = np.array(processed[skip_i:], dtype=np.float32, copy=True)
     t = int(remain.shape[0])
     if t < 2:
+        if t >= 1:
+            if float(remain[0, left_g_i]) < GRIP_CLOSED:
+                _reset_left_sm(phase)
+            phase.prev_gr = float(remain[0, right_g_i])
         phase.prev_path = 0.0
         return processed
     path, path_from = _right_path(remain, right_j)
@@ -964,38 +984,109 @@ def _apply_phase_slowdown(
     d_r0 = np.diff(r0.astype(np.float64))
     d_r0_mean = float(d_r0.mean()) if d_r0.size else 0.0
     g_l = remain[:, left_g_i]
-    g_r0 = float(remain[0, right_g_i])
+    g_r = remain[:, right_g_i]
+    g_r0 = float(g_r[0])
+    open_at: int | None = None
+    if phase.prev_gr < GRIP_CLOSED and g_r0 > GR_IS_OPEN:
+        open_at = 0
+    else:
+        for i in range(t):
+            prev = phase.prev_gr if i == 0 else float(g_r[i - 1])
+            if prev < GRIP_CLOSED and float(g_r[i]) > GR_IS_OPEN:
+                open_at = i
+                break
+    if open_at is not None:
+        phase.right_x2 = True
+        phase.right_moved = False
+    if float(g_l[0]) < GRIP_CLOSED:
+        _reset_left_sm(phase)
+    elif float(g_l[0]) > GRIP_OPEN and g_r0 < GRIP_CLOSED:
+        phase.left_on = True
+    close_k: int | None = None
     if float(g_l[0]) > GL_STILL_OPEN:
         below = np.where(g_l < GL_WILL_CLOSE)[0]
         if below.size:
-            k = int(below[0])
-            s_l = np.array(
-                [_close_scale(k - i) for i in range(t - 1)], dtype=np.float64
-            )
+            close_k = int(below[0])
+    if close_k is not None:
+        half_n = max(1, int(round(float(fps) * LEFT_CLOSE_HALF_S)))
+        s_l = np.empty(t - 1, dtype=np.float64)
+        for i in range(t - 1):
+            s = _close_scale(close_k - i)
+            if s <= 0.5:
+                if phase.close_half_i >= half_n:
+                    s = 1.0
+                else:
+                    phase.close_half_i += 1
+            s_l[i] = s
+        remain = _scale_joint_deltas(remain, left_j, s_l)
+    elif phase.left_on:
+        skip_n = int(SKIP_PHASE_A)
+        ramp_n = int(RAMP_ACTIONS)
+        at_2x = skip_n + ramp_n
+        hold_n = max(1, int(round(float(fps) * LEFT_HOLD_S)))
+        down_n = max(1, int(round(float(fps) * LEFT_DOWN_S)))
+        s_l = np.ones(t - 1, dtype=np.float64)
+        for i in range(t - 1):
+            right_closed_i = float(g_r[i]) < GRIP_CLOSED
+            s = 1.0
+            if phase.left_i >= skip_n and phase.left_i < at_2x:
+                rt = float(phase.left_i - skip_n) / float(ramp_n)
+                desired = 1.0 + rt
+                s = 1.0 if right_closed_i else desired
+            elif phase.left_i >= at_2x:
+                if phase.hold_i < hold_n:
+                    s = 1.0 if right_closed_i else 2.0
+                elif not right_closed_i:
+                    s = float(
+                        np.clip(2.0 - float(phase.down_i) / float(down_n), 1.0, 2.0)
+                    )
+                    phase.down_i += 1
+                if phase.hold_i < hold_n:
+                    phase.hold_i += 1
+            s_l[i] = s
+            phase.left_i += 1
+        if float(s_l.max()) > 1.0:
             remain = _scale_joint_deltas(remain, left_j, s_l)
     if float(r0.min()) < R0_LIFTED:
         phase.lifted = True
     if float(r0[0]) > R0_DOWN and path < PATH_IDLE:
         phase.lifted = False
+    if not phase.lifted:
+        phase.right_lat_i = 0
+    if phase.right_x2 and path > PATH_IDLE:
+        phase.right_moved = True
+    r_close_k: int | None = None
+    if g_r0 > GR_IS_OPEN:
+        below_r = np.where(g_r < GRIP_CLOSED)[0]
+        if below_r.size:
+            r_close_k = int(below_r[0])
     s_r = np.ones(t - 1, dtype=np.float64)
     apply_r = False
     lifting = g_r0 > GR_IS_OPEN and d_r0_mean < DR0_LIFT
     from_rest = phase.prev_path < PATH_IDLE
-    if lifting and from_rest and path > PATH_LIFT:
-        apply_r = True
-        for i in range(t - 1):
-            s_r[i] = min(_ease_in_scale(i), _path_scale(float(path_from[i])))
-    elif lifting and not from_rest:
+    if lifting and (not from_rest or path > PATH_LIFT):
         apply_r = True
         for i in range(t - 1):
             s_r[i] = _path_scale(float(path_from[i]))
-    elif phase.lifted and d_r0_mean > DR0_FWD:
+    elif phase.lifted:
         apply_r = True
         for i in range(t - 1):
-            s_r[i] = _path_scale(float(path_from[i]))
+            dist = (r_close_k - i) if r_close_k is not None else None
+            s_r[i] = _lifted_move_scale(dist, phase.right_lat_i)
+            phase.right_lat_i += 1
+    elif phase.right_x2:
+        apply_r = True
+        off = int(open_at) if open_at is not None else 0
+        for i in range(t - 1):
+            if i >= off:
+                s_r[i] = RIGHT_OPEN_MOVE
+    if phase.right_x2 and phase.right_moved and path < PATH_IDLE:
+        phase.right_x2 = False
+        phase.right_moved = False
     if apply_r:
         remain = _scale_joint_deltas(remain, right_j, s_r)
     phase.prev_path = path
+    phase.prev_gr = float(g_r[-1])
     out = np.array(processed, dtype=np.float32, copy=True)
     out[skip_i:] = remain
     return out
@@ -1325,6 +1416,7 @@ def _infer_worker(
                 left_g_i,
                 right_g_i,
                 vel_phase,
+                train_fps,
             )
             processed_t = torch.as_tensor(processed, dtype=torch.float32)
             action_queue.merge(pred, processed_t, new_delay, idx_before)
