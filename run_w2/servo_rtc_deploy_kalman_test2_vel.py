@@ -88,24 +88,12 @@ _LOG_RESULT_EVERY = 5
 GRIP_CLOSED = 0.2
 GRIP_OPEN = 0.45
 SKIP_PHASE_A = 20
-SKIP_PHASE_B = 10
 RAMP_ACTIONS = 15
-SPEED_MAX_A = 2.0
-SPEED_MAX_B = 1.5
+SPEED_MAX_A = 1.6
 GL_STILL_OPEN = 0.25
 GL_WILL_CLOSE = 0.15
 GR_IS_OPEN = 0.6
-R0_LIFTED = -100.0
-R0_DOWN = -90.0
-PATH_IDLE = 2.0
-PATH_LIFT = 8.0
-DR0_LIFT = -0.4
-DR0_FWD = 0.4
-LEFT_HOLD_S = 1.0
-LEFT_DOWN_S = 2.0
-LEFT_CLOSE_HALF_S = 1.0
-RIGHT_OPEN_MOVE = 2.0
-RIGHT_NEAR_N = 30
+RIGHT_CLOSE_PRE_N = 16
 
 
 class QuitKeyThread:
@@ -386,6 +374,7 @@ class ServoInterpolator:
         self._lock = threading.Lock()
         self._points: np.ndarray | None = None
         self._t0 = 0.0
+        self._t0_r = 0.0
         self._popped = 0
         self._speed_scale = 1.0
         self._x = 0.0
@@ -395,6 +384,7 @@ class ServoInterpolator:
         with self._lock:
             self._points = pts
             self._t0 = float(t0)
+            self._t0_r = float(t0)
             self._popped = 0
             self._x = 0.0
 
@@ -404,10 +394,9 @@ class ServoInterpolator:
         with self._lock:
             if abs(scale - self._speed_scale) < 1e-9:
                 return
-            x = (now - self._t0) * self._fps * self._speed_scale
+            x = (now - self._t0_r) * self._fps * self._speed_scale
             self._speed_scale = scale
-            self._t0 = now - x / (self._fps * self._speed_scale)
-            self._x = x
+            self._t0_r = now - x / (self._fps * self._speed_scale)
 
     def speed_scale(self) -> float:
         with self._lock:
@@ -418,7 +407,7 @@ class ServoInterpolator:
             if self._points is None:
                 return 0.0
             t = time.perf_counter()
-            x = (t - self._t0) * self._fps * self._speed_scale
+            x = (t - self._t0) * self._fps
             n = len(self._points)
             return float(max(0.0, min(x, float(max(n - 1, 0)))))
 
@@ -426,18 +415,14 @@ class ServoInterpolator:
         with self._lock:
             if self._points is None:
                 return None
-            x = (t - self._t0) * self._fps * self._speed_scale
-            n = len(self._points)
-            self._x = x
-            if x <= 0.0:
-                target = self._points[0]
-            elif x >= n - 1:
-                target = self._points[-1]
-            else:
-                i = int(math.floor(x))
-                alpha = x - i
-                target = self._points[i] * (1.0 - alpha) + self._points[i + 1] * alpha
-            return target.copy()
+            pts = self._points
+            n = len(pts)
+            x_l = (t - self._t0) * self._fps
+            x_r = (t - self._t0_r) * self._fps * self._speed_scale
+            self._x = x_l
+            left = _interp_row(pts[:, :7], x_l, n)
+            right = _interp_row(pts[:, 7:14], x_r, n)
+            return np.concatenate([left, right])
 
     def mark_sent(self) -> None:
         with self._lock:
@@ -448,10 +433,20 @@ class ServoInterpolator:
             if self._points is None:
                 return 0
             t = time.perf_counter()
-            x = (t - self._t0) * self._fps * self._speed_scale
+            x = (t - self._t0) * self._fps
             n = len(self._points)
             x = max(0.0, min(x, float(max(n - 1, 0))))
             return int(x * self._servo_hz / self._fps)
+
+
+def _interp_row(pts: np.ndarray, x: float, n: int) -> np.ndarray:
+    if x <= 0.0:
+        return pts[0].copy()
+    if x >= n - 1:
+        return pts[-1].copy()
+    i = int(math.floor(x))
+    alpha = x - i
+    return pts[i] * (1.0 - alpha) + pts[i + 1] * alpha
 
 
 class _JointCVKalman:
@@ -531,7 +526,8 @@ class ServoSendThread:
         self._tau_s = float(tau_s)
         self._tau2_s = float(tau2_s)
         self._deadband_deg = float(deadband_deg)
-        self._max_vel_deg_s = float(max_vel_deg_s)
+        self._max_vel_l_deg_s = float(max_vel_deg_s)
+        self._max_vel_r_deg_s = float(max_vel_deg_s)
         self._max_delta_deg = float(max_delta_deg)
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
@@ -570,8 +566,13 @@ class ServoSendThread:
     def popped(self) -> int:
         return self._interp.popped()
 
-    def set_max_vel(self, max_vel_deg_s: float) -> None:
-        self._max_vel_deg_s = float(max_vel_deg_s)
+    def set_max_vel(
+        self, max_vel_deg_s: float, right_deg_s: float | None = None
+    ) -> None:
+        self._max_vel_l_deg_s = float(max_vel_deg_s)
+        self._max_vel_r_deg_s = float(
+            max_vel_deg_s if right_deg_s is None else right_deg_s
+        )
 
     def latest_joints(self) -> np.ndarray | None:
         with self._cmd_lock:
@@ -590,6 +591,7 @@ class ServoSendThread:
         follow_hi: np.ndarray,
         dt: float,
         kf: _JointCVKalman | None,
+        max_vel_deg_s: float,
     ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
         desired = np.asarray(desired, dtype=np.float64).reshape(7)
         if last is None:
@@ -615,7 +617,7 @@ class ServoSendThread:
         else:
             f2 = f1
         filt = f2 if kf is None else kf.step(f2, dt)
-        max_step = self._max_vel_deg_s * dt
+        max_step = float(max_vel_deg_s) * dt
         cmd = last + np.clip(filt - last, -max_step, max_step)
         cmd = np.clip(cmd, self._lo, self._hi)
         cmd = np.clip(cmd, follow_lo, follow_hi)
@@ -646,6 +648,7 @@ class ServoSendThread:
                         follow_hi=self._follow_l_hi,
                         dt=dt,
                         kf=self._kf_l,
+                        max_vel_deg_s=self._max_vel_l_deg_s,
                     )
                     right_cmd, self._f1_r, self._f2_r = self._shape_arm(
                         right_des,
@@ -656,6 +659,7 @@ class ServoSendThread:
                         follow_hi=self._follow_r_hi,
                         dt=dt,
                         kf=self._kf_r,
+                        max_vel_deg_s=self._max_vel_r_deg_s,
                     )
                     with self._cmd_lock:
                         self._last_l = left_cmd.copy()
@@ -892,25 +896,7 @@ def _phase_speed_scale(phase_actions: float, skip: int, speed_max: float) -> flo
 
 class _VelPhase:
     def __init__(self) -> None:
-        self.lifted = False
-        self.prev_path = 0.0
-        self.prev_gr = 1.0
-        self.right_x2 = False
-        self.right_moved = False
-        self.left_on = False
-        self.left_i = 0
-        self.hold_i = 0
-        self.down_i = 0
-        self.close_half_i = 0
-        self.right_lat_i = 0
-
-
-def _reset_left_sm(phase: _VelPhase) -> None:
-    phase.left_on = False
-    phase.left_i = 0
-    phase.hold_i = 0
-    phase.down_i = 0
-    phase.close_half_i = 0
+        self.right_post_close_i = 0
 
 
 def _close_scale(steps_to_k: int) -> float:
@@ -918,23 +904,26 @@ def _close_scale(steps_to_k: int) -> float:
         return 1.0
     if steps_to_k > 4:
         return 0.6
-    return 0.5
+    if steps_to_k > 1:
+        return 0.3
+    return 0.15
 
 
-def _path_scale(path_i: float) -> float:
-    if path_i > 15.0:
+def _right_step_scale(
+    g: float, phase: _VelPhase, wait_n: int, *, left_open: bool
+) -> float:
+    if g > GR_IS_OPEN:
+        phase.right_post_close_i = 0
         return 1.0
-    return 0.5
-
-
-def _lifted_move_scale(dist: int | None, lat_i: int) -> float:
-    if dist is not None and dist <= RIGHT_NEAR_N:
-        if dist <= 0:
-            return 0.5
-        return 0.5 + 0.5 * (float(dist) / float(RIGHT_NEAR_N))
-    if lat_i >= RAMP_ACTIONS:
+    if g < GRIP_CLOSED:
+        ready = phase.right_post_close_i >= wait_n
+        phase.right_post_close_i += 1
+        if left_open:
+            return 1.0
+        return SPEED_MAX_A if ready else 1.0
+    if left_open:
         return 1.0
-    return 2.0 - float(lat_i) / float(RAMP_ACTIONS)
+    return SPEED_MAX_A if phase.right_post_close_i >= wait_n else 1.0
 
 
 def _scale_joint_deltas(
@@ -947,15 +936,6 @@ def _scale_joint_deltas(
         d = seq[i, cols] - seq[i - 1, cols]
         out[i, cols] = out[i - 1, cols] + np.float32(scales[i - 1]) * d
     return out
-
-
-def _right_path(remain: np.ndarray, right_j: np.ndarray) -> tuple[float, np.ndarray]:
-    right = remain[:, right_j]
-    if right.shape[0] < 2:
-        return 0.0, np.zeros(0, dtype=np.float64)
-    step = np.linalg.norm(np.diff(right, axis=0), axis=1)
-    path_from = np.cumsum(step[::-1])[::-1]
-    return float(step.sum()), path_from.astype(np.float64, copy=False)
 
 
 def _apply_phase_slowdown(
@@ -972,121 +952,51 @@ def _apply_phase_slowdown(
     skip_i = max(0, min(int(skip), n - 1))
     remain = np.array(processed[skip_i:], dtype=np.float32, copy=True)
     t = int(remain.shape[0])
+    wait_n = max(1, int(round(float(fps) * 2.0)))
     if t < 2:
         if t >= 1:
-            if float(remain[0, left_g_i]) < GRIP_CLOSED:
-                _reset_left_sm(phase)
-            phase.prev_gr = float(remain[0, right_g_i])
-        phase.prev_path = 0.0
+            _right_step_scale(
+                float(remain[0, right_g_i]),
+                phase,
+                wait_n,
+                left_open=float(remain[0, left_g_i]) > GRIP_OPEN,
+            )
         return processed
-    path, path_from = _right_path(remain, right_j)
-    r0 = remain[:, int(right_j[0])]
-    d_r0 = np.diff(r0.astype(np.float64))
-    d_r0_mean = float(d_r0.mean()) if d_r0.size else 0.0
     g_l = remain[:, left_g_i]
     g_r = remain[:, right_g_i]
-    g_r0 = float(g_r[0])
-    open_at: int | None = None
-    if phase.prev_gr < GRIP_CLOSED and g_r0 > GR_IS_OPEN:
-        open_at = 0
-    else:
-        for i in range(t):
-            prev = phase.prev_gr if i == 0 else float(g_r[i - 1])
-            if prev < GRIP_CLOSED and float(g_r[i]) > GR_IS_OPEN:
-                open_at = i
-                break
-    if open_at is not None:
-        phase.right_x2 = True
-        phase.right_moved = False
-    if float(g_l[0]) < GRIP_CLOSED:
-        _reset_left_sm(phase)
-    elif float(g_l[0]) > GRIP_OPEN and g_r0 < GRIP_CLOSED:
-        phase.left_on = True
-    close_k: int | None = None
     if float(g_l[0]) > GL_STILL_OPEN:
         below = np.where(g_l < GL_WILL_CLOSE)[0]
         if below.size:
-            close_k = int(below[0])
-    if close_k is not None:
-        half_n = max(1, int(round(float(fps) * LEFT_CLOSE_HALF_S)))
-        s_l = np.empty(t - 1, dtype=np.float64)
-        for i in range(t - 1):
-            s = _close_scale(close_k - i)
-            if s <= 0.5:
-                if phase.close_half_i >= half_n:
-                    s = 1.0
-                else:
-                    phase.close_half_i += 1
-            s_l[i] = s
-        remain = _scale_joint_deltas(remain, left_j, s_l)
-    elif phase.left_on:
-        skip_n = int(SKIP_PHASE_A)
-        ramp_n = int(RAMP_ACTIONS)
-        at_2x = skip_n + ramp_n
-        hold_n = max(1, int(round(float(fps) * LEFT_HOLD_S)))
-        down_n = max(1, int(round(float(fps) * LEFT_DOWN_S)))
-        s_l = np.ones(t - 1, dtype=np.float64)
-        for i in range(t - 1):
-            right_closed_i = float(g_r[i]) < GRIP_CLOSED
-            s = 1.0
-            if phase.left_i >= skip_n and phase.left_i < at_2x:
-                rt = float(phase.left_i - skip_n) / float(ramp_n)
-                desired = 1.0 + rt
-                s = 1.0 if right_closed_i else desired
-            elif phase.left_i >= at_2x:
-                if phase.hold_i < hold_n:
-                    s = 1.0 if right_closed_i else 2.0
-                elif not right_closed_i:
-                    s = float(
-                        np.clip(2.0 - float(phase.down_i) / float(down_n), 1.0, 2.0)
-                    )
-                    phase.down_i += 1
-                if phase.hold_i < hold_n:
-                    phase.hold_i += 1
-            s_l[i] = s
-            phase.left_i += 1
-        if float(s_l.max()) > 1.0:
+            k = int(below[0])
+            s_l = np.array(
+                [_close_scale(k - i) for i in range(t - 1)], dtype=np.float64
+            )
             remain = _scale_joint_deltas(remain, left_j, s_l)
-    if float(r0.min()) < R0_LIFTED:
-        phase.lifted = True
-    if float(r0[0]) > R0_DOWN and path < PATH_IDLE:
-        phase.lifted = False
-    if not phase.lifted:
-        phase.right_lat_i = 0
-    if phase.right_x2 and path > PATH_IDLE:
-        phase.right_moved = True
     r_close_k: int | None = None
-    if g_r0 > GR_IS_OPEN:
+    if float(g_r[0]) >= GRIP_CLOSED:
         below_r = np.where(g_r < GRIP_CLOSED)[0]
         if below_r.size:
             r_close_k = int(below_r[0])
     s_r = np.ones(t - 1, dtype=np.float64)
     apply_r = False
-    lifting = g_r0 > GR_IS_OPEN and d_r0_mean < DR0_LIFT
-    from_rest = phase.prev_path < PATH_IDLE
-    if lifting and (not from_rest or path > PATH_LIFT):
-        apply_r = True
-        for i in range(t - 1):
-            s_r[i] = _path_scale(float(path_from[i]))
-    elif phase.lifted:
-        apply_r = True
-        for i in range(t - 1):
-            dist = (r_close_k - i) if r_close_k is not None else None
-            s_r[i] = _lifted_move_scale(dist, phase.right_lat_i)
-            phase.right_lat_i += 1
-    elif phase.right_x2:
-        apply_r = True
-        off = int(open_at) if open_at is not None else 0
-        for i in range(t - 1):
-            if i >= off:
-                s_r[i] = RIGHT_OPEN_MOVE
-    if phase.right_x2 and phase.right_moved and path < PATH_IDLE:
-        phase.right_x2 = False
-        phase.right_moved = False
+    for i in range(t - 1):
+        dist = (r_close_k - i) if r_close_k is not None else None
+        left_open_i = float(g_l[i]) > GRIP_OPEN
+        if dist is not None and 1 <= dist <= RIGHT_CLOSE_PRE_N:
+            _right_step_scale(
+                float(g_r[i]), phase, wait_n, left_open=left_open_i
+            )
+            s_r[i] = 0.5
+            apply_r = True
+        else:
+            s = _right_step_scale(
+                float(g_r[i]), phase, wait_n, left_open=left_open_i
+            )
+            s_r[i] = s
+            if s != 1.0:
+                apply_r = True
     if apply_r:
         remain = _scale_joint_deltas(remain, right_j, s_r)
-    phase.prev_path = path
-    phase.prev_gr = float(g_r[-1])
     out = np.array(processed, dtype=np.float32, copy=True)
     out[skip_i:] = remain
     return out
@@ -1798,14 +1708,10 @@ def main() -> None:
             dprog = max(0.0, prog - last_prog)
             last_prog = prog
             left_open = cmd_gl > GRIP_OPEN
-            left_closed = cmd_gl < GRIP_CLOSED
-            right_open = cmd_gr > GRIP_OPEN
             right_closed = cmd_gr < GRIP_CLOSED
             new_phase: str | None = None
             if right_closed and left_open:
                 new_phase = "A"
-            elif left_closed and right_open:
-                new_phase = "B"
             if new_phase != phase:
                 phase = new_phase
                 phase_actions = 0.0
@@ -1813,12 +1719,11 @@ def main() -> None:
                 phase_actions += dprog
             if phase == "A":
                 scale = _phase_speed_scale(phase_actions, SKIP_PHASE_A, SPEED_MAX_A)
-            elif phase == "B":
-                scale = _phase_speed_scale(phase_actions, SKIP_PHASE_B, SPEED_MAX_B)
             else:
                 scale = 1.0
             interp.set_speed_scale(scale)
-            send_thread.set_max_vel(base_max_vel * scale)
+            right_vel = max(scale, SPEED_MAX_A if right_closed else 1.0)
+            send_thread.set_max_vel(base_max_vel * scale, base_max_vel * right_vel)
             popped_val.value = int(send_thread.popped())
             if infer_proc is not None and not infer_proc.is_alive():
                 try:
