@@ -46,19 +46,14 @@ from robotfm.train import build_policy
 from robotfm.types import Observation
 from run import (
     BackgroundGripperLoop,
-    CameraPreviewLoop,
     DUAL_ARM_CAMERAS,
     HardwareBundle,
-    PREVIEW_FPS,
     _apply_rtc_overrides,
     _clamp_joints_by_limits,
     _clamp_joints_by_max_delta,
     _confirm_targets_by_feedback,
     _connect_dual_grippers,
     _load_deploy_config,
-    _log_inference_result,
-    _log_inference_state_input,
-    _pump_camera_preview,
     _ramp_start_grippers,
     _read_gripper,
     _read_hcx_joints,
@@ -83,17 +78,23 @@ from teleop_sdk.filters import OneEuroFilter
 
 ARM_SERVO_HZ = 500
 ARM_RATE_FAIL_HZ = 450.0
-_LOG_STATE_INPUT_EVERY = 25
-_LOG_RESULT_EVERY = 5
 GRIP_CLOSED = 0.2
 GRIP_OPEN = 0.45
 SKIP_PHASE_A = 20
+SKIP_PHASE_B = 5
 RAMP_ACTIONS = 15
-SPEED_MAX_A = 1.6
+SPEED_MAX_A = 1.8
+SPEED_MAX_B = 2.0
+RIGHT_MOVE_PATH = 2.0
 GL_STILL_OPEN = 0.25
 GL_WILL_CLOSE = 0.15
 GR_IS_OPEN = 0.6
 RIGHT_CLOSE_PRE_N = 16
+START_SPEED_RATIO = 0.1
+START_ACCEL_S = 0.5
+START_DECEL_S = 0.5
+START_CONFIRM_TIMEOUT_S = 60.0
+HCX_LIMITED_MAX_VEL_DEG_S = 150.0
 
 
 class QuitKeyThread:
@@ -374,19 +375,18 @@ class ServoInterpolator:
         self._lock = threading.Lock()
         self._points: np.ndarray | None = None
         self._t0 = 0.0
+        self._t0_l = 0.0
         self._t0_r = 0.0
-        self._popped = 0
         self._speed_scale = 1.0
-        self._x = 0.0
+        self._speed_scale_l = 1.0
 
     def submit(self, points: np.ndarray, t0: float) -> None:
         pts = np.asarray(points, dtype=np.float64).reshape(-1, self._n_joints)
         with self._lock:
             self._points = pts
             self._t0 = float(t0)
+            self._t0_l = float(t0)
             self._t0_r = float(t0)
-            self._popped = 0
-            self._x = 0.0
 
     def set_speed_scale(self, scale: float, t: float | None = None) -> None:
         scale = max(1e-6, float(scale))
@@ -398,18 +398,29 @@ class ServoInterpolator:
             self._speed_scale = scale
             self._t0_r = now - x / (self._fps * self._speed_scale)
 
+    def set_left_speed_scale(self, scale: float, t: float | None = None) -> None:
+        scale = max(1e-6, float(scale))
+        now = time.perf_counter() if t is None else float(t)
+        with self._lock:
+            if abs(scale - self._speed_scale_l) < 1e-9:
+                return
+            x = (now - self._t0_l) * self._fps * self._speed_scale_l
+            self._speed_scale_l = scale
+            self._t0_l = now - x / (self._fps * self._speed_scale_l)
+
     def speed_scale(self) -> float:
         with self._lock:
             return float(self._speed_scale)
+
+    def _left_x(self, t: float, n: int) -> float:
+        x = (t - self._t0_l) * self._fps * self._speed_scale_l
+        return float(max(0.0, min(x, float(max(n - 1, 0)))))
 
     def progress(self) -> float:
         with self._lock:
             if self._points is None:
                 return 0.0
-            t = time.perf_counter()
-            x = (t - self._t0) * self._fps
-            n = len(self._points)
-            return float(max(0.0, min(x, float(max(n - 1, 0)))))
+            return self._left_x(time.perf_counter(), len(self._points))
 
     def sample(self, t: float) -> np.ndarray | None:
         with self._lock:
@@ -417,26 +428,29 @@ class ServoInterpolator:
                 return None
             pts = self._points
             n = len(pts)
-            x_l = (t - self._t0) * self._fps
+            x_l = (t - self._t0_l) * self._fps * self._speed_scale_l
             x_r = (t - self._t0_r) * self._fps * self._speed_scale
-            self._x = x_l
             left = _interp_row(pts[:, :7], x_l, n)
             right = _interp_row(pts[:, 7:14], x_r, n)
             return np.concatenate([left, right])
-
-    def mark_sent(self) -> None:
-        with self._lock:
-            self._popped += 1
 
     def popped(self) -> int:
         with self._lock:
             if self._points is None:
                 return 0
-            t = time.perf_counter()
-            x = (t - self._t0) * self._fps
             n = len(self._points)
-            x = max(0.0, min(x, float(max(n - 1, 0))))
+            x = self._left_x(time.perf_counter(), n)
             return int(x * self._servo_hz / self._fps)
+
+    def right_path(self) -> float:
+        with self._lock:
+            if self._points is None:
+                return 0.0
+            right = self._points[:, 7:14]
+            if right.shape[0] < 2:
+                return 0.0
+            step = np.linalg.norm(np.diff(right, axis=0), axis=1)
+            return float(step.sum())
 
 
 def _interp_row(pts: np.ndarray, x: float, n: int) -> np.ndarray:
@@ -447,6 +461,10 @@ def _interp_row(pts: np.ndarray, x: float, n: int) -> np.ndarray:
     i = int(math.floor(x))
     alpha = x - i
     return pts[i] * (1.0 - alpha) + pts[i + 1] * alpha
+
+
+def _clamp_servo_vel(vel_deg_s: float) -> float:
+    return min(max(float(vel_deg_s), 1e-3), HCX_LIMITED_MAX_VEL_DEG_S)
 
 
 class _JointCVKalman:
@@ -526,8 +544,9 @@ class ServoSendThread:
         self._tau_s = float(tau_s)
         self._tau2_s = float(tau2_s)
         self._deadband_deg = float(deadband_deg)
-        self._max_vel_l_deg_s = float(max_vel_deg_s)
-        self._max_vel_r_deg_s = float(max_vel_deg_s)
+        vel = _clamp_servo_vel(max_vel_deg_s)
+        self._max_vel_l_deg_s = vel
+        self._max_vel_r_deg_s = vel
         self._max_delta_deg = float(max_delta_deg)
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
@@ -569,10 +588,11 @@ class ServoSendThread:
     def set_max_vel(
         self, max_vel_deg_s: float, right_deg_s: float | None = None
     ) -> None:
-        self._max_vel_l_deg_s = float(max_vel_deg_s)
-        self._max_vel_r_deg_s = float(
-            max_vel_deg_s if right_deg_s is None else right_deg_s
-        )
+        left_v = _clamp_servo_vel(max_vel_deg_s)
+        right_v = left_v if right_deg_s is None else _clamp_servo_vel(right_deg_s)
+        with self._cmd_lock:
+            self._max_vel_l_deg_s = left_v
+            self._max_vel_r_deg_s = right_v
 
     def latest_joints(self) -> np.ndarray | None:
         with self._cmd_lock:
@@ -621,6 +641,9 @@ class ServoSendThread:
         cmd = last + np.clip(filt - last, -max_step, max_step)
         cmd = np.clip(cmd, self._lo, self._hi)
         cmd = np.clip(cmd, follow_lo, follow_hi)
+        if kf is not None:
+            kf._p = cmd.copy()
+            kf._v = (cmd - last) / max(float(dt), 1e-6)
         return (
             cmd,
             np.array(f1, dtype=np.float64, copy=True),
@@ -639,6 +662,9 @@ class ServoSendThread:
                 if target is not None:
                     left_des = target[:7]
                     right_des = target[7:14]
+                    with self._cmd_lock:
+                        vel_l = self._max_vel_l_deg_s
+                        vel_r = self._max_vel_r_deg_s
                     left_cmd, self._f1_l, self._f2_l = self._shape_arm(
                         left_des,
                         last=self._last_l,
@@ -648,7 +674,7 @@ class ServoSendThread:
                         follow_hi=self._follow_l_hi,
                         dt=dt,
                         kf=self._kf_l,
-                        max_vel_deg_s=self._max_vel_l_deg_s,
+                        max_vel_deg_s=vel_l,
                     )
                     right_cmd, self._f1_r, self._f2_r = self._shape_arm(
                         right_des,
@@ -659,14 +685,13 @@ class ServoSendThread:
                         follow_hi=self._follow_r_hi,
                         dt=dt,
                         kf=self._kf_r,
-                        max_vel_deg_s=self._max_vel_r_deg_s,
+                        max_vel_deg_s=vel_r,
                     )
                     with self._cmd_lock:
                         self._last_l = left_cmd.copy()
                         self._last_r = right_cmd.copy()
                     self._left.send_joint_angles_deg(left_cmd, self._dt)
                     self._right.send_joint_angles_deg(right_cmd, self._dt)
-                    self._interp.mark_sent()
                 next_t += self._dt
                 sleep_s = next_t - time.perf_counter()
                 if sleep_s > 0.0:
@@ -796,95 +821,6 @@ def _sync_action_queue_index(
         return action_queue.last_index
 
 
-def _interpolate_policy_to_servo(
-    phys: np.ndarray,
-    *,
-    train_fps: float,
-    servo_hz: int,
-    skip_policy_steps: int,
-) -> np.ndarray:
-    pts = np.asarray(phys, dtype=np.float64)
-    if pts.ndim != 2 or pts.shape[0] < 1:
-        raise ValueError(f"策略动作形状异常: {pts.shape}")
-    skip = max(0, min(int(skip_policy_steps), int(pts.shape[0]) - 1))
-    remain = pts[skip:]
-    n_pol = int(remain.shape[0])
-    n_hz = max(1, int(round(float(n_pol) * float(servo_hz) / float(train_fps))))
-    if n_pol == 1:
-        return np.repeat(remain, n_hz, axis=0)
-    x = np.linspace(0.0, float(n_pol - 1), n_hz, dtype=np.float64)
-    i0 = np.floor(x).astype(np.int64)
-    i1 = np.minimum(i0 + 1, n_pol - 1)
-    a = (x - i0.astype(np.float64))[:, None]
-    return remain[i0] * (1.0 - a) + remain[i1] * a
-
-
-def _shape_arm_traj(
-    desired: np.ndarray,
-    *,
-    last: np.ndarray | None,
-    lo: np.ndarray,
-    hi: np.ndarray,
-    follow_lo: np.ndarray,
-    follow_hi: np.ndarray,
-    tau_s: float,
-    max_vel_deg_s: float,
-    max_delta_deg: float,
-    dt: float,
-) -> np.ndarray:
-    n = int(desired.shape[0])
-    out = np.empty((n, 7), dtype=np.float64)
-    cur = None if last is None else np.asarray(last, dtype=np.float64).reshape(7)
-    filt = None if cur is None else cur.copy()
-    max_step = float(max_vel_deg_s) * float(dt)
-    for i in range(n):
-        des = np.asarray(desired[i], dtype=np.float64).reshape(7)
-        if cur is None:
-            cmd = np.clip(des, lo, hi)
-            cmd = np.clip(cmd, follow_lo, follow_hi)
-            cur = cmd
-            filt = cmd.copy()
-            out[i] = cmd
-            continue
-        clamped, _ = _clamp_joints_by_max_delta(des, cur, max_delta_deg)
-        des = np.asarray(clamped, dtype=np.float64)
-        if tau_s > 0.0 and filt is not None:
-            alpha = dt / (tau_s + dt)
-            des = filt + alpha * (des - filt)
-            filt = des
-        cmd = cur + np.clip(des - cur, -max_step, max_step)
-        cmd = np.clip(cmd, lo, hi)
-        cmd = np.clip(cmd, follow_lo, follow_hi)
-        cur = cmd
-        out[i] = cmd
-    return out
-
-
-def _reanchor_leftover(
-    leftover_abs: torch.Tensor,
-    q_now: np.ndarray,
-    *,
-    stats: dict,
-    norm_mode: str,
-    joint_mask: np.ndarray,
-    device: torch.device,
-) -> torch.Tensor:
-    abs_np = leftover_abs.detach().cpu().numpy().astype(np.float32)
-    delta = subtract_joint_pose(abs_np, q_now.astype(np.float32), joint_mask)
-    normed = normalize(delta, stats, prefix="action", mode=norm_mode)
-    return torch.from_numpy(np.asarray(normed, dtype=np.float32)).to(device)
-
-
-def _deploy_rtc(deploy_rtc: dict[str, Any] | None) -> dict[str, Any]:
-    out = dict(deploy_rtc or {})
-    out.pop("execution_horizon", None)
-    return out
-
-
-def _submit_interp_chunk(interp: ServoInterpolator, chunk: np.ndarray) -> None:
-    interp.submit(np.asarray(chunk, dtype=np.float64), time.perf_counter())
-
-
 def _phase_speed_scale(phase_actions: float, skip: int, speed_max: float) -> float:
     if phase_actions < float(skip):
         return 1.0
@@ -1002,6 +938,38 @@ def _apply_phase_slowdown(
     return out
 
 
+def _reanchor_leftover(
+    leftover_abs: torch.Tensor,
+    q_now: np.ndarray,
+    *,
+    stats: dict,
+    norm_mode: str,
+    joint_mask: np.ndarray,
+    device: torch.device,
+) -> torch.Tensor:
+    abs_np = leftover_abs.detach().cpu().numpy().astype(np.float32)
+    delta = subtract_joint_pose(abs_np, q_now.astype(np.float32), joint_mask)
+    normed = normalize(delta, stats, prefix="action", mode=norm_mode)
+    return torch.from_numpy(np.asarray(normed, dtype=np.float32)).to(device)
+
+
+def _deploy_rtc(deploy_rtc: dict[str, Any] | None) -> dict[str, Any]:
+    out = dict(deploy_rtc or {})
+    out.pop("execution_horizon", None)
+    return out
+
+
+def _submit_interp_chunk(interp: ServoInterpolator, chunk: np.ndarray) -> None:
+    interp.submit(np.asarray(chunk, dtype=np.float64), time.perf_counter())
+
+
+def _fill_joint_arr(joint_arr: Any, values: np.ndarray) -> None:
+    arr = np.asarray(values, dtype=np.float64).reshape(-1)
+    with joint_arr.get_lock():
+        for i, v in enumerate(arr[:16]):
+            joint_arr[i] = float(v)
+
+
 def _euro_snap(
     euro: OneEuroFilter,
 ) -> tuple[np.ndarray | None, np.ndarray, float | None]:
@@ -1106,6 +1074,7 @@ def _infer_worker(
     out_q: Any,
     ready_evt: Any,
     stop_evt: Any,
+    pose_ready: Any,
 ) -> None:
     signal.signal(signal.SIGINT, signal.SIG_IGN)
     try:
@@ -1217,6 +1186,10 @@ def _infer_worker(
             device=device,
             chunk_n=chunk_n,
         )
+        while not stop_evt.is_set() and not pose_ready.wait(timeout=0.05):
+            _gpu_keepalive(keep)
+        if stop_evt.is_set():
+            return
         infer_i = 0
         vel_phase = _VelPhase()
         while infer_i < max_steps and not stop_evt.is_set():
@@ -1439,16 +1412,10 @@ def main() -> None:
             raise ValueError(f"训练配置缺少 dataset.scale_mm_per_raw_unit[{cam}]")
 
     device = torch.device(cfg.train.device if torch.cuda.is_available() else "cpu")
-    predict_joint_delta = bool(cfg.policy.predict_joint_delta)
     joint_mask = joint_mask_from_names(cfg.action_names, cfg.action_dim)
     joint_idx = np.where(joint_mask)[0]
     if joint_idx.size != 14:
         raise ValueError(f"双臂关节维数应为 14，实际 {joint_idx.size}")
-    left_j = joint_idx[:7]
-    right_j = joint_idx[7:14]
-    grip_idx = np.where(~joint_mask)[0]
-    left_g_i = int(grip_idx[0]) if grip_idx.size >= 1 else 14
-    right_g_i = int(grip_idx[1]) if grip_idx.size >= 2 else 15
 
     halves = _cpu_affinity_halves()
     if halves is not None:
@@ -1472,11 +1439,77 @@ def main() -> None:
     send_thread: ServoSendThread | None = None
     infer_proc: mp.Process | None = None
     stop_evt = None
+    pose_ready = None
     watchdog: ServoWatchdogThread | None = None
     left_follower: HcxFollower | None = None
     right_follower: HcxFollower | None = None
     quit_keys: QuitKeyThread | None = None
     try:
+        _, _, source_hz = _direct_servo_config(teleop_yaml)
+        seed_l = np.asarray(
+            deploy["left_start_joints_deg"] or [0.0] * 7, dtype=np.float64
+        )
+        seed_r = np.asarray(
+            deploy["right_start_joints_deg"] or [0.0] * 7, dtype=np.float64
+        )
+        seed_lg = float(
+            1.0
+            if deploy["left_start_gripper"] is None
+            else deploy["left_start_gripper"]
+        )
+        seed_rg = float(
+            1.0
+            if deploy["right_start_gripper"] is None
+            else deploy["right_start_gripper"]
+        )
+        ctx = mp.get_context("spawn")
+        joint_arr = ctx.Array("d", 16)
+        _fill_joint_arr(
+            joint_arr,
+            np.concatenate(
+                [seed_l, seed_r, np.asarray([seed_lg, seed_rg], dtype=np.float64)]
+            ),
+        )
+        popped_val = ctx.Value("i", 0)
+        ack_val = ctx.Value("i", -1)
+        out_q = ctx.Queue(maxsize=4)
+        ready_evt = ctx.Event()
+        stop_evt = ctx.Event()
+        pose_ready = ctx.Event()
+        spec = {
+            "ckpt": str(ckpt_path),
+            "train_cfg": None if train_cfg_path is None else str(train_cfg_path),
+            "teleop_yaml": str(teleop_yaml),
+            "deploy_rtc": _deploy_rtc(deploy.get("rtc")),
+            "chunk": int(chunk_n),
+            "max_steps": int(max_steps),
+            "source_hz": int(source_hz),
+            "fps": float(train_fps),
+            "left_start": deploy["left_start_joints_deg"],
+            "right_start": deploy["right_start_joints_deg"],
+            "one_euro_enabled": bool(extra["one_euro_enabled"]),
+            "one_euro_mincutoff_hz": float(extra["one_euro_mincutoff_hz"]),
+            "one_euro_beta": float(extra["one_euro_beta"]),
+            "one_euro_dcutoff_hz": float(extra["one_euro_dcutoff_hz"]),
+        }
+        infer_proc = ctx.Process(
+            target=_infer_worker,
+            args=(
+                spec,
+                joint_arr,
+                popped_val,
+                ack_val,
+                out_q,
+                ready_evt,
+                stop_evt,
+                pose_ready,
+            ),
+            name="infer-worker",
+            daemon=True,
+        )
+        infer_proc.start()
+        print("[INFO] 推理进程已启动（与去起始位并行）", flush=True)
+
         (
             _hcx_connection,
             left_follower,
@@ -1505,6 +1538,12 @@ def main() -> None:
             )
             hw.right_gripper_loop.start(initial_opening=hold_right)
 
+        left_start = None
+        right_start = None
+        confirm_timeout_s = max(
+            float(deploy["move_feedback_confirm_timeout_s"]),
+            START_CONFIRM_TIMEOUT_S,
+        )
         if deploy["left_start_joints_deg"] is not None:
             left_start = _clamp_joints_by_limits(
                 deploy["left_start_joints_deg"],
@@ -1516,19 +1555,9 @@ def main() -> None:
                 left_start,
                 interrupt=False,
                 wait=False,
-                speed_ratio=deploy["move_speed_ratio"],
-                acceleration_seconds=deploy["move_acceleration_seconds"],
-                deceleration_seconds=deploy["move_deceleration_seconds"],
-            )
-            _confirm_targets_by_feedback(
-                hw,
-                left_start,
-                _read_hcx_joints(hw.right_arm, hw.right_start_joints_deg)
-                .astype(float)
-                .tolist(),
-                timeout_s=deploy["move_feedback_confirm_timeout_s"],
-                poll_interval_s=deploy["move_feedback_confirm_poll_interval_s"],
-                angle_tolerance_deg=deploy["move_angle_tolerance_deg"],
+                speed_ratio=START_SPEED_RATIO,
+                acceleration_seconds=START_ACCEL_S,
+                deceleration_seconds=START_DECEL_S,
             )
         if deploy["right_start_joints_deg"] is not None:
             right_start = _clamp_joints_by_limits(
@@ -1541,21 +1570,15 @@ def main() -> None:
                 right_start,
                 interrupt=False,
                 wait=False,
-                speed_ratio=deploy["move_speed_ratio"],
-                acceleration_seconds=deploy["move_acceleration_seconds"],
-                deceleration_seconds=deploy["move_deceleration_seconds"],
+                speed_ratio=START_SPEED_RATIO,
+                acceleration_seconds=START_ACCEL_S,
+                deceleration_seconds=START_DECEL_S,
             )
-            _confirm_targets_by_feedback(
-                hw,
-                _read_hcx_joints(hw.left_arm, hw.left_start_joints_deg)
-                .astype(float)
-                .tolist(),
-                right_start,
-                timeout_s=deploy["move_feedback_confirm_timeout_s"],
-                poll_interval_s=deploy["move_feedback_confirm_poll_interval_s"],
-                angle_tolerance_deg=deploy["move_angle_tolerance_deg"],
-            )
-
+        print(
+            f"[INFO] 去起始位 speed_ratio={START_SPEED_RATIO:g} "
+            f"acc={START_ACCEL_S:g}s dec={START_DECEL_S:g}s",
+            flush=True,
+        )
         _ramp_start_grippers(
             hw,
             left_target=deploy["left_start_gripper"],
@@ -1563,6 +1586,43 @@ def main() -> None:
             duration_s=deploy["start_gripper_ramp_s"],
             rate_hz=gripper_rate_hz,
         )
+        confirm_l = (
+            left_start
+            if left_start is not None
+            else _read_hcx_joints(hw.left_arm, hw.left_start_joints_deg)
+            .astype(float)
+            .tolist()
+        )
+        confirm_r = (
+            right_start
+            if right_start is not None
+            else _read_hcx_joints(hw.right_arm, hw.right_start_joints_deg)
+            .astype(float)
+            .tolist()
+        )
+        _confirm_targets_by_feedback(
+            hw,
+            confirm_l,
+            confirm_r,
+            timeout_s=confirm_timeout_s,
+            poll_interval_s=deploy["move_feedback_confirm_poll_interval_s"],
+            angle_tolerance_deg=deploy["move_angle_tolerance_deg"],
+        )
+        seed_l = _read_hcx_joints(hw.left_arm, hw.left_start_joints_deg)
+        seed_r = _read_hcx_joints(hw.right_arm, hw.right_start_joints_deg)
+        seed_lg = _read_gripper(hw.left_gripper, fallback=seed_lg)
+        seed_rg = _read_gripper(hw.right_gripper, fallback=seed_rg)
+        _fill_joint_arr(
+            joint_arr,
+            np.concatenate(
+                [
+                    np.asarray(seed_l, dtype=np.float64),
+                    np.asarray(seed_r, dtype=np.float64),
+                    np.asarray([seed_lg, seed_rg], dtype=np.float64),
+                ]
+            ),
+        )
+        pose_ready.set()
 
         follow_l_lo, follow_l_hi = left_follower.joint_limits_deg
         follow_r_lo, follow_r_hi = right_follower.joint_limits_deg
@@ -1598,47 +1658,6 @@ def main() -> None:
             kalman_q=float(extra["kalman_q"]),
             kalman_r=float(extra["kalman_r"]),
         )
-        seed_l = _read_hcx_joints(hw.left_arm, hw.left_start_joints_deg)
-        seed_r = _read_hcx_joints(hw.right_arm, hw.right_start_joints_deg)
-        seed_lg = _read_gripper(hw.left_gripper, fallback=1.0)
-        seed_rg = _read_gripper(hw.right_gripper, fallback=1.0)
-        seed = np.concatenate(
-            [seed_l, seed_r, np.asarray([seed_lg, seed_rg], dtype=np.float32)]
-        ).astype(np.float64)
-        ctx = mp.get_context("spawn")
-        joint_arr = ctx.Array("d", 16)
-        with joint_arr.get_lock():
-            for i, v in enumerate(seed.tolist()):
-                joint_arr[i] = float(v)
-        popped_val = ctx.Value("i", 0)
-        ack_val = ctx.Value("i", -1)
-        out_q = ctx.Queue(maxsize=4)
-        ready_evt = ctx.Event()
-        stop_evt = ctx.Event()
-        spec = {
-            "ckpt": str(ckpt_path),
-            "train_cfg": None if train_cfg_path is None else str(train_cfg_path),
-            "teleop_yaml": str(teleop_yaml),
-            "deploy_rtc": _deploy_rtc(deploy.get("rtc")),
-            "chunk": int(chunk_n),
-            "max_steps": int(max_steps),
-            "source_hz": int(source_hz),
-            "fps": float(train_fps),
-            "left_start": deploy["left_start_joints_deg"],
-            "right_start": deploy["right_start_joints_deg"],
-            "one_euro_enabled": bool(extra["one_euro_enabled"]),
-            "one_euro_mincutoff_hz": float(extra["one_euro_mincutoff_hz"]),
-            "one_euro_beta": float(extra["one_euro_beta"]),
-            "one_euro_dcutoff_hz": float(extra["one_euro_dcutoff_hz"]),
-        }
-        infer_proc = ctx.Process(
-            target=_infer_worker,
-            args=(spec, joint_arr, popped_val, ack_val, out_q, ready_evt, stop_evt),
-            name="infer-worker",
-            daemon=True,
-        )
-        infer_proc.start()
-        print("[INFO] 推理进程已启动", flush=True)
         if not ready_evt.wait(timeout=180.0):
             raise RuntimeError("推理进程启动超时")
         item = out_q.get(timeout=30.0)
@@ -1647,10 +1666,12 @@ def main() -> None:
         _submit_interp_chunk(interp, np.asarray(item["chunk"], dtype=np.float64))
         popped_val.value = 0
         ack_val.value = int(item["infer_i"])
+        cmd_gl = float(item["grip_l"])
+        cmd_gr = float(item["grip_r"])
         if hw.left_gripper_loop is not None:
-            hw.left_gripper_loop.set_opening(float(item["grip_l"]))
+            hw.left_gripper_loop.set_opening(cmd_gl)
         if hw.right_gripper_loop is not None:
-            hw.right_gripper_loop.set_opening(float(item["grip_r"]))
+            hw.right_gripper_loop.set_opening(cmd_gr)
         print(
             f"[INFO] infer={item['infer_i']} leftover={item['leftover']} "
             f"delay={item['delay']} qsize={item['qsize']} "
@@ -1683,8 +1704,6 @@ def main() -> None:
         phase: str | None = None
         phase_actions = 0.0
         last_prog = 0.0
-        cmd_gl = float(item["grip_l"])
-        cmd_gr = float(item["grip_r"])
         while True:
             if quit_keys.pressed():
                 print("\n[INFO] 收到 q，停止伺服", flush=True)
@@ -1708,10 +1727,14 @@ def main() -> None:
             dprog = max(0.0, prog - last_prog)
             last_prog = prog
             left_open = cmd_gl > GRIP_OPEN
+            left_closed = cmd_gl < GRIP_CLOSED
             right_closed = cmd_gr < GRIP_CLOSED
+            right_moving = interp.right_path() > RIGHT_MOVE_PATH
             new_phase: str | None = None
             if right_closed and left_open:
                 new_phase = "A"
+            elif left_closed and not right_moving:
+                new_phase = "B"
             if new_phase != phase:
                 phase = new_phase
                 phase_actions = 0.0
@@ -1719,11 +1742,21 @@ def main() -> None:
                 phase_actions += dprog
             if phase == "A":
                 scale = _phase_speed_scale(phase_actions, SKIP_PHASE_A, SPEED_MAX_A)
+                interp.set_left_speed_scale(1.0)
+                interp.set_speed_scale(scale)
+                right_vel = max(scale, SPEED_MAX_A if right_closed else 1.0)
+                send_thread.set_max_vel(base_max_vel * scale, base_max_vel * right_vel)
+            elif phase == "B":
+                scale_b = _phase_speed_scale(phase_actions, SKIP_PHASE_B, SPEED_MAX_B)
+                interp.set_left_speed_scale(scale_b)
+                interp.set_speed_scale(1.0)
+                right_vel = SPEED_MAX_A if right_closed else 1.0
+                send_thread.set_max_vel(base_max_vel * scale_b, base_max_vel * right_vel)
             else:
-                scale = 1.0
-            interp.set_speed_scale(scale)
-            right_vel = max(scale, SPEED_MAX_A if right_closed else 1.0)
-            send_thread.set_max_vel(base_max_vel * scale, base_max_vel * right_vel)
+                interp.set_left_speed_scale(1.0)
+                interp.set_speed_scale(1.0)
+                right_vel = SPEED_MAX_A if right_closed else 1.0
+                send_thread.set_max_vel(base_max_vel, base_max_vel * right_vel)
             popped_val.value = int(send_thread.popped())
             if infer_proc is not None and not infer_proc.is_alive():
                 try:
@@ -1774,6 +1807,8 @@ def main() -> None:
                 pass
         if stop_evt is not None:
             stop_evt.set()
+        if pose_ready is not None:
+            pose_ready.set()
         if infer_proc is not None:
             infer_proc.join(timeout=5.0)
             if infer_proc.is_alive():
