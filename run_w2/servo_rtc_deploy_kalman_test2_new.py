@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-# 做了初步的加减速
 from __future__ import annotations
 
 import argparse
 import gc
+import json
 import math
 import multiprocessing as mp
 import os
@@ -15,6 +15,7 @@ import threading
 import time
 import tty
 from collections import deque
+from collections.abc import Callable
 from pathlib import Path
 from queue import Empty, Full
 from typing import Any
@@ -47,19 +48,14 @@ from robotfm.train import build_policy
 from robotfm.types import Observation
 from run import (
     BackgroundGripperLoop,
-    CameraPreviewLoop,
     DUAL_ARM_CAMERAS,
     HardwareBundle,
-    PREVIEW_FPS,
     _apply_rtc_overrides,
     _clamp_joints_by_limits,
     _clamp_joints_by_max_delta,
     _confirm_targets_by_feedback,
     _connect_dual_grippers,
     _load_deploy_config,
-    _log_inference_result,
-    _log_inference_state_input,
-    _pump_camera_preview,
     _ramp_start_grippers,
     _read_gripper,
     _read_hcx_joints,
@@ -69,8 +65,12 @@ from run import (
 )
 from run_dual_arm_depth import (
     HeadTriggeredCapture,
+    _as_uint16_depth,
+    _as_uint8_rgb,
     _build_obs_batch,
+    _check_scale_mm_per_raw_unit,
     _connect_record_cameras,
+    _describe_rgbd_issue,
     _prepare_rgbd_observation,
 )
 from teleop_sdk.adapters.hcx import (
@@ -84,24 +84,23 @@ from teleop_sdk.filters import OneEuroFilter
 
 ARM_SERVO_HZ = 500
 ARM_RATE_FAIL_HZ = 450.0
-_LOG_STATE_INPUT_EVERY = 25
-_LOG_RESULT_EVERY = 5
 GRIP_CLOSED = 0.2
 GRIP_OPEN = 0.45
 SKIP_PHASE_A = 20
-SKIP_PHASE_B = 10
+SKIP_PHASE_B = 5
 RAMP_ACTIONS = 15
 SPEED_MAX_A = 1.8
-SPEED_MAX_B = 1.5
+SPEED_MAX_B = 2.0
+RIGHT_MOVE_PATH = 2.0
 GL_STILL_OPEN = 0.25
 GL_WILL_CLOSE = 0.15
 GR_IS_OPEN = 0.6
-R0_LIFTED = -100.0
-R0_DOWN = -90.0
-PATH_IDLE = 2.0
-PATH_LIFT = 8.0
-DR0_LIFT = -0.4
-DR0_FWD = 0.4
+RIGHT_CLOSE_PRE_N = 16
+START_SPEED_RATIO = 0.1
+START_ACCEL_S = 0.5
+START_DECEL_S = 0.5
+START_CONFIRM_TIMEOUT_S = 60.0
+HCX_LIMITED_MAX_VEL_DEG_S = 150.0
 
 
 class QuitKeyThread:
@@ -382,17 +381,18 @@ class ServoInterpolator:
         self._lock = threading.Lock()
         self._points: np.ndarray | None = None
         self._t0 = 0.0
-        self._popped = 0
+        self._t0_l = 0.0
+        self._t0_r = 0.0
         self._speed_scale = 1.0
-        self._x = 0.0
+        self._speed_scale_l = 1.0
 
     def submit(self, points: np.ndarray, t0: float) -> None:
         pts = np.asarray(points, dtype=np.float64).reshape(-1, self._n_joints)
         with self._lock:
             self._points = pts
             self._t0 = float(t0)
-            self._popped = 0
-            self._x = 0.0
+            self._t0_l = float(t0)
+            self._t0_r = float(t0)
 
     def set_speed_scale(self, scale: float, t: float | None = None) -> None:
         scale = max(1e-6, float(scale))
@@ -400,54 +400,77 @@ class ServoInterpolator:
         with self._lock:
             if abs(scale - self._speed_scale) < 1e-9:
                 return
-            x = (now - self._t0) * self._fps * self._speed_scale
+            x = (now - self._t0_r) * self._fps * self._speed_scale
             self._speed_scale = scale
-            self._t0 = now - x / (self._fps * self._speed_scale)
-            self._x = x
+            self._t0_r = now - x / (self._fps * self._speed_scale)
+
+    def set_left_speed_scale(self, scale: float, t: float | None = None) -> None:
+        scale = max(1e-6, float(scale))
+        now = time.perf_counter() if t is None else float(t)
+        with self._lock:
+            if abs(scale - self._speed_scale_l) < 1e-9:
+                return
+            x = (now - self._t0_l) * self._fps * self._speed_scale_l
+            self._speed_scale_l = scale
+            self._t0_l = now - x / (self._fps * self._speed_scale_l)
 
     def speed_scale(self) -> float:
         with self._lock:
             return float(self._speed_scale)
 
+    def _left_x(self, t: float, n: int) -> float:
+        x = (t - self._t0_l) * self._fps * self._speed_scale_l
+        return float(max(0.0, min(x, float(max(n - 1, 0)))))
+
     def progress(self) -> float:
         with self._lock:
             if self._points is None:
                 return 0.0
-            t = time.perf_counter()
-            x = (t - self._t0) * self._fps * self._speed_scale
-            n = len(self._points)
-            return float(max(0.0, min(x, float(max(n - 1, 0)))))
+            return self._left_x(time.perf_counter(), len(self._points))
 
     def sample(self, t: float) -> np.ndarray | None:
         with self._lock:
             if self._points is None:
                 return None
-            x = (t - self._t0) * self._fps * self._speed_scale
-            n = len(self._points)
-            self._x = x
-            if x <= 0.0:
-                target = self._points[0]
-            elif x >= n - 1:
-                target = self._points[-1]
-            else:
-                i = int(math.floor(x))
-                alpha = x - i
-                target = self._points[i] * (1.0 - alpha) + self._points[i + 1] * alpha
-            return target.copy()
-
-    def mark_sent(self) -> None:
-        with self._lock:
-            self._popped += 1
+            pts = self._points
+            n = len(pts)
+            x_l = (t - self._t0_l) * self._fps * self._speed_scale_l
+            x_r = (t - self._t0_r) * self._fps * self._speed_scale
+            left = _interp_row(pts[:, :7], x_l, n)
+            right = _interp_row(pts[:, 7:14], x_r, n)
+            return np.concatenate([left, right])
 
     def popped(self) -> int:
         with self._lock:
             if self._points is None:
                 return 0
-            t = time.perf_counter()
-            x = (t - self._t0) * self._fps * self._speed_scale
             n = len(self._points)
-            x = max(0.0, min(x, float(max(n - 1, 0))))
+            x = self._left_x(time.perf_counter(), n)
             return int(x * self._servo_hz / self._fps)
+
+    def right_path(self) -> float:
+        with self._lock:
+            if self._points is None:
+                return 0.0
+            right = self._points[:, 7:14]
+            if right.shape[0] < 2:
+                return 0.0
+            step = np.linalg.norm(np.diff(right, axis=0), axis=1)
+            return float(step.sum())
+
+
+def _interp_row(pts: np.ndarray, x: float, n: int) -> np.ndarray:
+    if x <= 0.0:
+        return pts[0].copy()
+    if x >= n - 1:
+        return pts[-1].copy()
+    i = int(math.floor(x))
+    alpha = x - i
+    return pts[i] * (1.0 - alpha) + pts[i + 1] * alpha
+
+
+def _clamp_servo_vel(vel_deg_s: float) -> float:
+    return min(max(float(vel_deg_s), 1e-3), HCX_LIMITED_MAX_VEL_DEG_S)
 
 
 class _JointCVKalman:
@@ -527,7 +550,9 @@ class ServoSendThread:
         self._tau_s = float(tau_s)
         self._tau2_s = float(tau2_s)
         self._deadband_deg = float(deadband_deg)
-        self._max_vel_deg_s = float(max_vel_deg_s)
+        vel = _clamp_servo_vel(max_vel_deg_s)
+        self._max_vel_l_deg_s = vel
+        self._max_vel_r_deg_s = vel
         self._max_delta_deg = float(max_delta_deg)
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
@@ -566,8 +591,14 @@ class ServoSendThread:
     def popped(self) -> int:
         return self._interp.popped()
 
-    def set_max_vel(self, max_vel_deg_s: float) -> None:
-        self._max_vel_deg_s = float(max_vel_deg_s)
+    def set_max_vel(
+        self, max_vel_deg_s: float, right_deg_s: float | None = None
+    ) -> None:
+        left_v = _clamp_servo_vel(max_vel_deg_s)
+        right_v = left_v if right_deg_s is None else _clamp_servo_vel(right_deg_s)
+        with self._cmd_lock:
+            self._max_vel_l_deg_s = left_v
+            self._max_vel_r_deg_s = right_v
 
     def latest_joints(self) -> np.ndarray | None:
         with self._cmd_lock:
@@ -586,6 +617,7 @@ class ServoSendThread:
         follow_hi: np.ndarray,
         dt: float,
         kf: _JointCVKalman | None,
+        max_vel_deg_s: float,
     ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
         desired = np.asarray(desired, dtype=np.float64).reshape(7)
         if last is None:
@@ -611,10 +643,13 @@ class ServoSendThread:
         else:
             f2 = f1
         filt = f2 if kf is None else kf.step(f2, dt)
-        max_step = self._max_vel_deg_s * dt
+        max_step = float(max_vel_deg_s) * dt
         cmd = last + np.clip(filt - last, -max_step, max_step)
         cmd = np.clip(cmd, self._lo, self._hi)
         cmd = np.clip(cmd, follow_lo, follow_hi)
+        if kf is not None:
+            kf._p = cmd.copy()
+            kf._v = (cmd - last) / max(float(dt), 1e-6)
         return (
             cmd,
             np.array(f1, dtype=np.float64, copy=True),
@@ -633,6 +668,9 @@ class ServoSendThread:
                 if target is not None:
                     left_des = target[:7]
                     right_des = target[7:14]
+                    with self._cmd_lock:
+                        vel_l = self._max_vel_l_deg_s
+                        vel_r = self._max_vel_r_deg_s
                     left_cmd, self._f1_l, self._f2_l = self._shape_arm(
                         left_des,
                         last=self._last_l,
@@ -642,6 +680,7 @@ class ServoSendThread:
                         follow_hi=self._follow_l_hi,
                         dt=dt,
                         kf=self._kf_l,
+                        max_vel_deg_s=vel_l,
                     )
                     right_cmd, self._f1_r, self._f2_r = self._shape_arm(
                         right_des,
@@ -652,13 +691,13 @@ class ServoSendThread:
                         follow_hi=self._follow_r_hi,
                         dt=dt,
                         kf=self._kf_r,
+                        max_vel_deg_s=vel_r,
                     )
                     with self._cmd_lock:
                         self._last_l = left_cmd.copy()
                         self._last_r = right_cmd.copy()
                     self._left.send_joint_angles_deg(left_cmd, self._dt)
                     self._right.send_joint_angles_deg(right_cmd, self._dt)
-                    self._interp.mark_sent()
                 next_t += self._dt
                 sleep_s = next_t - time.perf_counter()
                 if sleep_s > 0.0:
@@ -788,67 +827,120 @@ def _sync_action_queue_index(
         return action_queue.last_index
 
 
-def _interpolate_policy_to_servo(
-    phys: np.ndarray,
-    *,
-    train_fps: float,
-    servo_hz: int,
-    skip_policy_steps: int,
-) -> np.ndarray:
-    pts = np.asarray(phys, dtype=np.float64)
-    if pts.ndim != 2 or pts.shape[0] < 1:
-        raise ValueError(f"策略动作形状异常: {pts.shape}")
-    skip = max(0, min(int(skip_policy_steps), int(pts.shape[0]) - 1))
-    remain = pts[skip:]
-    n_pol = int(remain.shape[0])
-    n_hz = max(1, int(round(float(n_pol) * float(servo_hz) / float(train_fps))))
-    if n_pol == 1:
-        return np.repeat(remain, n_hz, axis=0)
-    x = np.linspace(0.0, float(n_pol - 1), n_hz, dtype=np.float64)
-    i0 = np.floor(x).astype(np.int64)
-    i1 = np.minimum(i0 + 1, n_pol - 1)
-    a = (x - i0.astype(np.float64))[:, None]
-    return remain[i0] * (1.0 - a) + remain[i1] * a
+def _phase_speed_scale(phase_actions: float, skip: int, speed_max: float) -> float:
+    if phase_actions < float(skip):
+        return 1.0
+    ramp_t = (float(phase_actions) - float(skip)) / float(RAMP_ACTIONS)
+    if ramp_t >= 1.0:
+        return float(speed_max)
+    return 1.0 + (float(speed_max) - 1.0) * ramp_t
 
 
-def _shape_arm_traj(
-    desired: np.ndarray,
-    *,
-    last: np.ndarray | None,
-    lo: np.ndarray,
-    hi: np.ndarray,
-    follow_lo: np.ndarray,
-    follow_hi: np.ndarray,
-    tau_s: float,
-    max_vel_deg_s: float,
-    max_delta_deg: float,
-    dt: float,
+class _VelPhase:
+    def __init__(self) -> None:
+        self.right_post_close_i = 0
+
+
+def _close_scale(steps_to_k: int) -> float:
+    if steps_to_k > 8:
+        return 1.0
+    if steps_to_k > 4:
+        return 0.6
+    if steps_to_k > 1:
+        return 0.3
+    return 0.15
+
+
+def _right_step_scale(
+    g: float, phase: _VelPhase, wait_n: int, *, left_open: bool
+) -> float:
+    if g > GR_IS_OPEN:
+        phase.right_post_close_i = 0
+        return 1.0
+    if g < GRIP_CLOSED:
+        ready = phase.right_post_close_i >= wait_n
+        phase.right_post_close_i += 1
+        if left_open:
+            return 1.0
+        return SPEED_MAX_A if ready else 1.0
+    if left_open:
+        return 1.0
+    return SPEED_MAX_A if phase.right_post_close_i >= wait_n else 1.0
+
+
+def _scale_joint_deltas(
+    seq: np.ndarray, idx: np.ndarray, scales: np.ndarray
 ) -> np.ndarray:
-    n = int(desired.shape[0])
-    out = np.empty((n, 7), dtype=np.float64)
-    cur = None if last is None else np.asarray(last, dtype=np.float64).reshape(7)
-    filt = None if cur is None else cur.copy()
-    max_step = float(max_vel_deg_s) * float(dt)
-    for i in range(n):
-        des = np.asarray(desired[i], dtype=np.float64).reshape(7)
-        if cur is None:
-            cmd = np.clip(des, lo, hi)
-            cmd = np.clip(cmd, follow_lo, follow_hi)
-            cur = cmd
-            filt = cmd.copy()
-            out[i] = cmd
-            continue
-        clamped, _ = _clamp_joints_by_max_delta(des, cur, max_delta_deg)
-        des = np.asarray(clamped, dtype=np.float64)
-        if tau_s > 0.0 and filt is not None:
-            alpha = dt / (tau_s + dt)
-            des = filt + alpha * (des - filt)
-            filt = des
-        cmd = cur + np.clip(des - cur, -max_step, max_step)
-        cmd = np.clip(cmd, lo, hi)
-        cmd = np.clip(cmd, follow_lo, follow_hi)
-        cur = cmd
-        out[i] = cmd
+    out = np.array(seq, dtype=np.float32, copy=True)
+    cols = np.asarray(idx)
+    t = int(seq.shape[0])
+    for i in range(1, t):
+        d = seq[i, cols] - seq[i - 1, cols]
+        out[i, cols] = out[i - 1, cols] + np.float32(scales[i - 1]) * d
+    return out
+
+
+def _apply_phase_slowdown(
+    processed: np.ndarray,
+    skip: int,
+    left_j: np.ndarray,
+    right_j: np.ndarray,
+    left_g_i: int,
+    right_g_i: int,
+    phase: _VelPhase,
+    fps: float,
+) -> np.ndarray:
+    n = int(processed.shape[0])
+    skip_i = max(0, min(int(skip), n - 1))
+    remain = np.array(processed[skip_i:], dtype=np.float32, copy=True)
+    t = int(remain.shape[0])
+    wait_n = max(1, int(round(float(fps) * 2.0)))
+    if t < 2:
+        if t >= 1:
+            _right_step_scale(
+                float(remain[0, right_g_i]),
+                phase,
+                wait_n,
+                left_open=float(remain[0, left_g_i]) > GRIP_OPEN,
+            )
+        return processed
+    g_l = remain[:, left_g_i]
+    g_r = remain[:, right_g_i]
+    if float(g_l[0]) > GL_STILL_OPEN:
+        below = np.where(g_l < GL_WILL_CLOSE)[0]
+        if below.size:
+            k = int(below[0])
+            s_l = np.array(
+                [_close_scale(k - i) for i in range(t - 1)], dtype=np.float64
+            )
+            remain = _scale_joint_deltas(remain, left_j, s_l)
+    r_close_k: int | None = None
+    if float(g_r[0]) >= GRIP_CLOSED:
+        below_r = np.where(g_r < GRIP_CLOSED)[0]
+        if below_r.size:
+            r_close_k = int(below_r[0])
+    s_r = np.ones(t - 1, dtype=np.float64)
+    apply_r = False
+    for i in range(t - 1):
+        dist = (r_close_k - i) if r_close_k is not None else None
+        left_open_i = float(g_l[i]) > GRIP_OPEN
+        if dist is not None and 1 <= dist <= RIGHT_CLOSE_PRE_N:
+            _right_step_scale(
+                float(g_r[i]), phase, wait_n, left_open=left_open_i
+            )
+            s_r[i] = 0.5
+            apply_r = True
+        else:
+            s = _right_step_scale(
+                float(g_r[i]), phase, wait_n, left_open=left_open_i
+            )
+            s_r[i] = s
+            if s != 1.0:
+                apply_r = True
+    if apply_r:
+        remain = _scale_joint_deltas(remain, right_j, s_r)
+    out = np.array(processed, dtype=np.float32, copy=True)
+    out[skip_i:] = remain
     return out
 
 
@@ -877,128 +969,11 @@ def _submit_interp_chunk(interp: ServoInterpolator, chunk: np.ndarray) -> None:
     interp.submit(np.asarray(chunk, dtype=np.float64), time.perf_counter())
 
 
-def _phase_speed_scale(phase_actions: float, skip: int, speed_max: float) -> float:
-    if phase_actions < float(skip):
-        return 1.0
-    ramp_t = (float(phase_actions) - float(skip)) / float(RAMP_ACTIONS)
-    if ramp_t >= 1.0:
-        return float(speed_max)
-    return 1.0 + (float(speed_max) - 1.0) * ramp_t
-
-
-class _VelPhase:
-    def __init__(self) -> None:
-        self.lifted = False
-        self.prev_path = 0.0
-
-
-def _close_scale(steps_to_k: int) -> float:
-    if steps_to_k > 8:
-        return 1.0
-    if steps_to_k > 4:
-        return 0.6
-    if steps_to_k > 1:
-        return 0.3
-    return 0.15
-
-
-def _path_scale(path_i: float) -> float:
-    if path_i > 15.0:
-        return 1.0
-    if path_i > 8.0:
-        return 0.5
-    if path_i > 3.0:
-        return 0.25
-    return 0.1
-
-
-def _ease_in_scale(i: int) -> float:
-    if i <= 1:
-        return 0.15
-    if i <= 3:
-        return 0.3
-    if i <= 5:
-        return 0.6
-    return 1.0
-
-
-def _scale_joint_deltas(
-    seq: np.ndarray, idx: np.ndarray, scales: np.ndarray
-) -> np.ndarray:
-    out = np.array(seq, dtype=np.float32, copy=True)
-    cols = np.asarray(idx)
-    t = int(seq.shape[0])
-    for i in range(1, t):
-        d = seq[i, cols] - seq[i - 1, cols]
-        out[i, cols] = out[i - 1, cols] + np.float32(scales[i - 1]) * d
-    return out
-
-
-def _right_path(remain: np.ndarray, right_j: np.ndarray) -> tuple[float, np.ndarray]:
-    right = remain[:, right_j]
-    if right.shape[0] < 2:
-        return 0.0, np.zeros(0, dtype=np.float64)
-    step = np.linalg.norm(np.diff(right, axis=0), axis=1)
-    path_from = np.cumsum(step[::-1])[::-1]
-    return float(step.sum()), path_from.astype(np.float64, copy=False)
-
-
-def _apply_phase_slowdown(
-    processed: np.ndarray,
-    skip: int,
-    left_j: np.ndarray,
-    right_j: np.ndarray,
-    left_g_i: int,
-    right_g_i: int,
-    phase: _VelPhase,
-) -> np.ndarray:
-    n = int(processed.shape[0])
-    skip_i = max(0, min(int(skip), n - 1))
-    remain = np.array(processed[skip_i:], dtype=np.float32, copy=True)
-    t = int(remain.shape[0])
-    if t < 2:
-        phase.prev_path = 0.0
-        return processed
-    path, path_from = _right_path(remain, right_j)
-    r0 = remain[:, int(right_j[0])]
-    d_r0 = np.diff(r0.astype(np.float64))
-    d_r0_mean = float(d_r0.mean()) if d_r0.size else 0.0
-    g_l = remain[:, left_g_i]
-    g_r0 = float(remain[0, right_g_i])
-    if float(g_l[0]) > GL_STILL_OPEN:
-        below = np.where(g_l < GL_WILL_CLOSE)[0]
-        if below.size:
-            k = int(below[0])
-            s_l = np.array(
-                [_close_scale(k - i) for i in range(t - 1)], dtype=np.float64
-            )
-            remain = _scale_joint_deltas(remain, left_j, s_l)
-    if float(r0.min()) < R0_LIFTED:
-        phase.lifted = True
-    if float(r0[0]) > R0_DOWN and path < PATH_IDLE:
-        phase.lifted = False
-    s_r = np.ones(t - 1, dtype=np.float64)
-    apply_r = False
-    lifting = g_r0 > GR_IS_OPEN and d_r0_mean < DR0_LIFT
-    from_rest = phase.prev_path < PATH_IDLE
-    if lifting and from_rest and path > PATH_LIFT:
-        apply_r = True
-        for i in range(t - 1):
-            s_r[i] = min(_ease_in_scale(i), _path_scale(float(path_from[i])))
-    elif lifting and not from_rest:
-        apply_r = True
-        for i in range(t - 1):
-            s_r[i] = _path_scale(float(path_from[i]))
-    elif phase.lifted and d_r0_mean > DR0_FWD:
-        apply_r = True
-        for i in range(t - 1):
-            s_r[i] = _path_scale(float(path_from[i]))
-    if apply_r:
-        remain = _scale_joint_deltas(remain, right_j, s_r)
-    phase.prev_path = path
-    out = np.array(processed, dtype=np.float32, copy=True)
-    out[skip_i:] = remain
-    return out
+def _fill_joint_arr(joint_arr: Any, values: np.ndarray) -> None:
+    arr = np.asarray(values, dtype=np.float64).reshape(-1)
+    with joint_arr.get_lock():
+        for i, v in enumerate(arr[:16]):
+            joint_arr[i] = float(v)
 
 
 def _euro_snap(
@@ -1070,6 +1045,124 @@ def _gpu_keepalive(keep: torch.Tensor | None) -> None:
         keep.add_(0.0)
 
 
+class KeepaliveHeadCapture(HeadTriggeredCapture):
+    def __init__(
+        self,
+        camera_manager: Any,
+        depth_cameras: tuple[str, ...] | list[str],
+        expected_scale_mm: dict[str, float],
+        on_wait: Callable[[], None] | None = None,
+    ) -> None:
+        super().__init__(camera_manager, depth_cameras, expected_scale_mm)
+        self._on_wait = on_wait
+
+    def _idle(self) -> None:
+        if self._on_wait is not None:
+            self._on_wait()
+        time.sleep(0.005)
+
+    def capture(
+        self, *, timeout_s: float = 2.0
+    ) -> tuple[dict[str, np.ndarray], dict[str, np.ndarray]]:
+        self._head_seq = int(self._head.latest_sequence())
+        deadline = time.perf_counter() + timeout_s
+        head_item = None
+        while time.perf_counter() < deadline:
+            head_item = self._head.get_next_frame_after(self._head_seq)
+            if head_item is not None:
+                break
+            self._idle()
+        if head_item is None:
+            details = [_describe_rgbd_issue(self._head, "head", need_depth=False)]
+            details.extend(
+                _describe_rgbd_issue(cam, name, need_depth=True)
+                for name, cam in self._hands.items()
+            )
+            raise TimeoutError(
+                f"等待 head 新帧超时 ({timeout_s}s)。\n"
+                + "\n".join(f"  - {line}" for line in details)
+            )
+        seq, head_frame = head_item
+        self._head_seq = int(seq)
+        if head_frame is None or head_frame.rgb is None:
+            raise RuntimeError("head 新帧缺少 RGB")
+        master_ns = int(head_frame.capture_monotonic_ns)
+
+        images = {"head": _as_uint8_rgb(head_frame.rgb, "head")}
+        depths: dict[str, np.ndarray] = {}
+        for name, cam in self._hands.items():
+            hand_frame = None
+            while time.perf_counter() < deadline:
+                candidate = cam.get_frame_at_or_before(master_ns)
+                if (
+                    candidate is not None
+                    and candidate.rgb is not None
+                    and candidate.depth is not None
+                    and candidate.meters_per_raw_unit is not None
+                    and int(candidate.capture_monotonic_ns) <= master_ns
+                ):
+                    hand_frame = candidate
+                    break
+                self._idle()
+            if hand_frame is None:
+                details = [_describe_rgbd_issue(self._head, "head", need_depth=False)]
+                details.extend(
+                    _describe_rgbd_issue(c, n, need_depth=True)
+                    for n, c in self._hands.items()
+                )
+                raise TimeoutError(
+                    f"{name} 没有不晚于 head 的 RGB-D 帧 (head_ns={master_ns})。\n"
+                    + "\n".join(f"  - {line}" for line in details)
+                )
+            depth, scale_mm = _as_uint16_depth(
+                hand_frame.depth, float(hand_frame.meters_per_raw_unit), name
+            )
+            _check_scale_mm_per_raw_unit(name, scale_mm, self._expected_scale_mm)
+            rgb_hand = _as_uint8_rgb(hand_frame.rgb, name)
+            if rgb_hand.shape[:2] != depth.shape:
+                raise RuntimeError(
+                    f"{name} RGB 与 depth 尺寸不一致: rgb={rgb_hand.shape} depth={depth.shape}"
+                )
+            if name not in self._logged_scale:
+                print(
+                    f"[INFO] observation.depth.{name} scale={scale_mm:g} mm/raw-unit",
+                    flush=True,
+                )
+                self._logged_scale.add(name)
+            images[name] = rgb_hand
+            depths[name] = depth
+        return images, depths
+
+
+def _infer_trace_record(item: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "infer_i": int(item["infer_i"]),
+        "leftover": int(item["leftover"]),
+        "leftover_none": bool(item["leftover_none"]),
+        "delay": int(item["delay"]),
+        "infer_delay": int(item["infer_delay"]),
+        "exec_h": int(item["exec_h"]),
+        "qsize": int(item["qsize"]),
+        "capture_ms": float(item["capture_ms"]),
+        "infer_ms": float(item["infer_ms"]),
+    }
+
+
+def _append_infer_trace(path: Path, item: dict[str, Any]) -> None:
+    with path.open("a", encoding="utf-8") as f:
+        f.write(json.dumps(_infer_trace_record(item), ensure_ascii=False) + "\n")
+
+
+def _format_infer_info(item: dict[str, Any]) -> str:
+    return (
+        f"[INFO] infer={item['infer_i']} leftover={item['leftover']} "
+        f"leftover_none={int(bool(item['leftover_none']))} "
+        f"delay={item['delay']} infer_delay={item['infer_delay']} "
+        f"exec_h={item['exec_h']} qsize={item['qsize']} "
+        f"capture_ms={item['capture_ms']:.0f} infer_ms={item['infer_ms']:.0f}"
+    )
+
+
 def _sample_actions_timed(
     policy: Any,
     batch: dict[str, torch.Tensor],
@@ -1105,6 +1198,7 @@ def _infer_worker(
     out_q: Any,
     ready_evt: Any,
     stop_evt: Any,
+    pose_ready: Any,
 ) -> None:
     signal.signal(signal.SIGINT, signal.SIG_IGN)
     try:
@@ -1173,10 +1267,11 @@ def _infer_worker(
             right_start_joints_deg=spec["right_start"],
         )
         hw.camera_manager = _connect_record_cameras(teleop_yaml)
-        hw.camera_capture = HeadTriggeredCapture(
+        hw.camera_capture = KeepaliveHeadCapture(
             hw.camera_manager,
             depth_cameras=depth_cameras,
             expected_scale_mm=expected_scale_mm,
+            on_wait=lambda: _gpu_keepalive(keep),
         )
         obs_kw = dict(
             image_size=image_size,
@@ -1216,6 +1311,31 @@ def _infer_worker(
             device=device,
             chunk_n=chunk_n,
         )
+        warmup_left = torch.zeros(
+            chunk_n, int(cfg.action_dim), device=device, dtype=torch.float32
+        )
+        _, _ = _sample_actions_timed(
+            policy,
+            warmup_batch,
+            leftover=warmup_left,
+            inference_delay=2,
+            execution_horizon=4,
+            device=device,
+            chunk_n=chunk_n,
+        )
+        _, _ = _sample_actions_timed(
+            policy,
+            warmup_batch,
+            leftover=warmup_left,
+            inference_delay=4,
+            execution_horizon=6,
+            device=device,
+            chunk_n=chunk_n,
+        )
+        while not stop_evt.is_set() and not pose_ready.wait(timeout=0.05):
+            _gpu_keepalive(keep)
+        if stop_evt.is_set():
+            return
         infer_i = 0
         vel_phase = _VelPhase()
         while infer_i < max_steps and not stop_evt.is_set():
@@ -1233,11 +1353,16 @@ def _infer_worker(
             leftover = action_queue.get_left_over()
             if leftover is not None and leftover.shape[0] == 0:
                 leftover = None
+            leftover_none = leftover is None
             leftover_len = 0 if leftover is None else int(leftover.shape[0])
             exec_h = infer_delay + 2
             if leftover_len > 0:
                 exec_h = min(exec_h, leftover_len)
+            elif leftover_none and infer_i > 0:
+                exec_h = 0
+            t_cap = time.perf_counter()
             obs = _capture_infer_obs(hw, list(cameras), joint_arr, **obs_kw)
+            capture_ms = (time.perf_counter() - t_cap) * 1e3
             obs_history = [obs]
             q_now = np.asarray(obs_history[-1].state, dtype=np.float32)
             batch = _build_obs_batch(
@@ -1272,6 +1397,10 @@ def _infer_worker(
                     )
                 elif n_left > chunk_n:
                     leftover = leftover[:chunk_n]
+            elif infer_i > 0:
+                leftover = torch.zeros(
+                    chunk_n, int(cfg.action_dim), device=device, dtype=torch.float32
+                )
             pred, infer_s = _sample_actions_timed(
                 policy,
                 batch,
@@ -1325,6 +1454,7 @@ def _infer_worker(
                 left_g_i,
                 right_g_i,
                 vel_phase,
+                train_fps,
             )
             processed_t = torch.as_tensor(processed, dtype=torch.float32)
             action_queue.merge(pred, processed_t, new_delay, idx_before)
@@ -1338,8 +1468,12 @@ def _infer_worker(
                 "grip_l": float(np.clip(g_row[left_g_i], 0.0, 1.0)),
                 "grip_r": float(np.clip(g_row[right_g_i], 0.0, 1.0)),
                 "leftover": leftover_len,
+                "leftover_none": leftover_none,
                 "delay": int(new_delay),
+                "infer_delay": int(infer_delay),
+                "exec_h": int(exec_h),
                 "qsize": int(action_queue.qsize()),
+                "capture_ms": float(capture_ms),
                 "infer_ms": float(infer_s * 1e3),
             }
             while not stop_evt.is_set():
@@ -1388,6 +1522,8 @@ def main() -> None:
         raise FileNotFoundError(f"找不到训练配置: {train_cfg_path}")
 
     print(f"[INFO] 加载 checkpoint: {ckpt_path}")
+    infer_trace_path = ckpt_path.parent / "deploy_infer_trace.jsonl"
+    print(f"[INFO] infer trace: {infer_trace_path}", flush=True)
     ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
     cfg = load_config(train_cfg_path) if train_cfg_path is not None else ckpt["config"]
     stats = ckpt["stats"]
@@ -1437,16 +1573,10 @@ def main() -> None:
             raise ValueError(f"训练配置缺少 dataset.scale_mm_per_raw_unit[{cam}]")
 
     device = torch.device(cfg.train.device if torch.cuda.is_available() else "cpu")
-    predict_joint_delta = bool(cfg.policy.predict_joint_delta)
     joint_mask = joint_mask_from_names(cfg.action_names, cfg.action_dim)
     joint_idx = np.where(joint_mask)[0]
     if joint_idx.size != 14:
         raise ValueError(f"双臂关节维数应为 14，实际 {joint_idx.size}")
-    left_j = joint_idx[:7]
-    right_j = joint_idx[7:14]
-    grip_idx = np.where(~joint_mask)[0]
-    left_g_i = int(grip_idx[0]) if grip_idx.size >= 1 else 14
-    right_g_i = int(grip_idx[1]) if grip_idx.size >= 2 else 15
 
     halves = _cpu_affinity_halves()
     if halves is not None:
@@ -1470,11 +1600,77 @@ def main() -> None:
     send_thread: ServoSendThread | None = None
     infer_proc: mp.Process | None = None
     stop_evt = None
+    pose_ready = None
     watchdog: ServoWatchdogThread | None = None
     left_follower: HcxFollower | None = None
     right_follower: HcxFollower | None = None
     quit_keys: QuitKeyThread | None = None
     try:
+        _, _, source_hz = _direct_servo_config(teleop_yaml)
+        seed_l = np.asarray(
+            deploy["left_start_joints_deg"] or [0.0] * 7, dtype=np.float64
+        )
+        seed_r = np.asarray(
+            deploy["right_start_joints_deg"] or [0.0] * 7, dtype=np.float64
+        )
+        seed_lg = float(
+            1.0
+            if deploy["left_start_gripper"] is None
+            else deploy["left_start_gripper"]
+        )
+        seed_rg = float(
+            1.0
+            if deploy["right_start_gripper"] is None
+            else deploy["right_start_gripper"]
+        )
+        ctx = mp.get_context("spawn")
+        joint_arr = ctx.Array("d", 16)
+        _fill_joint_arr(
+            joint_arr,
+            np.concatenate(
+                [seed_l, seed_r, np.asarray([seed_lg, seed_rg], dtype=np.float64)]
+            ),
+        )
+        popped_val = ctx.Value("i", 0)
+        ack_val = ctx.Value("i", -1)
+        out_q = ctx.Queue(maxsize=4)
+        ready_evt = ctx.Event()
+        stop_evt = ctx.Event()
+        pose_ready = ctx.Event()
+        spec = {
+            "ckpt": str(ckpt_path),
+            "train_cfg": None if train_cfg_path is None else str(train_cfg_path),
+            "teleop_yaml": str(teleop_yaml),
+            "deploy_rtc": _deploy_rtc(deploy.get("rtc")),
+            "chunk": int(chunk_n),
+            "max_steps": int(max_steps),
+            "source_hz": int(source_hz),
+            "fps": float(train_fps),
+            "left_start": deploy["left_start_joints_deg"],
+            "right_start": deploy["right_start_joints_deg"],
+            "one_euro_enabled": bool(extra["one_euro_enabled"]),
+            "one_euro_mincutoff_hz": float(extra["one_euro_mincutoff_hz"]),
+            "one_euro_beta": float(extra["one_euro_beta"]),
+            "one_euro_dcutoff_hz": float(extra["one_euro_dcutoff_hz"]),
+        }
+        infer_proc = ctx.Process(
+            target=_infer_worker,
+            args=(
+                spec,
+                joint_arr,
+                popped_val,
+                ack_val,
+                out_q,
+                ready_evt,
+                stop_evt,
+                pose_ready,
+            ),
+            name="infer-worker",
+            daemon=True,
+        )
+        infer_proc.start()
+        print("[INFO] 推理进程已启动（与去起始位并行）", flush=True)
+
         (
             _hcx_connection,
             left_follower,
@@ -1503,6 +1699,12 @@ def main() -> None:
             )
             hw.right_gripper_loop.start(initial_opening=hold_right)
 
+        left_start = None
+        right_start = None
+        confirm_timeout_s = max(
+            float(deploy["move_feedback_confirm_timeout_s"]),
+            START_CONFIRM_TIMEOUT_S,
+        )
         if deploy["left_start_joints_deg"] is not None:
             left_start = _clamp_joints_by_limits(
                 deploy["left_start_joints_deg"],
@@ -1514,19 +1716,9 @@ def main() -> None:
                 left_start,
                 interrupt=False,
                 wait=False,
-                speed_ratio=deploy["move_speed_ratio"],
-                acceleration_seconds=deploy["move_acceleration_seconds"],
-                deceleration_seconds=deploy["move_deceleration_seconds"],
-            )
-            _confirm_targets_by_feedback(
-                hw,
-                left_start,
-                _read_hcx_joints(hw.right_arm, hw.right_start_joints_deg)
-                .astype(float)
-                .tolist(),
-                timeout_s=deploy["move_feedback_confirm_timeout_s"],
-                poll_interval_s=deploy["move_feedback_confirm_poll_interval_s"],
-                angle_tolerance_deg=deploy["move_angle_tolerance_deg"],
+                speed_ratio=START_SPEED_RATIO,
+                acceleration_seconds=START_ACCEL_S,
+                deceleration_seconds=START_DECEL_S,
             )
         if deploy["right_start_joints_deg"] is not None:
             right_start = _clamp_joints_by_limits(
@@ -1539,21 +1731,15 @@ def main() -> None:
                 right_start,
                 interrupt=False,
                 wait=False,
-                speed_ratio=deploy["move_speed_ratio"],
-                acceleration_seconds=deploy["move_acceleration_seconds"],
-                deceleration_seconds=deploy["move_deceleration_seconds"],
+                speed_ratio=START_SPEED_RATIO,
+                acceleration_seconds=START_ACCEL_S,
+                deceleration_seconds=START_DECEL_S,
             )
-            _confirm_targets_by_feedback(
-                hw,
-                _read_hcx_joints(hw.left_arm, hw.left_start_joints_deg)
-                .astype(float)
-                .tolist(),
-                right_start,
-                timeout_s=deploy["move_feedback_confirm_timeout_s"],
-                poll_interval_s=deploy["move_feedback_confirm_poll_interval_s"],
-                angle_tolerance_deg=deploy["move_angle_tolerance_deg"],
-            )
-
+        print(
+            f"[INFO] 去起始位 speed_ratio={START_SPEED_RATIO:g} "
+            f"acc={START_ACCEL_S:g}s dec={START_DECEL_S:g}s",
+            flush=True,
+        )
         _ramp_start_grippers(
             hw,
             left_target=deploy["left_start_gripper"],
@@ -1561,6 +1747,43 @@ def main() -> None:
             duration_s=deploy["start_gripper_ramp_s"],
             rate_hz=gripper_rate_hz,
         )
+        confirm_l = (
+            left_start
+            if left_start is not None
+            else _read_hcx_joints(hw.left_arm, hw.left_start_joints_deg)
+            .astype(float)
+            .tolist()
+        )
+        confirm_r = (
+            right_start
+            if right_start is not None
+            else _read_hcx_joints(hw.right_arm, hw.right_start_joints_deg)
+            .astype(float)
+            .tolist()
+        )
+        _confirm_targets_by_feedback(
+            hw,
+            confirm_l,
+            confirm_r,
+            timeout_s=confirm_timeout_s,
+            poll_interval_s=deploy["move_feedback_confirm_poll_interval_s"],
+            angle_tolerance_deg=deploy["move_angle_tolerance_deg"],
+        )
+        seed_l = _read_hcx_joints(hw.left_arm, hw.left_start_joints_deg)
+        seed_r = _read_hcx_joints(hw.right_arm, hw.right_start_joints_deg)
+        seed_lg = _read_gripper(hw.left_gripper, fallback=seed_lg)
+        seed_rg = _read_gripper(hw.right_gripper, fallback=seed_rg)
+        _fill_joint_arr(
+            joint_arr,
+            np.concatenate(
+                [
+                    np.asarray(seed_l, dtype=np.float64),
+                    np.asarray(seed_r, dtype=np.float64),
+                    np.asarray([seed_lg, seed_rg], dtype=np.float64),
+                ]
+            ),
+        )
+        pose_ready.set()
 
         follow_l_lo, follow_l_hi = left_follower.joint_limits_deg
         follow_r_lo, follow_r_hi = right_follower.joint_limits_deg
@@ -1596,47 +1819,6 @@ def main() -> None:
             kalman_q=float(extra["kalman_q"]),
             kalman_r=float(extra["kalman_r"]),
         )
-        seed_l = _read_hcx_joints(hw.left_arm, hw.left_start_joints_deg)
-        seed_r = _read_hcx_joints(hw.right_arm, hw.right_start_joints_deg)
-        seed_lg = _read_gripper(hw.left_gripper, fallback=1.0)
-        seed_rg = _read_gripper(hw.right_gripper, fallback=1.0)
-        seed = np.concatenate(
-            [seed_l, seed_r, np.asarray([seed_lg, seed_rg], dtype=np.float32)]
-        ).astype(np.float64)
-        ctx = mp.get_context("spawn")
-        joint_arr = ctx.Array("d", 16)
-        with joint_arr.get_lock():
-            for i, v in enumerate(seed.tolist()):
-                joint_arr[i] = float(v)
-        popped_val = ctx.Value("i", 0)
-        ack_val = ctx.Value("i", -1)
-        out_q = ctx.Queue(maxsize=4)
-        ready_evt = ctx.Event()
-        stop_evt = ctx.Event()
-        spec = {
-            "ckpt": str(ckpt_path),
-            "train_cfg": None if train_cfg_path is None else str(train_cfg_path),
-            "teleop_yaml": str(teleop_yaml),
-            "deploy_rtc": _deploy_rtc(deploy.get("rtc")),
-            "chunk": int(chunk_n),
-            "max_steps": int(max_steps),
-            "source_hz": int(source_hz),
-            "fps": float(train_fps),
-            "left_start": deploy["left_start_joints_deg"],
-            "right_start": deploy["right_start_joints_deg"],
-            "one_euro_enabled": bool(extra["one_euro_enabled"]),
-            "one_euro_mincutoff_hz": float(extra["one_euro_mincutoff_hz"]),
-            "one_euro_beta": float(extra["one_euro_beta"]),
-            "one_euro_dcutoff_hz": float(extra["one_euro_dcutoff_hz"]),
-        }
-        infer_proc = ctx.Process(
-            target=_infer_worker,
-            args=(spec, joint_arr, popped_val, ack_val, out_q, ready_evt, stop_evt),
-            name="infer-worker",
-            daemon=True,
-        )
-        infer_proc.start()
-        print("[INFO] 推理进程已启动", flush=True)
         if not ready_evt.wait(timeout=180.0):
             raise RuntimeError("推理进程启动超时")
         item = out_q.get(timeout=30.0)
@@ -1645,16 +1827,14 @@ def main() -> None:
         _submit_interp_chunk(interp, np.asarray(item["chunk"], dtype=np.float64))
         popped_val.value = 0
         ack_val.value = int(item["infer_i"])
+        cmd_gl = float(item["grip_l"])
+        cmd_gr = float(item["grip_r"])
         if hw.left_gripper_loop is not None:
-            hw.left_gripper_loop.set_opening(float(item["grip_l"]))
+            hw.left_gripper_loop.set_opening(cmd_gl)
         if hw.right_gripper_loop is not None:
-            hw.right_gripper_loop.set_opening(float(item["grip_r"]))
-        print(
-            f"[INFO] infer={item['infer_i']} leftover={item['leftover']} "
-            f"delay={item['delay']} qsize={item['qsize']} "
-            f"infer_ms={item['infer_ms']:.0f}",
-            flush=True,
-        )
+            hw.right_gripper_loop.set_opening(cmd_gr)
+        print(_format_infer_info(item), flush=True)
+        _append_infer_trace(infer_trace_path, item)
         if not left_follower.start_servo():
             raise RuntimeError("HCX left direct-servo 启动失败")
         if not right_follower.start_servo():
@@ -1681,8 +1861,6 @@ def main() -> None:
         phase: str | None = None
         phase_actions = 0.0
         last_prog = 0.0
-        cmd_gl = float(item["grip_l"])
-        cmd_gr = float(item["grip_r"])
         while True:
             if quit_keys.pressed():
                 print("\n[INFO] 收到 q，停止伺服", flush=True)
@@ -1707,12 +1885,12 @@ def main() -> None:
             last_prog = prog
             left_open = cmd_gl > GRIP_OPEN
             left_closed = cmd_gl < GRIP_CLOSED
-            right_open = cmd_gr > GRIP_OPEN
             right_closed = cmd_gr < GRIP_CLOSED
+            right_moving = interp.right_path() > RIGHT_MOVE_PATH
             new_phase: str | None = None
             if right_closed and left_open:
                 new_phase = "A"
-            elif left_closed and right_open:
+            elif left_closed and not right_moving:
                 new_phase = "B"
             if new_phase != phase:
                 phase = new_phase
@@ -1721,12 +1899,21 @@ def main() -> None:
                 phase_actions += dprog
             if phase == "A":
                 scale = _phase_speed_scale(phase_actions, SKIP_PHASE_A, SPEED_MAX_A)
+                interp.set_left_speed_scale(1.0)
+                interp.set_speed_scale(scale)
+                right_vel = max(scale, SPEED_MAX_A if right_closed else 1.0)
+                send_thread.set_max_vel(base_max_vel * scale, base_max_vel * right_vel)
             elif phase == "B":
-                scale = _phase_speed_scale(phase_actions, SKIP_PHASE_B, SPEED_MAX_B)
+                scale_b = _phase_speed_scale(phase_actions, SKIP_PHASE_B, SPEED_MAX_B)
+                interp.set_left_speed_scale(scale_b)
+                interp.set_speed_scale(1.0)
+                right_vel = SPEED_MAX_A if right_closed else 1.0
+                send_thread.set_max_vel(base_max_vel * scale_b, base_max_vel * right_vel)
             else:
-                scale = 1.0
-            interp.set_speed_scale(scale)
-            send_thread.set_max_vel(base_max_vel * scale)
+                interp.set_left_speed_scale(1.0)
+                interp.set_speed_scale(1.0)
+                right_vel = SPEED_MAX_A if right_closed else 1.0
+                send_thread.set_max_vel(base_max_vel, base_max_vel * right_vel)
             popped_val.value = int(send_thread.popped())
             if infer_proc is not None and not infer_proc.is_alive():
                 try:
@@ -1750,12 +1937,8 @@ def main() -> None:
                 hw.left_gripper_loop.set_opening(cmd_gl)
             if hw.right_gripper_loop is not None:
                 hw.right_gripper_loop.set_opening(cmd_gr)
-            print(
-                f"[INFO] infer={item['infer_i']} leftover={item['leftover']} "
-                f"delay={item['delay']} qsize={item['qsize']} "
-                f"infer_ms={item['infer_ms']:.0f}",
-                flush=True,
-            )
+            print(_format_infer_info(item), flush=True)
+            _append_infer_trace(infer_trace_path, item)
     except KeyboardInterrupt:
         print("\n[INFO] 收到 Ctrl+C，停止伺服", flush=True)
     finally:
@@ -1777,6 +1960,8 @@ def main() -> None:
                 pass
         if stop_evt is not None:
             stop_evt.set()
+        if pose_ready is not None:
+            pose_ready.set()
         if infer_proc is not None:
             infer_proc.join(timeout=5.0)
             if infer_proc.is_alive():

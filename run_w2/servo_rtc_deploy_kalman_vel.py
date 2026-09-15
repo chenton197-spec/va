@@ -1,5 +1,4 @@
 #!/usr/bin/env python3
-# 做了初步的加减速，移动到起始位速度慢
 from __future__ import annotations
 
 import argparse
@@ -82,8 +81,11 @@ ARM_RATE_FAIL_HZ = 450.0
 GRIP_CLOSED = 0.2
 GRIP_OPEN = 0.45
 SKIP_PHASE_A = 20
+SKIP_PHASE_B = 5
 RAMP_ACTIONS = 15
 SPEED_MAX_A = 1.8
+SPEED_MAX_B = 2.0
+RIGHT_MOVE_PATH = 2.0
 GL_STILL_OPEN = 0.25
 GL_WILL_CLOSE = 0.15
 GR_IS_OPEN = 0.6
@@ -373,14 +375,17 @@ class ServoInterpolator:
         self._lock = threading.Lock()
         self._points: np.ndarray | None = None
         self._t0 = 0.0
+        self._t0_l = 0.0
         self._t0_r = 0.0
         self._speed_scale = 1.0
+        self._speed_scale_l = 1.0
 
     def submit(self, points: np.ndarray, t0: float) -> None:
         pts = np.asarray(points, dtype=np.float64).reshape(-1, self._n_joints)
         with self._lock:
             self._points = pts
             self._t0 = float(t0)
+            self._t0_l = float(t0)
             self._t0_r = float(t0)
 
     def set_speed_scale(self, scale: float, t: float | None = None) -> None:
@@ -393,18 +398,29 @@ class ServoInterpolator:
             self._speed_scale = scale
             self._t0_r = now - x / (self._fps * self._speed_scale)
 
+    def set_left_speed_scale(self, scale: float, t: float | None = None) -> None:
+        scale = max(1e-6, float(scale))
+        now = time.perf_counter() if t is None else float(t)
+        with self._lock:
+            if abs(scale - self._speed_scale_l) < 1e-9:
+                return
+            x = (now - self._t0_l) * self._fps * self._speed_scale_l
+            self._speed_scale_l = scale
+            self._t0_l = now - x / (self._fps * self._speed_scale_l)
+
     def speed_scale(self) -> float:
         with self._lock:
             return float(self._speed_scale)
+
+    def _left_x(self, t: float, n: int) -> float:
+        x = (t - self._t0_l) * self._fps * self._speed_scale_l
+        return float(max(0.0, min(x, float(max(n - 1, 0)))))
 
     def progress(self) -> float:
         with self._lock:
             if self._points is None:
                 return 0.0
-            t = time.perf_counter()
-            x = (t - self._t0) * self._fps
-            n = len(self._points)
-            return float(max(0.0, min(x, float(max(n - 1, 0)))))
+            return self._left_x(time.perf_counter(), len(self._points))
 
     def sample(self, t: float) -> np.ndarray | None:
         with self._lock:
@@ -412,7 +428,7 @@ class ServoInterpolator:
                 return None
             pts = self._points
             n = len(pts)
-            x_l = (t - self._t0) * self._fps
+            x_l = (t - self._t0_l) * self._fps * self._speed_scale_l
             x_r = (t - self._t0_r) * self._fps * self._speed_scale
             left = _interp_row(pts[:, :7], x_l, n)
             right = _interp_row(pts[:, 7:14], x_r, n)
@@ -422,11 +438,19 @@ class ServoInterpolator:
         with self._lock:
             if self._points is None:
                 return 0
-            t = time.perf_counter()
-            x = (t - self._t0) * self._fps
             n = len(self._points)
-            x = max(0.0, min(x, float(max(n - 1, 0))))
+            x = self._left_x(time.perf_counter(), n)
             return int(x * self._servo_hz / self._fps)
+
+    def right_path(self) -> float:
+        with self._lock:
+            if self._points is None:
+                return 0.0
+            right = self._points[:, 7:14]
+            if right.shape[0] < 2:
+                return 0.0
+            step = np.linalg.norm(np.diff(right, axis=0), axis=1)
+            return float(step.sum())
 
 
 def _interp_row(pts: np.ndarray, x: float, n: int) -> np.ndarray:
@@ -1703,10 +1727,14 @@ def main() -> None:
             dprog = max(0.0, prog - last_prog)
             last_prog = prog
             left_open = cmd_gl > GRIP_OPEN
+            left_closed = cmd_gl < GRIP_CLOSED
             right_closed = cmd_gr < GRIP_CLOSED
+            right_moving = interp.right_path() > RIGHT_MOVE_PATH
             new_phase: str | None = None
             if right_closed and left_open:
                 new_phase = "A"
+            elif left_closed and not right_moving:
+                new_phase = "B"
             if new_phase != phase:
                 phase = new_phase
                 phase_actions = 0.0
@@ -1714,11 +1742,21 @@ def main() -> None:
                 phase_actions += dprog
             if phase == "A":
                 scale = _phase_speed_scale(phase_actions, SKIP_PHASE_A, SPEED_MAX_A)
+                interp.set_left_speed_scale(1.0)
+                interp.set_speed_scale(scale)
+                right_vel = max(scale, SPEED_MAX_A if right_closed else 1.0)
+                send_thread.set_max_vel(base_max_vel * scale, base_max_vel * right_vel)
+            elif phase == "B":
+                scale_b = _phase_speed_scale(phase_actions, SKIP_PHASE_B, SPEED_MAX_B)
+                interp.set_left_speed_scale(scale_b)
+                interp.set_speed_scale(1.0)
+                right_vel = SPEED_MAX_A if right_closed else 1.0
+                send_thread.set_max_vel(base_max_vel * scale_b, base_max_vel * right_vel)
             else:
-                scale = 1.0
-            interp.set_speed_scale(scale)
-            right_vel = max(scale, SPEED_MAX_A if right_closed else 1.0)
-            send_thread.set_max_vel(base_max_vel * scale, base_max_vel * right_vel)
+                interp.set_left_speed_scale(1.0)
+                interp.set_speed_scale(1.0)
+                right_vel = SPEED_MAX_A if right_closed else 1.0
+                send_thread.set_max_vel(base_max_vel, base_max_vel * right_vel)
             popped_val.value = int(send_thread.popped())
             if infer_proc is not None and not infer_proc.is_alive():
                 try:

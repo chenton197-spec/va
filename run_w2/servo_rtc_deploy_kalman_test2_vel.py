@@ -14,6 +14,7 @@ import threading
 import time
 import tty
 from collections import deque
+from collections.abc import Callable
 from pathlib import Path
 from queue import Empty, Full
 from typing import Any
@@ -63,8 +64,12 @@ from run import (
 )
 from run_dual_arm_depth import (
     HeadTriggeredCapture,
+    _as_uint16_depth,
+    _as_uint8_rgb,
     _build_obs_batch,
+    _check_scale_mm_per_raw_unit,
     _connect_record_cameras,
+    _describe_rgbd_issue,
     _prepare_rgbd_observation,
 )
 from teleop_sdk.adapters.hcx import (
@@ -1039,6 +1044,95 @@ def _gpu_keepalive(keep: torch.Tensor | None) -> None:
         keep.add_(0.0)
 
 
+class KeepaliveHeadCapture(HeadTriggeredCapture):
+    def __init__(
+        self,
+        camera_manager: Any,
+        depth_cameras: tuple[str, ...] | list[str],
+        expected_scale_mm: dict[str, float],
+        on_wait: Callable[[], None] | None = None,
+    ) -> None:
+        super().__init__(camera_manager, depth_cameras, expected_scale_mm)
+        self._on_wait = on_wait
+
+    def _idle(self) -> None:
+        if self._on_wait is not None:
+            self._on_wait()
+        time.sleep(0.005)
+
+    def capture(
+        self, *, timeout_s: float = 2.0
+    ) -> tuple[dict[str, np.ndarray], dict[str, np.ndarray]]:
+        self._head_seq = int(self._head.latest_sequence())
+        deadline = time.perf_counter() + timeout_s
+        head_item = None
+        while time.perf_counter() < deadline:
+            head_item = self._head.get_next_frame_after(self._head_seq)
+            if head_item is not None:
+                break
+            self._idle()
+        if head_item is None:
+            details = [_describe_rgbd_issue(self._head, "head", need_depth=False)]
+            details.extend(
+                _describe_rgbd_issue(cam, name, need_depth=True)
+                for name, cam in self._hands.items()
+            )
+            raise TimeoutError(
+                f"等待 head 新帧超时 ({timeout_s}s)。\n"
+                + "\n".join(f"  - {line}" for line in details)
+            )
+        seq, head_frame = head_item
+        self._head_seq = int(seq)
+        if head_frame is None or head_frame.rgb is None:
+            raise RuntimeError("head 新帧缺少 RGB")
+        master_ns = int(head_frame.capture_monotonic_ns)
+
+        images = {"head": _as_uint8_rgb(head_frame.rgb, "head")}
+        depths: dict[str, np.ndarray] = {}
+        for name, cam in self._hands.items():
+            hand_frame = None
+            while time.perf_counter() < deadline:
+                candidate = cam.get_frame_at_or_before(master_ns)
+                if (
+                    candidate is not None
+                    and candidate.rgb is not None
+                    and candidate.depth is not None
+                    and candidate.meters_per_raw_unit is not None
+                    and int(candidate.capture_monotonic_ns) <= master_ns
+                ):
+                    hand_frame = candidate
+                    break
+                self._idle()
+            if hand_frame is None:
+                details = [_describe_rgbd_issue(self._head, "head", need_depth=False)]
+                details.extend(
+                    _describe_rgbd_issue(c, n, need_depth=True)
+                    for n, c in self._hands.items()
+                )
+                raise TimeoutError(
+                    f"{name} 没有不晚于 head 的 RGB-D 帧 (head_ns={master_ns})。\n"
+                    + "\n".join(f"  - {line}" for line in details)
+                )
+            depth, scale_mm = _as_uint16_depth(
+                hand_frame.depth, float(hand_frame.meters_per_raw_unit), name
+            )
+            _check_scale_mm_per_raw_unit(name, scale_mm, self._expected_scale_mm)
+            rgb_hand = _as_uint8_rgb(hand_frame.rgb, name)
+            if rgb_hand.shape[:2] != depth.shape:
+                raise RuntimeError(
+                    f"{name} RGB 与 depth 尺寸不一致: rgb={rgb_hand.shape} depth={depth.shape}"
+                )
+            if name not in self._logged_scale:
+                print(
+                    f"[INFO] observation.depth.{name} scale={scale_mm:g} mm/raw-unit",
+                    flush=True,
+                )
+                self._logged_scale.add(name)
+            images[name] = rgb_hand
+            depths[name] = depth
+        return images, depths
+
+
 def _sample_actions_timed(
     policy: Any,
     batch: dict[str, torch.Tensor],
@@ -1143,10 +1237,11 @@ def _infer_worker(
             right_start_joints_deg=spec["right_start"],
         )
         hw.camera_manager = _connect_record_cameras(teleop_yaml)
-        hw.camera_capture = HeadTriggeredCapture(
+        hw.camera_capture = KeepaliveHeadCapture(
             hw.camera_manager,
             depth_cameras=depth_cameras,
             expected_scale_mm=expected_scale_mm,
+            on_wait=lambda: _gpu_keepalive(keep),
         )
         obs_kw = dict(
             image_size=image_size,
@@ -1186,6 +1281,27 @@ def _infer_worker(
             device=device,
             chunk_n=chunk_n,
         )
+        warmup_left = torch.zeros(
+            chunk_n, int(cfg.action_dim), device=device, dtype=torch.float32
+        )
+        _, _ = _sample_actions_timed(
+            policy,
+            warmup_batch,
+            leftover=warmup_left,
+            inference_delay=2,
+            execution_horizon=4,
+            device=device,
+            chunk_n=chunk_n,
+        )
+        _, _ = _sample_actions_timed(
+            policy,
+            warmup_batch,
+            leftover=warmup_left,
+            inference_delay=4,
+            execution_horizon=6,
+            device=device,
+            chunk_n=chunk_n,
+        )
         while not stop_evt.is_set() and not pose_ready.wait(timeout=0.05):
             _gpu_keepalive(keep)
         if stop_evt.is_set():
@@ -1211,6 +1327,8 @@ def _infer_worker(
             exec_h = infer_delay + 2
             if leftover_len > 0:
                 exec_h = min(exec_h, leftover_len)
+            elif leftover is None and infer_i > 0:
+                exec_h = 0
             obs = _capture_infer_obs(hw, list(cameras), joint_arr, **obs_kw)
             obs_history = [obs]
             q_now = np.asarray(obs_history[-1].state, dtype=np.float32)
@@ -1246,6 +1364,10 @@ def _infer_worker(
                     )
                 elif n_left > chunk_n:
                     leftover = leftover[:chunk_n]
+            elif infer_i > 0:
+                leftover = torch.zeros(
+                    chunk_n, int(cfg.action_dim), device=device, dtype=torch.float32
+                )
             pred, infer_s = _sample_actions_timed(
                 policy,
                 batch,
