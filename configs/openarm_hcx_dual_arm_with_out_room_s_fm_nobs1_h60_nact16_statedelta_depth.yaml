@@ -55,12 +55,12 @@ policy:
 
 train:
   batch_size: 80
-  steps: 227760
+  steps: 90810
   lr: 0.0001
   weight_decay: 0.0001
   log_freq: 50
-  save_freq: 11388
-  latest_save_freq: 11388
+  save_freq: 6054
+  latest_save_freq: 6054
   keep_last_ckpts: 20
   device: cuda
   num_workers: 4
@@ -73,5 +73,5 @@ train:
   max_grad_norm: 1.0
   amp: false
   compile: true
-  val_freq: 1423
+  val_freq: 1513
   val_samples: 256
